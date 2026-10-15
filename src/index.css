@@ -1,0 +1,336 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Outfit:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-display: 'Plus Jakarta Sans', 'Outfit', 'Inter', sans-serif;
+
+  /* Academic Navy Primary */
+  --color-navy-50: #f8fafc;
+  --color-navy-100: #f1f5f9;
+  --color-navy-200: #e2e8f0;
+  --color-navy-300: #cbd5e1;
+  --color-navy-400: #94a3b8;
+  --color-navy-500: #64748b;
+  --color-navy-600: #475569;
+  --color-navy-700: #334155;
+  --color-navy-800: #1e293b;
+  --color-navy-900: #0f172a;
+  --color-navy-950: #0b132b;
+
+  /* Royal Blue Interactive Accents */
+  --color-blue-accent-50: #eff6ff;
+  --color-blue-accent-100: #dbeafe;
+  --color-blue-accent-200: #bfdbfe;
+  --color-blue-accent-300: #93c5fd;
+  --color-blue-accent-400: #60a5fa;
+  --color-blue-accent-500: #3b82f6;
+  --color-blue-accent-600: #2563eb;
+  --color-blue-accent-700: #1d4ed8;
+  --color-blue-accent-800: #1e40af;
+  --color-blue-accent-900: #1e3a8a;
+
+  /* Soft Green Verification & Match */
+  --color-match-green-50: #ecfdf5;
+  --color-match-green-100: #d1fae5;
+  --color-match-green-200: #a7f3d0;
+  --color-match-green-300: #6ee7b7;
+  --color-match-green-400: #34d399;
+  --color-match-green-500: #10b981;
+  --color-match-green-600: #059669;
+  --color-match-green-700: #047857;
+
+  /* Pastel Category Backgrounds */
+  --color-pastel-purple: #f5f3ff;
+  --color-pastel-blue: #eff6ff;
+  --color-pastel-emerald: #ecfdf5;
+  --color-pastel-amber: #fffbeb;
+  --color-pastel-rose: #fff1f2;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: #f8fafc;
+  color: #0f172a;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Surfaces & Card Containers ───────────────────────────────────────────── */
+
+.glass {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 1px 3px 0 rgba(15, 23, 42, 0.04), 0 1px 2px -1px rgba(15, 23, 42, 0.04);
+}
+
+.glass-strong {
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  box-shadow: 0 4px 6px -1px rgba(15, 23, 42, 0.05), 0 2px 4px -2px rgba(15, 23, 42, 0.03);
+}
+
+.bg-card-gradient {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+}
+
+.bg-hero-gradient {
+  background: radial-gradient(circle at 50% 0%, rgba(219, 234, 254, 0.45) 0%, rgba(248, 250, 252, 0) 65%), #f8fafc;
+}
+
+.bg-dark-section {
+  background-color: #0b132b;
+  color: #f8fafc;
+}
+
+/* ── Typography & Gradient Text ───────────────────────────────────────────── */
+
+.gradient-text {
+  background: linear-gradient(135deg, #0f172a 0%, #2563eb 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.gradient-text-2 {
+  background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.gradient-text-green {
+  background: linear-gradient(135deg, #059669 0%, #10b981 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ── Buttons ──────────────────────────────────────────────────────────────── */
+
+.btn-primary {
+  background-color: #0f172a;
+  color: #ffffff;
+  border: 1px solid #0f172a;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  box-shadow: 0 1px 2px 0 rgba(15, 23, 42, 0.08);
+}
+
+.btn-primary:hover {
+  background-color: #1e293b;
+  border-color: #1e293b;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px 0 rgba(15, 23, 42, 0.15);
+}
+
+.btn-primary:active {
+  transform: translateY(0);
+}
+
+.btn-accent {
+  background-color: #2563eb;
+  color: #ffffff;
+  border: 1px solid #2563eb;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  box-shadow: 0 1px 2px 0 rgba(37, 99, 235, 0.15);
+}
+
+.btn-accent:hover {
+  background-color: #1d4ed8;
+  border-color: #1d4ed8;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px 0 rgba(37, 99, 235, 0.25);
+}
+
+.btn-secondary {
+  background-color: #ffffff;
+  color: #334155;
+  border: 1px solid #e2e8f0;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.btn-secondary:hover {
+  background-color: #f8fafc;
+  color: #0f172a;
+  border-color: #cbd5e1;
+  box-shadow: 0 2px 6px 0 rgba(15, 23, 42, 0.05);
+}
+
+/* ── Form Inputs ──────────────────────────────────────────────────────────── */
+
+.input-base {
+  background-color: #ffffff;
+  border: 1px solid #e2e8f0;
+  color: #0f172a;
+  transition: all 0.15s ease-in-out;
+}
+
+.input-base:focus {
+  outline: none;
+  border-color: #2563eb;
+  background-color: #ffffff;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+}
+
+.input-base::placeholder {
+  color: #94a3b8;
+}
+
+/* ── Hover Effects & Card Interactions ────────────────────────────────────── */
+
+.card-hover {
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.card-hover:hover {
+  transform: translateY(-2px);
+  border-color: #cbd5e1;
+  box-shadow: 0 12px 24px -4px rgba(15, 23, 42, 0.08), 0 4px 8px -2px rgba(15, 23, 42, 0.03);
+}
+
+/* ── Tags & Badges ────────────────────────────────────────────────────────── */
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 9999px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  background-color: #eff6ff;
+  color: #1d4ed8;
+  border: 1px solid #dbeafe;
+  transition: all 0.15s ease;
+}
+
+.tag:hover {
+  background-color: #dbeafe;
+  border-color: #bfdbfe;
+}
+
+.verified-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background-color: #ecfdf5;
+  color: #047857;
+  border: 1px solid #a7f3d0;
+  border-radius: 9999px;
+  padding: 2px 8px;
+  font-size: 0.725rem;
+  font-weight: 600;
+}
+
+/* Match pill */
+.match-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background-color: #ecfdf5;
+  color: #047857;
+  border: 1px solid #a7f3d0;
+  border-radius: 9999px;
+  padding: 2px 10px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+/* Category card badge */
+.category-badge-purple {
+  background-color: #f5f3ff;
+  color: #6d28d9;
+  border: 1px solid #ede9fe;
+}
+
+.category-badge-blue {
+  background-color: #eff6ff;
+  color: #1d4ed8;
+  border: 1px solid #dbeafe;
+}
+
+.category-badge-emerald {
+  background-color: #ecfdf5;
+  color: #047857;
+  border: 1px solid #d1fae5;
+}
+
+.category-badge-amber {
+  background-color: #fffbeb;
+  color: #b45309;
+  border: 1px solid #fef3c7;
+}
+
+/* Status badges */
+.status-submitted { color: #475569; background-color: #f1f5f9; border: 1px solid #e2e8f0; }
+.status-review { color: #b45309; background-color: #fffbeb; border: 1px solid #fde68a; }
+.status-shortlisted { color: #1d4ed8; background-color: #eff6ff; border: 1px solid #bfdbfe; }
+.status-interview { color: #6d28d9; background-color: #f5f3ff; border: 1px solid #ddd6fe; }
+.status-accepted { color: #047857; background-color: #ecfdf5; border: 1px solid #a7f3d0; }
+.status-rejected { color: #b91c1c; background-color: #fef2f2; border: 1px solid #fecaca; }
+
+/* ── Skeletons & Animations ───────────────────────────────────────────────── */
+
+@keyframes shimmer {
+  0% { background-position: -800px 0; }
+  100% { background-position: 800px 0; }
+}
+
+.skeleton {
+  background: linear-gradient(90deg, #f1f5f9 25%, #e2e8f0 50%, #f1f5f9 75%);
+  background-size: 800px 100%;
+  animation: shimmer 1.5s infinite;
+  border-radius: 6px;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(0.92); }
+}
+
+.pulse-dot {
+  animation: pulse-dot 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fade-in-up {
+  animation: fadeInUp 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* ── Custom Scrollbar ─────────────────────────────────────────────────────── */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
