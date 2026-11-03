@@ -17,7 +17,6 @@ import {
   ChevronRight,
 } from 'lucide-react'
 import { Button } from '@/components/common/Button'
-import { VerificationBadge } from '@/components/common/Badges'
 
 // ── Research Areas Data ────────────────────────────────────────────────────────
 
@@ -151,7 +150,7 @@ export default function Landing() {
 
             {/* Supporting Description */}
             <p className="text-base sm:text-lg text-slate-600 max-w-2xl leading-relaxed">
-              Discover verified professors and funded Master's and PhD positions that match your
+              Discover professors and funded Master's and PhD positions that match your
               academic goals, skills, and experience.
             </p>
 
@@ -202,7 +201,7 @@ export default function Landing() {
                 />
               </div>
               <p className="text-xs font-medium text-slate-500">
-                <strong className="font-semibold text-slate-800">2,400+</strong> verified
+                <strong className="font-semibold text-slate-800">2,400+</strong>{' '}
                 professors across leading universities
               </p>
             </div>
@@ -358,7 +357,7 @@ export default function Landing() {
             Research Areas
           </h2>
           <p className="text-sm text-slate-500 mt-1">
-            Browse verified faculty by academic specialization.
+            Browse faculty and research groups by academic specialization.
           </p>
         </div>
 
@@ -438,9 +437,6 @@ export default function Landing() {
                         <h3 className="font-display text-base font-bold text-slate-900 truncate">
                           {prof.name}
                         </h3>
-                      </div>
-                      <div className="mt-1">
-                        <VerificationBadge status="verified" size="sm" />
                       </div>
                       <p className="text-xs text-slate-600 mt-2 font-medium">
                         {prof.academicTitle} · {prof.department}
@@ -544,9 +540,9 @@ export default function Landing() {
                 <div className="w-10 h-10 rounded-xl bg-blue-900/60 border border-blue-500/30 flex items-center justify-center text-blue-400">
                   <ShieldCheck size={20} />
                 </div>
-                <h4 className="text-base font-bold text-white">Verified professors</h4>
+                <h4 className="text-base font-bold text-white">Comprehensive lab profiles</h4>
                 <p className="text-xs sm:text-sm text-slate-400 leading-relaxed">
-                  Build trust through institutional email and identity verification.
+                  Explore detailed faculty research areas, ongoing projects, and lab publications.
                 </p>
               </div>
 

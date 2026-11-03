@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { 
   Plus, ArrowLeft, Trash2, Calendar, DollarSign, Check, 
-  AlertCircle, Edit3, X, Briefcase, GraduationCap, Users, 
+  Edit3, X, Briefcase, GraduationCap, Users, 
   Sparkles, ExternalLink, ChevronDown, CheckCircle2 
 } from 'lucide-react'
 import { useAuth } from '@/context/AuthContext'
@@ -51,32 +51,6 @@ export default function ManagePositions() {
   const [applicationDeadline, setApplicationDeadline] = useState('')
   const [startDate, setStartDate] = useState('Spring 2027')
 
-  const [verificationStatus, setVerificationStatus] = useState<string>(() => {
-    const savedVerifications = localStorage.getItem('rm_demo_verifications')
-    if (savedVerifications) {
-      try {
-        const list = JSON.parse(savedVerifications)
-        const myRecord = list.find((item: any) =>
-          (user && (item.userId === user.uid || (item.applicantEmail && user.email && item.applicantEmail.toLowerCase() === user.email.toLowerCase()))) ||
-          (!user && item.userId === 'demo-1')
-        )
-        if (myRecord) return myRecord.status
-      } catch {
-        // fallback
-      }
-    }
-    const savedProf = localStorage.getItem('rm_demo_professor_profile')
-    if (savedProf) {
-      try {
-        const p = JSON.parse(savedProf)
-        if (p.verificationStatus) return p.verificationStatus
-      } catch {
-        // fallback
-      }
-    }
-    return 'verified'
-  })
-
   useEffect(() => {
     if (isDemoMode) {
       const local = localStorage.getItem('rm_demo_positions')
@@ -85,21 +59,6 @@ export default function ManagePositions() {
           setPositions(JSON.parse(local))
         } catch {
           setPositions(defaultPositions)
-        }
-      }
-
-      // Sync verification status
-      const savedVerifications = localStorage.getItem('rm_demo_verifications')
-      if (savedVerifications) {
-        try {
-          const list = JSON.parse(savedVerifications)
-          const myRecord = list.find((item: any) =>
-            (user && (item.userId === user.uid || (item.applicantEmail && user.email && item.applicantEmail.toLowerCase() === user.email.toLowerCase()))) ||
-            (!user && item.userId === 'demo-1')
-          )
-          if (myRecord) setVerificationStatus(myRecord.status)
-        } catch {
-          // ignore
         }
       }
     }
@@ -171,7 +130,6 @@ export default function ManagePositions() {
       setSuccessMsg('Research position updated successfully!')
     } else {
       // Create new position
-      const isVerified = verificationStatus === 'verified'
       const newPos: Position = {
         id: `pos-${Date.now()}`,
         professorId: user?.uid || 'demo-1',
@@ -195,18 +153,14 @@ export default function ManagePositions() {
         stipend,
         applicationDeadline: applicationDeadline || '2026-12-31',
         startDate: startDate || 'Spring 2027',
-        isOpen: isVerified,
+        isOpen: true,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       }
       const updated = [newPos, ...positions]
       setPositions(updated)
       localStorage.setItem('rm_demo_positions', JSON.stringify(updated))
-      setSuccessMsg(
-        isVerified
-          ? 'New research position published!'
-          : 'Opportunity saved as draft (Unpublished). Faculty verification required to publish.'
-      )
+      setSuccessMsg('New research position published!')
     }
 
     setIsFormOpen(false)
@@ -214,11 +168,6 @@ export default function ManagePositions() {
   }
 
   const toggleStatus = (id: string) => {
-    if (verificationStatus !== 'verified') {
-      setSuccessMsg('Faculty verification required to open opportunities publicly.')
-      setTimeout(() => setSuccessMsg(''), 4000)
-      return
-    }
     const updated = positions.map((p) => (p.id === id ? { ...p, isOpen: !p.isOpen } : p))
     setPositions(updated)
     localStorage.setItem('rm_demo_positions', JSON.stringify(updated))
@@ -276,22 +225,6 @@ export default function ManagePositions() {
             </Button>
           </div>
         </div>
-
-        {/* Verification Alert Banner if not verified */}
-        {verificationStatus !== 'verified' && (
-          <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 shadow-xs flex items-start gap-3 animate-fade-in">
-            <AlertCircle size={20} className="text-amber-600 shrink-0 mt-0.5" />
-            <div className="space-y-0.5">
-              <h4 className="text-xs font-bold text-amber-900">
-                Institutional Affiliation Verification Required
-              </h4>
-              <p className="text-xs text-amber-800">
-                Your faculty affiliation status is currently <strong className="uppercase underline font-bold">{verificationStatus}</strong>.
-                You may draft research positions, but opportunities cannot be published publicly to accept student applications until an administrator confirms your credentials.
-              </p>
-            </div>
-          </div>
-        )}
 
         {/* Position Creation / Editing Drawer Form */}
         {isFormOpen && (

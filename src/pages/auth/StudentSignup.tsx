@@ -125,7 +125,6 @@ export default function StudentSignup() {
         technicalSkills: skills.technicalSkills || ['Deep Learning'],
         researchTools: skills.researchTools || ['Git'],
         languageScores,
-        verificationStatus: 'pending' as const,
         accountStatus: 'active' as const,
         profileCompleteness: 75,
         createdAt: new Date().toISOString(),
@@ -135,28 +134,7 @@ export default function StudentSignup() {
       // 1. Save profile to localStorage
       localStorage.setItem('rm_demo_student_profile', JSON.stringify(newStudentProfile))
 
-      // 2. Queue verification request in rm_demo_verifications
-      const newVerificationReq = {
-        id: `req-${Date.now()}`,
-        userId: user.uid,
-        userName: accountData.fullName,
-        userEmail: accountData.email,
-        userRole: 'student' as const,
-        university: academic.university || 'Seoul National University',
-        department: academic.department || 'Computer Science',
-        academicTitleOrDegree: `${academic.degree || 'Bachelor'} in ${academic.major || 'Computer Science'}`,
-        docType: 'Official Academic Transcript & Student Enrollment Letter',
-        docUrl: 'https://example.com/student_transcript.pdf',
-        status: 'pending' as const,
-        accountStatus: 'active' as const,
-        submittedAt: new Date().toISOString(),
-      }
-
-      const existingVerifications = localStorage.getItem('rm_demo_verifications')
-      const verificationsList = existingVerifications ? JSON.parse(existingVerifications) : []
-      localStorage.setItem('rm_demo_verifications', JSON.stringify([newVerificationReq, ...verificationsList]))
-
-      // 3. Add to rm_demo_system_users
+      // 2. Add to rm_demo_system_users
       const newSystemUser = {
         uid: user.uid,
         displayName: accountData.fullName,
@@ -165,7 +143,6 @@ export default function StudentSignup() {
         university: academic.university || 'Seoul National University',
         department: academic.department || 'Computer Science',
         academicTitleOrDegree: `${academic.degree || 'Bachelor'} in ${academic.major || 'Computer Science'}`,
-        verificationStatus: 'pending' as const,
         accountStatus: 'active' as const,
         createdAt: new Date().toISOString().slice(0, 10),
         applicationsCount: 0,

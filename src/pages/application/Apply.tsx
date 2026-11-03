@@ -3,13 +3,13 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { collection, doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore'
 import {
   ArrowLeft, Send, Sparkles, FileText, CheckCircle2,
-  Calendar, DollarSign, Building, AlertCircle, ShieldAlert,
+  Calendar, DollarSign, Building, AlertCircle,
   GraduationCap, ExternalLink, Lock
 } from 'lucide-react'
 import { db, isDemoMode } from '@/lib/firebase'
 import { useAuth } from '@/context/AuthContext'
 import type { Position } from '@/types/position.types'
-import type { StudentProfile, AffiliationVerificationStatus } from '@/types/user.types'
+import type { StudentProfile } from '@/types/user.types'
 import type { Application } from '@/types/application.types'
 import { Button } from '@/components/common/Button'
 import { computeMatch } from '@/lib/matching'
@@ -72,37 +72,6 @@ export default function Apply() {
     return DEMO_STUDENT_PROFILE
   })
 
-  // Affiliation verification status check
-  const [verificationStatus, setVerificationStatus] = useState<AffiliationVerificationStatus>(() => {
-    // 1. Check rm_demo_verifications
-    const savedVerifications = localStorage.getItem('rm_demo_verifications')
-    if (savedVerifications) {
-      try {
-        const list = JSON.parse(savedVerifications)
-        const myRecord = list.find((item: any) =>
-          (user && (item.userId === user.uid || (item.applicantEmail && user.email && item.applicantEmail.toLowerCase() === user.email.toLowerCase()))) ||
-          (!user && item.userId === 'demo-student')
-        )
-        if (myRecord) return myRecord.status
-      } catch {
-        // fallback
-      }
-    }
-
-    // 2. Check student profile
-    const savedStudent = localStorage.getItem('rm_demo_student_profile')
-    if (savedStudent) {
-      try {
-        const parsed = JSON.parse(savedStudent)
-        if (parsed.verificationStatus) return parsed.verificationStatus
-      } catch {
-        // fallback
-      }
-    }
-
-    return 'verified'
-  })
-
   // Compute live match score
   const matchResult = computeMatch(studentProfile, position)
 
@@ -149,7 +118,7 @@ export default function Apply() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!statement.trim() || verificationStatus !== 'verified') return
+    if (!statement.trim()) return
 
     setLoading(true)
     const applicationId = `app-${Date.now()}`
@@ -175,7 +144,7 @@ export default function Apply() {
         {
           status: 'submitted',
           changedAt: new Date().toISOString(),
-          note: 'Application submitted online by verified student',
+          note: 'Application submitted online',
         },
       ],
       submittedAt: new Date().toISOString(),
@@ -200,8 +169,6 @@ export default function Apply() {
     setLoading(false)
     setSubmitted(true)
   }
-
-  const isVerified = verificationStatus === 'verified'
 
   if (submitted) {
     return (
@@ -277,32 +244,6 @@ export default function Apply() {
           Back to Search / Openings
         </button>
 
-        {/* Verification Barrier Alert if NOT verified */}
-        {!isVerified && (
-          <div className="bg-amber-50 border border-amber-200 rounded-2xl p-5 shadow-xs flex items-start gap-4">
-            <ShieldAlert size={22} className="text-amber-600 shrink-0 mt-0.5" />
-            <div className="space-y-1">
-              <h3 className="text-sm font-bold text-amber-900">
-                Institutional Affiliation Verification Required
-              </h3>
-              <p className="text-xs text-amber-800 leading-relaxed">
-                Your student affiliation status is currently <strong className="uppercase font-bold underline">{verificationStatus}</strong>.
-                Unverified or pending students may browse and bookmark faculty opportunities, but your university enrollment proof must be verified by an administrator before you can submit applications to faculty.
-              </p>
-              <div className="pt-2 flex items-center gap-3">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => navigate('/profile/student')}
-                  className="text-xs border-amber-300 text-amber-900 hover:bg-amber-100"
-                >
-                  View Profile & Verification Info
-                </Button>
-              </div>
-            </div>
-          </div>
-        )}
-
         {/* Position Header Summary Card */}
         <div className="bg-white rounded-2xl border border-slate-200/80 p-6 sm:p-8 shadow-xs space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4 pb-4 border-b border-slate-100">
@@ -372,22 +313,17 @@ export default function Apply() {
                 <textarea
                   value={statement}
                   onChange={(e) => setStatement(e.target.value)}
-                  disabled={!isVerified}
-                  placeholder={
-                    isVerified
-                      ? 'Describe your academic background, thesis work, and why you wish to join this group...'
-                      : 'Affiliation verification required before submitting applications.'
-                  }
+                  placeholder="Describe your academic background, thesis work, and why you wish to join this group..."
                   rows={6}
                   required
                   className="w-full text-xs rounded-xl border border-slate-200 p-3.5 focus:outline-none focus:ring-2 focus:ring-blue-600/30 focus:border-blue-600 disabled:bg-slate-100 disabled:text-slate-400"
                 />
               </div>
 
-              {/* Verified Documents Attached */}
+              {/* Documents Attached */}
               <div className="space-y-3 pt-2">
                 <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                  Attached Verified Documents
+                  Attached Application Documents
                 </h3>
 
                 <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200/80 flex items-center justify-between text-xs">
@@ -424,13 +360,13 @@ export default function Apply() {
               {/* Submit CTA */}
               <div className="pt-4 border-t border-slate-100 flex items-center justify-between">
                 <span className="text-xs text-slate-400">
-                  {isVerified ? 'Ready for faculty review upon submission' : 'Verification required to submit'}
+                  Ready for faculty review upon submission
                 </span>
 
                 <Button
                   type="submit"
                   size="md"
-                  disabled={!isVerified || loading || !statement.trim()}
+                  disabled={loading || !statement.trim()}
                   loading={loading}
                   className="text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50"
                   id="submit-application-btn"

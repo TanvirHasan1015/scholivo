@@ -202,9 +202,6 @@ export default function ProfessorProfileEdit() {
               <h2 className="text-xl sm:text-2xl font-bold text-slate-900 font-display">
                 {profile.fullName}
               </h2>
-              <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
-                Verified Faculty
-              </span>
             </div>
             <p className="text-sm font-semibold text-blue-600">
               {profile.academicTitle} • {profile.department}

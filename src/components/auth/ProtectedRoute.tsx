@@ -21,7 +21,9 @@ export function ProtectedRoute({ allowedRoles }: ProtectedRouteProps) {
     )
   }
 
-  if (!user) return <Navigate to="/login" replace />
+  if (!user || (role !== 'student' && role !== 'professor')) {
+    return <Navigate to="/login" replace />
+  }
 
   // Check if current user's account is suspended
   const checkIsSuspended = (): boolean => {
@@ -97,10 +99,9 @@ export function ProtectedRoute({ allowedRoles }: ProtectedRouteProps) {
     )
   }
 
-  if (allowedRoles && role && !allowedRoles.includes(role)) {
+  if (allowedRoles && !allowedRoles.includes(role)) {
     // Redirect to appropriate dashboard
     if (role === 'professor') return <Navigate to="/dashboard/professor" replace />
-    if (role === 'admin') return <Navigate to="/admin" replace />
     return <Navigate to="/dashboard/student" replace />
   }
 

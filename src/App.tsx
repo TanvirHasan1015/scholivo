@@ -22,7 +22,6 @@ import ApplicationDetail from '@/pages/application/ApplicationDetail'
 import ProfessorDashboard from '@/pages/professor/ProfessorDashboard'
 import ManagePositions from '@/pages/professor/ManagePositions'
 import ProfessorProfileEdit from '@/pages/professor/ProfessorProfileEdit'
-import AdminDashboard from '@/pages/admin/AdminDashboard'
 import Messages from '@/pages/messaging/Messages'
 
 export default function App() {
@@ -58,14 +57,9 @@ export default function App() {
               </Route>
 
               {/* Shared Protected Routes (both student & professor) */}
-              <Route element={<ProtectedRoute allowedRoles={['student', 'professor', 'admin']} />}>
+              <Route element={<ProtectedRoute allowedRoles={['student', 'professor']} />}>
                 <Route path="/applications/:applicationId" element={<ApplicationDetail />} />
                 <Route path="/messages" element={<Messages />} />
-              </Route>
-
-              {/* Admin Routes */}
-              <Route element={<ProtectedRoute allowedRoles={['admin']} />}>
-                <Route path="/admin" element={<AdminDashboard />} />
               </Route>
 
               {/* 404 Route */}

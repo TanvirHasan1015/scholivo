@@ -4,7 +4,7 @@ import { collection, getDocs, query, where, limit } from 'firebase/firestore'
 import { 
   User, BookOpen, Search, Heart, FileText, Bell, TrendingUp, 
   ChevronRight, Star, GraduationCap, Award, CheckCircle2, ArrowUpRight,
-  Sparkles, Clock, Compass, ShieldCheck, MapPin
+  Sparkles, Clock, Compass, MapPin
 } from 'lucide-react'
 import { db, isDemoMode } from '@/lib/firebase'
 import { useAuth } from '@/context/AuthContext'
@@ -97,19 +97,6 @@ export default function StudentDashboard() {
     if (isDemoMode) {
       const local = localStorage.getItem('rm_demo_student_profile')
       const p = local ? JSON.parse(local) : { ...DEMO_STUDENT_PROFILE }
-      const savedVerifications = localStorage.getItem('rm_demo_verifications')
-      if (savedVerifications) {
-        try {
-          const list = JSON.parse(savedVerifications)
-          const myRecord = list.find((item: any) =>
-            (user && (item.userId === user.uid || (item.applicantEmail && user.email && item.applicantEmail.toLowerCase() === user.email.toLowerCase()))) ||
-            (!user && item.userId === 'demo-student')
-          )
-          if (myRecord) {
-            p.verificationStatus = myRecord.status
-          }
-        } catch {}
-      }
       setProfile({ ...p, profileCompleteness: calculateProfileCompleteness(p) })
       setApplications(loadSyncedApplications())
 
@@ -167,18 +154,6 @@ export default function StudentDashboard() {
                 <Sparkles size={13} className="text-blue-600" />
                 <span>Student Research Portal</span>
               </div>
-              <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold border ${
-                (profile?.verificationStatus || 'verified') === 'verified'
-                  ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                  : (profile?.verificationStatus || 'verified') === 'more_info_required'
-                  ? 'bg-purple-50 text-purple-700 border-purple-200'
-                  : (profile?.verificationStatus || 'verified') === 'rejected'
-                  ? 'bg-rose-50 text-rose-700 border-rose-200'
-                  : 'bg-amber-50 text-amber-700 border-amber-200'
-              }`}>
-                <ShieldCheck size={13} className={(profile?.verificationStatus || 'verified') === 'verified' ? 'text-emerald-600' : 'text-amber-600'} />
-                <span>Affiliation: {profile?.verificationStatus ? (profile.verificationStatus === 'verified' ? 'Verified Student' : profile.verificationStatus.replace('_', ' ')) : 'Verified Student'}</span>
-              </span>
             </div>
             <h1 className="font-display text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight">
               Welcome back, {user?.displayName ? user.displayName.split(' ')[0] : 'Alex'} 👋
@@ -310,7 +285,7 @@ export default function StudentDashboard() {
                   <div className="text-center py-10 px-4 bg-slate-50 rounded-2xl border border-dashed border-slate-200">
                     <FileText size={36} className="mx-auto text-slate-400 mb-2 opacity-60" />
                     <p className="text-sm font-semibold text-slate-800">No applications submitted yet</p>
-                    <p className="text-xs text-slate-500 mt-1">Explore verified positions matching your research background</p>
+                    <p className="text-xs text-slate-500 mt-1">Explore positions matching your research background</p>
                     <Button variant="secondary" size="sm" className="mt-4" onClick={() => navigate('/search')}>
                       Browse Faculty Openings
                     </Button>

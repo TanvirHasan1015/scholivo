@@ -1,6 +1,5 @@
-import { useState, useEffect } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { Send, ArrowLeft, MessageSquare, CheckCheck, Clock, ShieldAlert, Search, Sparkles } from 'lucide-react'
+import { useState } from 'react'
+import { Send, MessageSquare, CheckCheck, Clock } from 'lucide-react'
 import { useAuth } from '@/context/AuthContext'
 import { Avatar } from '@/components/common/Avatar'
 import { Button } from '@/components/common/Button'
@@ -82,59 +81,15 @@ const INITIAL_CONVERSATIONS: Conversation[] = [
 
 export default function Messages() {
   const { user, role } = useAuth()
-  const navigate = useNavigate()
   const [conversations, setConversations] = useState<Conversation[]>(INITIAL_CONVERSATIONS)
   const [activeConvId, setActiveConvId] = useState<string>('conv-1')
   const [inputMessage, setInputMessage] = useState('')
-
-  // Verification status check for student
-  const [verificationStatus, setVerificationStatus] = useState<string>(() => {
-    if (role === 'student') {
-      const savedVerifications = localStorage.getItem('rm_demo_verifications')
-      if (savedVerifications) {
-        try {
-          const list = JSON.parse(savedVerifications)
-          const myRecord = list.find((item: any) =>
-            (user && (item.userId === user.uid || (item.applicantEmail && user.email && item.applicantEmail.toLowerCase() === user.email.toLowerCase()))) ||
-            (!user && item.userId === 'demo-student')
-          )
-          if (myRecord) return myRecord.status
-        } catch {}
-      }
-      const savedStudent = localStorage.getItem('rm_demo_student_profile')
-      if (savedStudent) {
-        try {
-          const p = JSON.parse(savedStudent)
-          if (p.verificationStatus) return p.verificationStatus
-        } catch {}
-      }
-    }
-    return 'verified'
-  })
-
-  useEffect(() => {
-    if (role === 'student') {
-      const savedVerifications = localStorage.getItem('rm_demo_verifications')
-      if (savedVerifications) {
-        try {
-          const list = JSON.parse(savedVerifications)
-          const myRecord = list.find((item: any) =>
-            (user && (item.userId === user.uid || (item.applicantEmail && user.email && item.applicantEmail.toLowerCase() === user.email.toLowerCase()))) ||
-            (!user && item.userId === 'demo-student')
-          )
-          if (myRecord) setVerificationStatus(myRecord.status)
-        } catch {}
-      }
-    }
-  }, [user, role])
-
-  const isRestrictedStudent = role === 'student' && verificationStatus !== 'verified'
 
   const activeConv = conversations.find(c => c.id === activeConvId) || conversations[0]
 
   const handleSendMessage = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!inputMessage.trim() || isRestrictedStudent) return
+    if (!inputMessage.trim()) return
 
     const newMsg: Message = {
       id: `msg-${Date.now()}`,
@@ -158,78 +113,6 @@ export default function Messages() {
     }))
 
     setInputMessage('')
-  }
-
-  // If student is unverified / pending, render restriction barrier
-  if (isRestrictedStudent) {
-    return (
-      <div className="min-h-screen bg-slate-50/70 pt-20 pb-20 px-4 sm:px-6">
-        <div className="max-w-2xl mx-auto space-y-6">
-          <div className="flex items-center justify-between">
-            <button
-              onClick={() => navigate('/dashboard/student')}
-              className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-500 hover:text-slate-900 transition-colors py-1 px-2.5 rounded-lg hover:bg-slate-200/60"
-            >
-              <ArrowLeft size={14} />
-              Back to Student Dashboard
-            </button>
-          </div>
-
-          <div className="bg-white rounded-3xl border border-slate-200/80 p-8 sm:p-12 text-center shadow-xs space-y-6">
-            <div className="w-16 h-16 rounded-2xl bg-amber-50 border border-amber-200 flex items-center justify-center mx-auto text-amber-600">
-              <ShieldAlert size={32} />
-            </div>
-
-            <div>
-              <span className="inline-block px-3 py-1 rounded-full text-xs font-semibold bg-amber-100/80 text-amber-800 border border-amber-200 uppercase tracking-wider mb-2">
-                Verification Required
-              </span>
-              <h1 className="text-2xl sm:text-3xl font-bold font-display text-slate-900 tracking-tight">
-                Academic Messaging Restricted
-              </h1>
-            </div>
-
-            <p className="text-slate-600 text-xs sm:text-sm leading-relaxed max-w-lg mx-auto">
-              Your student affiliation is currently{' '}
-              <strong className="text-amber-800 capitalize font-semibold">{verificationStatus.replace('_', ' ')}</strong>.
-              Direct messaging with faculty is reserved for verified students to protect academic communication standards. You may still search research opportunities and save faculty profiles.
-            </p>
-
-            <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200/70 max-w-md mx-auto text-left text-xs space-y-2 text-slate-600">
-              <div className="flex items-center gap-2 font-semibold text-slate-800">
-                <Sparkles size={14} className="text-blue-600" />
-                Available During Pending Status:
-              </div>
-              <ul className="list-disc list-inside space-y-1 text-slate-500 pl-1">
-                <li>Browse complete faculty profiles and publications</li>
-                <li>Search matching research opportunities</li>
-                <li>Save professors to your personal shortlist</li>
-                <li>Update your academic profile and credentials</li>
-              </ul>
-            </div>
-
-            <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-3">
-              <Button
-                variant="primary"
-                onClick={() => navigate('/search')}
-                className="text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white"
-                id="browse-professors-btn"
-              >
-                <Search size={14} className="mr-1.5" />
-                Browse Faculty Directory
-              </Button>
-              <Button
-                variant="secondary"
-                onClick={() => navigate('/dashboard/student')}
-                className="text-xs font-semibold"
-              >
-                Return to Dashboard
-              </Button>
-            </div>
-          </div>
-        </div>
-      </div>
-    )
   }
 
   return (

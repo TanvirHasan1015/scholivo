@@ -5,7 +5,7 @@ import {
   Users, Briefcase, Plus, CheckCircle2, Clock, 
   MessageSquare, Eye, Calendar, Sparkles, Building, 
   GraduationCap, ArrowUpRight, ChevronRight, Filter, 
-  Settings, Award, ShieldCheck, Check, AlertCircle, FileText
+  Settings, Award, Check, FileText
 } from 'lucide-react'
 import { db, isDemoMode } from '@/lib/firebase'
 import { useAuth } from '@/context/AuthContext'
@@ -95,19 +95,6 @@ export default function ProfessorDashboard() {
       if (localApps) {
         try { setApplications(JSON.parse(localApps)) } catch {}
       }
-      const savedVerifications = localStorage.getItem('rm_demo_verifications')
-      if (savedVerifications) {
-        try {
-          const list = JSON.parse(savedVerifications)
-          const myRecord = list.find((item: any) =>
-            (user && (item.userId === user.uid || (item.applicantEmail && user.email && item.applicantEmail.toLowerCase() === user.email.toLowerCase()))) ||
-            (!user && item.userId === 'demo-1')
-          )
-          if (myRecord) {
-            setProfile((prev) => ({ ...prev, verificationStatus: myRecord.status }))
-          }
-        } catch {}
-      }
       return
     }
 
@@ -146,10 +133,6 @@ export default function ProfessorDashboard() {
   }
 
   const handleStatusChange = (appId: string, newStatus: ApplicationStatus) => {
-    if ((profile.verificationStatus || 'verified') !== 'verified') {
-      alert('Faculty verification required to change candidate application stages.')
-      return
-    }
     const updated = applications.map((app) => {
       if (app.id === appId) {
         return {
@@ -202,14 +185,6 @@ export default function ProfessorDashboard() {
                 <Sparkles size={13} className="text-blue-600" />
                 <span>Faculty Research Portal (Demonstration Mode)</span>
               </div>
-              <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold border ${
-                (profile.verificationStatus || 'verified') === 'verified'
-                  ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                  : 'bg-amber-50 text-amber-700 border-amber-200'
-              }`}>
-                <ShieldCheck size={13} className={(profile.verificationStatus || 'verified') === 'verified' ? 'text-emerald-600' : 'text-amber-600'} />
-                <span>{(profile.verificationStatus || 'verified') === 'verified' ? 'Verified Lab' : `Affiliation: ${profile.verificationStatus}`}</span>
-              </span>
             </div>
 
             <h1 className="font-display text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight">
@@ -346,19 +321,6 @@ export default function ProfessorDashboard() {
                 ))}
               </div>
 
-              {/* Pending Faculty Verification Alert */}
-              {(profile.verificationStatus || 'verified') !== 'verified' && (
-                <div className="p-4 rounded-2xl bg-amber-50/90 border border-amber-200 text-amber-900 text-xs flex items-start gap-3 mb-6">
-                  <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                  <div>
-                    <p className="font-semibold text-amber-950">Faculty Verification Pending</p>
-                    <p className="mt-0.5 text-amber-800 leading-relaxed">
-                      Candidate dossier evaluation and application stage transitions are locked until institutional affiliation is approved by an administrator. You may still update your research profile and prepare draft opportunities.
-                    </p>
-                  </div>
-                </div>
-              )}
-
               {/* Applications List */}
               <div className="space-y-4">
                 {filteredApplications.map((app) => (
@@ -407,9 +369,7 @@ export default function ProfessorDashboard() {
                         <select
                           value={app.status}
                           onChange={(e) => handleStatusChange(app.id, e.target.value as ApplicationStatus)}
-                          disabled={(profile.verificationStatus || 'verified') !== 'verified'}
-                          title={(profile.verificationStatus || 'verified') !== 'verified' ? 'Faculty verification required to change stage' : undefined}
-                          className="bg-white border border-slate-200 rounded-lg px-2.5 py-1 text-xs font-semibold text-slate-800 focus:border-blue-600 outline-none cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-slate-100"
+                          className="bg-white border border-slate-200 rounded-lg px-2.5 py-1 text-xs font-semibold text-slate-800 focus:border-blue-600 outline-none cursor-pointer"
                           id={`change-status-${app.id}`}
                         >
                           <option value="submitted">Submitted</option>

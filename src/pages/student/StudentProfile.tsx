@@ -547,7 +547,7 @@ export default function StudentProfilePage() {
               </div>
               <div>
                 <h3 className="text-base font-bold text-slate-900 font-display">Documents & External Links</h3>
-                <p className="text-xs text-slate-500">Provide verified links to your CV, transcript, and online portfolio</p>
+                <p className="text-xs text-slate-500">Provide links to your CV, transcript, and online portfolio</p>
               </div>
             </div>
 

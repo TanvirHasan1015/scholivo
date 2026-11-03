@@ -4,7 +4,7 @@ import { collection, getDocs, query, where, limit } from 'firebase/firestore'
 import { 
   MapPin, Globe, BookOpen, Users, ExternalLink, Heart, HeartOff, 
   ChevronDown, ChevronUp, Calendar, DollarSign, GraduationCap, Mail,
-  Sparkles, CheckCircle2, ArrowLeft, ArrowUpRight, Award, ShieldCheck,
+  Sparkles, CheckCircle2, ArrowLeft, ArrowUpRight, Award,
   Building, Briefcase
 } from 'lucide-react'
 import { db, isDemoMode } from '@/lib/firebase'
@@ -17,7 +17,7 @@ import { computeMatch } from '@/lib/matching'
 import { Avatar } from '@/components/common/Avatar'
 import { Button } from '@/components/common/Button'
 import { MatchScoreBadge } from '@/components/matching/MatchScore'
-import { VerificationBadge, RecruitingBadge } from '@/components/common/Badges'
+import { RecruitingBadge } from '@/components/common/Badges'
 import { formatDate, FUNDING_LABELS, cn } from '@/utils/helpers'
 
 type Tab = 'overview' | 'research' | 'positions' | 'publications' | 'lab'
@@ -230,7 +230,6 @@ export default function ProfessorProfilePage() {
                 </div>
 
                 <div className="flex flex-wrap gap-2">
-                  <VerificationBadge status={professor.verificationStatus} />
                   <RecruitingBadge status={professor.recruitingStatus} />
                 </div>
               </div>

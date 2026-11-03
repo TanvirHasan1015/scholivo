@@ -3,7 +3,7 @@ import { Link, useNavigate } from 'react-router-dom'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { BookOpen, User, GraduationCap, FlaskConical, Shield, ChevronRight, ChevronLeft, Upload, CheckCircle } from 'lucide-react'
+import { BookOpen, User, GraduationCap, FlaskConical, ChevronRight, ChevronLeft } from 'lucide-react'
 import { doc, setDoc, serverTimestamp } from 'firebase/firestore'
 import { useAuth } from '@/context/AuthContext'
 import { db } from '@/lib/firebase'
@@ -32,7 +32,6 @@ const STEPS = [
   { id: 'account', label: 'Account', icon: User },
   { id: 'profile', label: 'Profile', icon: GraduationCap },
   { id: 'research', label: 'Research', icon: FlaskConical },
-  { id: 'verification', label: 'Verify', icon: Shield },
 ]
 
 const TITLES = [
@@ -67,8 +66,6 @@ export default function ProfessorSignup() {
     researchAreas: [] as string[],
     researchInterests: [] as string[],
   })
-
-  const [verificationDoc, setVerificationDoc] = useState<File | null>(null)
 
   const handleNext = async () => {
     if (currentStep === 0) {
@@ -106,8 +103,6 @@ export default function ProfessorSignup() {
         researchInterests: research.researchInterests || ['Machine Learning'],
         currentProjects: [],
         publications: [],
-        verificationStatus: 'pending' as const,
-        verificationDocuments: [],
         accountStatus: 'active' as const,
         isRecruiting: false,
         recruitingStatus: 'not_recruiting' as const,
@@ -118,29 +113,7 @@ export default function ProfessorSignup() {
       // 1. Save profile to localStorage
       localStorage.setItem('rm_demo_professor_profile', JSON.stringify(newProfProfile))
 
-      // 2. Queue verification request in rm_demo_verifications
-      const newVerificationReq = {
-        id: `req-${Date.now()}`,
-        userId: user.uid,
-        userName: accountData.fullName,
-        userEmail: accountData.email,
-        userRole: 'professor' as const,
-        university: profile.university || 'Stanford University',
-        department: profile.department || 'Computer Science',
-        academicTitleOrDegree: accountData.academicTitle || 'Assistant Professor',
-        docType: verificationDoc ? 'Institutional Faculty Proof Document' : 'Official Academic Webpage Directory',
-        docUrl: profile.universityProfileUrl || 'https://example.com/faculty_id.pdf',
-        officialProfileUrl: profile.universityProfileUrl || 'https://stanford.edu/faculty',
-        status: 'pending' as const,
-        accountStatus: 'active' as const,
-        submittedAt: new Date().toISOString(),
-      }
-
-      const existingVerifications = localStorage.getItem('rm_demo_verifications')
-      const verificationsList = existingVerifications ? JSON.parse(existingVerifications) : []
-      localStorage.setItem('rm_demo_verifications', JSON.stringify([newVerificationReq, ...verificationsList]))
-
-      // 3. Add to rm_demo_system_users
+      // 2. Add to rm_demo_system_users
       const newSystemUser = {
         uid: user.uid,
         displayName: accountData.fullName,
@@ -149,7 +122,6 @@ export default function ProfessorSignup() {
         university: profile.university || 'Stanford University',
         department: profile.department || 'Computer Science',
         academicTitleOrDegree: accountData.academicTitle || 'Assistant Professor',
-        verificationStatus: 'pending' as const,
         accountStatus: 'active' as const,
         createdAt: new Date().toISOString().slice(0, 10),
         openPositionsCount: 0,
@@ -276,68 +248,9 @@ export default function ProfessorSignup() {
             </div>
           )}
 
-          {/* Step 3: Verification */}
-          {currentStep === 3 && (
-            <div className="space-y-5 fade-in-up">
-              <h2 className="font-semibold text-white text-lg mb-2">Account Verification</h2>
-              <p className="text-sm text-slate-400 mb-5">
-                Professor accounts require verification to ensure the integrity of the platform.
-                Your account will be reviewed by our admin team within 2–3 business days.
-              </p>
-
-              {/* Verification steps */}
-              <div className="space-y-3">
-                {[
-                  { n: 1, label: 'Email Verification', desc: 'A verification link will be sent to your university email after signup.', done: true },
-                  { n: 2, label: 'Upload Institutional Proof', desc: 'Upload your faculty ID, appointment letter, or institutional proof.', done: false },
-                  { n: 3, label: 'Admin Review', desc: 'Our team reviews your documents and approves your account.', done: false },
-                ].map(({ n, label, desc, done }) => (
-                  <div key={n} className="flex gap-3 p-4 glass rounded-xl border border-white/8">
-                    <div className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 mt-0.5 ${done ? 'bg-indigo-600' : 'bg-white/8 border border-white/15'}`}>
-                      {done ? <CheckCircle size={14} className="text-white" /> : <span className="text-xs text-slate-500">{n}</span>}
-                    </div>
-                    <div>
-                      <p className="text-sm font-medium text-white">{label}</p>
-                      <p className="text-xs text-slate-500 mt-0.5">{desc}</p>
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              {/* Document upload */}
-              <div
-                className="glass rounded-2xl border-2 border-dashed border-white/15 p-8 text-center hover:border-indigo-500/40 transition-colors cursor-pointer"
-                onClick={() => document.getElementById('verification-doc-input')?.click()}
-                id="verification-upload-area"
-              >
-                <input
-                  id="verification-doc-input"
-                  type="file"
-                  accept=".pdf,.jpg,.jpeg,.png"
-                  className="hidden"
-                  onChange={(e) => setVerificationDoc(e.target.files?.[0] || null)}
-                />
-                {verificationDoc ? (
-                  <div className="flex flex-col items-center gap-2">
-                    <CheckCircle size={28} className="text-emerald-400" />
-                    <p className="text-sm text-emerald-400 font-medium">{verificationDoc.name}</p>
-                    <p className="text-xs text-slate-500">Click to change file</p>
-                  </div>
-                ) : (
-                  <div className="flex flex-col items-center gap-2">
-                    <Upload size={28} className="text-slate-600" />
-                    <p className="text-sm text-slate-400">Upload Faculty ID or Institutional Proof</p>
-                    <p className="text-xs text-slate-600">PDF, JPG or PNG — max 10MB</p>
-                    <Button variant="secondary" size="sm" type="button" className="mt-2">Select File</Button>
-                  </div>
-                )}
-              </div>
-
-              {error && (
-                <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3 text-sm text-red-400">
-                  {error}
-                </div>
-              )}
+          {error && (
+            <div className="mt-4 rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3 text-sm text-red-400">
+              {error}
             </div>
           )}
 

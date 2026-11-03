@@ -3,7 +3,7 @@ import { Link, useNavigate } from 'react-router-dom'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { Mail, Lock, Eye, EyeOff, Sparkles, ArrowRight, Shield } from 'lucide-react'
+import { Mail, Lock, Eye, EyeOff, Sparkles, ArrowRight } from 'lucide-react'
 import { useAuth } from '@/context/AuthContext'
 import { isDemoMode } from '@/lib/firebase'
 import { Input } from '@/components/common/Input'
@@ -36,7 +36,6 @@ export default function Login() {
       setTimeout(() => {
         const currentRole = role
         if (currentRole === 'professor') navigate('/dashboard/professor')
-        else if (currentRole === 'admin') navigate('/admin')
         else navigate('/dashboard/student')
       }, 100)
     } catch (err: unknown) {
@@ -66,16 +65,6 @@ export default function Login() {
       navigate('/dashboard/professor')
     } catch {
       setAuthError('Demo professor sign in failed.')
-    }
-  }
-
-  const handleDemoAdminSignIn = async () => {
-    setAuthError('')
-    try {
-      await signIn('admin@scholivo.edu', 'demo123')
-      navigate('/admin')
-    } catch {
-      setAuthError('Demo admin sign in failed.')
     }
   }
 
@@ -157,19 +146,6 @@ export default function Login() {
               >
                 <Sparkles size={14} className="text-indigo-600" />
                 <span>Quick Sign-in as Demo Professor (Prof. Kim)</span>
-              </Button>
-
-              <Button
-                type="button"
-                variant="outline"
-                fullWidth
-                size="md"
-                onClick={handleDemoAdminSignIn}
-                className="flex items-center justify-center gap-2 border-dashed border-purple-300 bg-purple-50/50 text-purple-700 hover:bg-purple-50 cursor-pointer font-semibold"
-                id="demo-admin-login-btn"
-              >
-                <Shield size={14} className="text-purple-600" />
-                <span>Quick Sign-in as Demo Administrator</span>
               </Button>
             </div>
           )}

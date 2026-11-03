@@ -29,11 +29,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [role, setRole] = useState<UserRole | null>(null)
   const [loading, setLoading] = useState(true)
 
+  const isValidRole = (value: unknown): value is UserRole =>
+    value === 'student' || value === 'professor'
+
   const fetchRole = async (uid: string): Promise<UserRole | null> => {
     try {
       const snap = await getDoc(doc(db, 'users', uid))
       if (snap.exists()) {
-        return snap.data().role as UserRole
+        const fetchedRole = snap.data().role
+        return isValidRole(fetchedRole) ? fetchedRole : null
       }
     } catch (e) {
       console.error('Failed to fetch role:', e)
@@ -50,8 +54,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (saved && !isLoggedOut) {
         try {
           const parsed = JSON.parse(saved)
-          setUser(parsed.user)
-          setRole(parsed.role)
+          if (parsed?.user && isValidRole(parsed?.role)) {
+            setUser(parsed.user)
+            setRole(parsed.role)
+          } else {
+            localStorage.removeItem('rm_demo_user')
+            setUser(null)
+            setRole(null)
+          }
         } catch {
           localStorage.removeItem('rm_demo_user')
           setUser(null)
@@ -107,18 +117,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }
       }
 
-      const assignedRole: UserRole = matchedSysUser?.role
+      const assignedRole: UserRole = isValidRole(matchedSysUser?.role)
         ? matchedSysUser.role
-        : lower.includes('admin')
-        ? 'admin'
         : (lower.includes('prof') || lower.includes('faculty') || lower.includes('kim'))
         ? 'professor'
         : 'student'
 
       const demoUser = {
-        uid: matchedSysUser?.uid || (assignedRole === 'professor' ? 'demo-1' : assignedRole === 'admin' ? 'demo-admin' : 'demo-student'),
-        email: matchedSysUser?.email || email || (assignedRole === 'professor' ? 'minji.kim@kaist.ac.kr' : assignedRole === 'admin' ? 'admin@scholivo.edu' : 'alex.rivera@university.edu'),
-        displayName: matchedSysUser?.displayName || (assignedRole === 'professor' ? 'Prof. Minji Kim' : assignedRole === 'admin' ? 'System Administrator' : 'Alex Rivera'),
+        uid: matchedSysUser?.uid || (assignedRole === 'professor' ? 'demo-1' : 'demo-student'),
+        email: matchedSysUser?.email || email || (assignedRole === 'professor' ? 'minji.kim@kaist.ac.kr' : 'alex.rivera@university.edu'),
+        displayName: matchedSysUser?.displayName || (assignedRole === 'professor' ? 'Prof. Minji Kim' : 'Alex Rivera'),
         photoURL: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&q=80&w=200',
         emailVerified: true,
       } as unknown as User

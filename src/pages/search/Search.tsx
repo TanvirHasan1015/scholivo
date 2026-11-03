@@ -14,7 +14,7 @@ import { computeMatch } from '@/lib/matching'
 import { Avatar } from '@/components/common/Avatar'
 import { Button } from '@/components/common/Button'
 import { MatchChip } from '@/components/matching/MatchScore'
-import { VerificationBadge, RecruitingBadge } from '@/components/common/Badges'
+import { RecruitingBadge } from '@/components/common/Badges'
 import { RESEARCH_AREAS, COUNTRIES, FUNDING_LABELS, cn } from '@/utils/helpers'
 
 const DEGREE_FILTER_OPTIONS = ['Master', 'PhD', 'Research_Assistant', 'PostDoc']
@@ -74,7 +74,7 @@ export default function SearchPage() {
 
       try {
         const snap = await getDocs(
-          query(collection(db, 'professors'), where('verificationStatus', '==', 'verified'), limit(50))
+          query(collection(db, 'professors'), limit(50))
         )
 
         const results: ProfessorWithPositions[] = []
@@ -176,13 +176,13 @@ export default function SearchPage() {
             <div>
               <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-blue-50 border border-blue-200 text-blue-700 text-xs font-semibold mb-2">
                 <Sparkles size={13} className="text-blue-600" />
-                <span>Verified Faculty Directory</span>
+                <span>Professor Directory</span>
               </div>
               <h1 className="font-display text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight">
                 Find Research Labs & Professors
               </h1>
               <p className="text-slate-500 text-sm mt-1">
-                Search verified faculty by research field, institution, and funded graduate openings
+                Search faculty by research field, institution, and funded graduate openings
               </p>
             </div>
           </div>
@@ -478,11 +478,8 @@ function ProfessorCard({
           )}
         </div>
 
-        {/* Verification & Recruiting Badges */}
+        {/* Recruiting Badge */}
         <div className="flex flex-wrap items-center gap-1.5 mb-3.5">
-          {professor.verificationStatus === 'verified' && (
-            <VerificationBadge status="verified" />
-          )}
           <RecruitingBadge status={professor.recruitingStatus} />
         </div>
 

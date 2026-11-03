@@ -40,7 +40,7 @@ export interface LanguageScore {
 
 // ── User (Shared) ─────────────────────────────────────────────────────────────
 
-export type UserRole = 'student' | 'professor' | 'admin'
+export type UserRole = 'student' | 'professor'
 
 export interface BaseUser {
   uid: string
@@ -97,12 +97,8 @@ export interface StudentProfile {
   transcriptUrl?: string
   portfolioUrl?: string
 
-  // Affiliation Verification & Account
-  verificationStatus?: AffiliationVerificationStatus
+  // Account Status
   accountStatus?: AccountStatus
-  verificationNotes?: string
-  verificationDocUrl?: string
-  verificationRequestedAt?: string
 
   // Meta
   profileCompleteness: number
@@ -111,37 +107,11 @@ export interface StudentProfile {
   updatedAt: string
 }
 
-// ── Verification & Account Status ──────────────────────────────────────────────
-
-export type AffiliationVerificationStatus =
-  | 'unverified'
-  | 'pending'
-  | 'verified'
-  | 'rejected'
-  | 'more_info_required'
+// ── Account & Recruiting Status ───────────────────────────────────────────────
 
 export type AccountStatus = 'active' | 'suspended' | 'banned'
 
-export type VerificationStatus = AffiliationVerificationStatus | 'unsubmitted'
 export type RecruitingStatus = 'actively_recruiting' | 'sometimes' | 'not_recruiting'
-
-export interface VerificationAuditLog {
-  id: string
-  userId: string
-  userName: string
-  userRole: UserRole
-  decision: AffiliationVerificationStatus
-  note?: string
-  reviewer: string
-  reviewedAt: string
-}
-
-export interface VerificationDoc {
-  type: 'faculty_id' | 'institutional_proof' | 'student_id' | 'enrollment_cert' | 'other'
-  url: string
-  uploadedAt: string
-  fileName: string
-}
 
 export interface ResearchProject {
   id: string
@@ -193,11 +163,7 @@ export interface ProfessorProfile {
   labWebsiteUrl?: string
   labMembers?: LabMember[]
 
-  // Verification & Status
-  verificationStatus: VerificationStatus
-  verificationDocuments: VerificationDoc[]
-  verifiedAt?: string
-  verificationNotes?: string
+  // Account Status
   accountStatus?: AccountStatus
 
   // Recruiting
