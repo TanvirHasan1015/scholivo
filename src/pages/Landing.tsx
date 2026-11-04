@@ -1,4 +1,6 @@
-import { Link, useNavigate } from 'react-router-dom'
+import { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { collection, getDocs, limit, query } from 'firebase/firestore'
 import {
   Search,
   Sparkles,
@@ -13,59 +15,61 @@ import {
   Shield,
   BarChart3,
   Users,
-  CheckCircle2,
   ChevronRight,
 } from 'lucide-react'
+import { db } from '@/lib/firebase'
+import type { ProfessorProfile } from '@/types/user.types'
 import { Button } from '@/components/common/Button'
+import { Avatar } from '@/components/common/Avatar'
 
 // ── Research Areas Data ────────────────────────────────────────────────────────
 
 const RESEARCH_AREAS = [
   {
     title: 'Artificial Intelligence',
-    count: '32 professors',
+    count: 'Explore labs',
     icon: Sparkles,
     bgClass: 'bg-indigo-50 text-indigo-600 border-indigo-100',
   },
   {
     title: 'Computer Vision',
-    count: '39 professors',
+    count: 'Explore labs',
     icon: Eye,
     bgClass: 'bg-blue-50 text-blue-600 border-blue-100',
   },
   {
     title: 'Machine Learning',
-    count: '46 professors',
+    count: 'Explore labs',
     icon: Cpu,
     bgClass: 'bg-emerald-50 text-emerald-600 border-emerald-100',
   },
   {
     title: 'Robotics',
-    count: '53 professors',
+    count: 'Explore labs',
     icon: Bot,
     bgClass: 'bg-amber-50 text-amber-600 border-amber-100',
   },
   {
     title: 'Cybersecurity',
-    count: '60 professors',
+    count: 'Explore labs',
     icon: Shield,
     bgClass: 'bg-blue-50 text-blue-600 border-blue-100',
   },
   {
     title: 'Natural Language Processing',
-    count: '67 professors',
+    count: 'Explore labs',
     icon: MessageSquare,
     bgClass: 'bg-purple-50 text-purple-600 border-purple-100',
   },
   {
     title: 'Data Science',
-    count: '74 professors',
+    count: 'Explore labs',
     icon: BarChart3,
     bgClass: 'bg-emerald-50 text-emerald-600 border-emerald-100',
   },
   {
     title: 'Human–Computer Interaction',
-    count: '81 professors',
+    count: 'Explore labs',
     icon: Users,
     bgClass: 'bg-amber-50 text-amber-600 border-amber-100',
   },
@@ -81,52 +85,45 @@ const STEPS = [
   { step: '5', title: 'Connect & interview' },
 ]
 
-// ── Featured Professors Data ──────────────────────────────────────────────────
-
-const FEATURED_PROFESSORS = [
-  {
-    name: 'Prof. Minji Kim',
-    username: 'profkim',
-    academicTitle: 'Associate Professor',
-    department: 'School of Computing',
-    university: 'KAIST',
-    avatarUrl:
-      'https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?auto=format&fit=crop&q=80&w=300',
-    researchAreas: ['Medical AI', 'Computer Vision', 'Deep Learning'],
-    matchScore: 94,
-    recruiting: true,
-    funded: true,
-  },
-  {
-    name: 'Prof. Daniel Lee',
-    username: 'proflee',
-    academicTitle: 'Professor',
-    department: 'Computer Science & Engineering',
-    university: 'Seoul National University',
-    avatarUrl:
-      'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&q=80&w=300',
-    researchAreas: ['Robotics', 'Control Systems', 'Autonomous Vehicles'],
-    matchScore: 91,
-    recruiting: true,
-    funded: true,
-  },
-  {
-    name: 'Prof. Emily Chen',
-    username: 'profchen',
-    academicTitle: 'Assistant Professor',
-    department: 'CSAIL',
-    university: 'MIT',
-    avatarUrl:
-      'https://images.unsplash.com/photo-1580489944761-15a19d654956?auto=format&fit=crop&q=80&w=300',
-    researchAreas: ['NLP', 'Language Models', 'AI Safety'],
-    matchScore: 89,
-    recruiting: true,
-    funded: true,
-  },
-]
-
 export default function Landing() {
   const navigate = useNavigate()
+  const [featuredProfessors, setFeaturedProfessors] = useState<ProfessorProfile[]>([])
+  const [loadingFeatured, setLoadingFeatured] = useState(true)
+
+  useEffect(() => {
+    let cancelled = false
+    async function loadFeatured() {
+      try {
+        const snap = await getDocs(query(collection(db, 'professors'), limit(3)))
+        if (cancelled) return
+        const list: ProfessorProfile[] = []
+        snap.forEach((d) => {
+          const raw = d.data() as Partial<ProfessorProfile>
+          list.push({
+            ...(raw as ProfessorProfile),
+            uid: raw.uid || d.id,
+            fullName: raw.fullName ?? 'Professor',
+            username: raw.username ?? d.id,
+            academicTitle: raw.academicTitle ?? 'Faculty',
+            department: raw.department ?? '',
+            university: raw.university ?? '',
+            researchAreas: Array.isArray(raw.researchAreas) ? raw.researchAreas : [],
+            isRecruiting: Boolean(raw.isRecruiting),
+          })
+        })
+        setFeaturedProfessors(list)
+      } catch (err) {
+        console.error('Failed to load featured professors:', err)
+        if (!cancelled) setFeaturedProfessors([])
+      } finally {
+        if (!cancelled) setLoadingFeatured(false)
+      }
+    }
+    loadFeatured()
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   return (
     <div className="bg-slate-50 min-h-screen text-slate-900">
@@ -175,36 +172,6 @@ export default function Landing() {
                 Join Scholivo
               </Button>
             </div>
-
-            {/* Social Proof Avatars */}
-            <div className="pt-6 flex items-center gap-3.5">
-              <div className="flex -space-x-2.5 overflow-hidden">
-                <img
-                  className="inline-block h-8 w-8 rounded-full ring-2 ring-white object-cover"
-                  src="https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&q=80&w=120"
-                  alt="Professor"
-                />
-                <img
-                  className="inline-block h-8 w-8 rounded-full ring-2 ring-white object-cover"
-                  src="https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&q=80&w=120"
-                  alt="Professor"
-                />
-                <img
-                  className="inline-block h-8 w-8 rounded-full ring-2 ring-white object-cover"
-                  src="https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?auto=format&fit=crop&q=80&w=120"
-                  alt="Professor"
-                />
-                <img
-                  className="inline-block h-8 w-8 rounded-full ring-2 ring-white object-cover"
-                  src="https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&q=80&w=120"
-                  alt="Professor"
-                />
-              </div>
-              <p className="text-xs font-medium text-slate-500">
-                <strong className="font-semibold text-slate-800">2,400+</strong>{' '}
-                professors across leading universities
-              </p>
-            </div>
           </div>
 
           {/* Right Column: Match Maker Widget ("HOW YOUR MATCH IS MADE") */}
@@ -220,30 +187,28 @@ export default function Landing() {
                 {/* Student Profile */}
                 <div className="flex items-center gap-3">
                   <div className="w-11 h-11 rounded-full bg-slate-200 text-slate-700 font-bold text-xs flex items-center justify-center shrink-0 border border-slate-300/60">
-                    TH
+                    YOU
                   </div>
                   <div>
                     <h4 className="text-xs font-bold text-slate-900 leading-tight">Your profile</h4>
-                    <p className="text-[11px] text-slate-500">AI · Computer Vision</p>
+                    <p className="text-[11px] text-slate-500">Interests · Skills · GPA</p>
                   </div>
                 </div>
 
                 {/* Match Score Indicator Pill */}
                 <div className="px-2.5 py-1 rounded-full bg-emerald-600 text-white text-xs font-extrabold shadow-xs shrink-0">
-                  94%
+                  AI Match
                 </div>
 
                 {/* Professor Profile */}
                 <div className="flex items-center gap-3 text-right justify-end">
                   <div>
-                    <h4 className="text-xs font-bold text-slate-900 leading-tight">Prof. Minji Kim</h4>
-                    <p className="text-[11px] text-slate-500">Medical AI · KAIST</p>
+                    <h4 className="text-xs font-bold text-slate-900 leading-tight">Research Lab</h4>
+                    <p className="text-[11px] text-slate-500">Open Positions</p>
                   </div>
-                  <img
-                    src="https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?auto=format&fit=crop&q=80&w=160"
-                    alt="Prof. Minji Kim"
-                    className="w-11 h-11 rounded-full object-cover shrink-0 border border-slate-200"
-                  />
+                  <div className="w-11 h-11 rounded-full bg-blue-50 text-blue-600 font-bold text-xs flex items-center justify-center shrink-0 border border-blue-200">
+                    LAB
+                  </div>
                 </div>
               </div>
 
@@ -254,7 +219,7 @@ export default function Landing() {
                     <Check size={11} className="text-emerald-700 stroke-[3]" />
                     <span>Research fit</span>
                   </div>
-                  <div className="text-xs font-bold text-emerald-900 mt-0.5">96%</div>
+                  <div className="text-xs font-bold text-emerald-900 mt-0.5">Topics</div>
                 </div>
 
                 <div className="bg-emerald-50/90 border border-emerald-200/80 rounded-xl p-2.5 text-center">
@@ -262,7 +227,7 @@ export default function Landing() {
                     <Check size={11} className="text-emerald-700 stroke-[3]" />
                     <span>Skills fit</span>
                   </div>
-                  <div className="text-xs font-bold text-emerald-900 mt-0.5">92%</div>
+                  <div className="text-xs font-bold text-emerald-900 mt-0.5">Tools</div>
                 </div>
 
                 <div className="bg-emerald-50/90 border border-emerald-200/80 rounded-xl p-2.5 text-center">
@@ -270,13 +235,13 @@ export default function Landing() {
                     <Check size={11} className="text-emerald-700 stroke-[3]" />
                     <span>Academic fit</span>
                   </div>
-                  <div className="text-xs font-bold text-emerald-900 mt-0.5">95%</div>
+                  <div className="text-xs font-bold text-emerald-900 mt-0.5">Background</div>
                 </div>
               </div>
 
-              {/* Embedded Recommended Opportunity Card */}
+              {/* Embedded Explore Directory Card */}
               <div
-                onClick={() => navigate('/professor/profkim')}
+                onClick={() => navigate('/search')}
                 className="group cursor-pointer bg-slate-900 text-white rounded-2xl p-4 flex items-center justify-between gap-3 hover:bg-slate-800 transition-all shadow-md"
               >
                 <div className="flex items-center gap-3">
@@ -285,12 +250,12 @@ export default function Landing() {
                   </div>
                   <div>
                     <span className="block text-[10px] font-bold tracking-wider text-slate-400 uppercase">
-                      RECOMMENDED OPPORTUNITY
+                      EXPLORE DIRECTORY
                     </span>
                     <h5 className="text-xs font-bold text-white group-hover:text-blue-300 transition-colors">
-                      PhD in Medical AI
+                      Browse Open Graduate Positions
                     </h5>
-                    <p className="text-[11px] text-slate-400">Fully funded · Fall 2026</p>
+                    <p className="text-[11px] text-slate-400">Master's & PhD research opportunities</p>
                   </div>
                 </div>
                 <div className="w-7 h-7 rounded-lg bg-slate-800 flex items-center justify-center text-slate-400 group-hover:text-white group-hover:translate-x-0.5 transition-all shrink-0">
@@ -395,13 +360,13 @@ export default function Landing() {
         </div>
       </section>
 
-      {/* ── 4. Featured Professors Section ("HIGHLY MATCHED") ──────────────── */}
+      {/* ── 4. Featured Professors Section ─────────────────────────────────── */}
       <section className="py-20 bg-slate-50 border-t border-slate-200/80">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4 mb-10">
             <div>
               <span className="text-xs font-bold tracking-widest text-blue-600 uppercase">
-                HIGHLY MATCHED
+                FACULTY DIRECTORY
               </span>
               <h2 className="font-display text-2xl sm:text-3xl font-extrabold text-slate-900 tracking-tight mt-1">
                 Featured professors
@@ -417,74 +382,90 @@ export default function Landing() {
             </Button>
           </div>
 
-          {/* Cards Grid */}
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            {FEATURED_PROFESSORS.map((prof) => (
-              <div
-                key={prof.username}
-                className="bg-white rounded-2xl border border-slate-200 shadow-2xs hover:shadow-md hover:border-slate-300 transition-all duration-200 p-6 flex flex-col justify-between"
-              >
-                {/* Professor Info Header */}
-                <div className="space-y-4">
-                  <div className="flex items-start gap-3.5">
-                    <img
-                      src={prof.avatarUrl}
-                      alt={prof.name}
-                      className="w-14 h-14 rounded-full object-cover border border-slate-200 shrink-0 shadow-2xs"
-                    />
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-1.5 flex-wrap">
-                        <h3 className="font-display text-base font-bold text-slate-900 truncate">
-                          {prof.name}
-                        </h3>
+          {loadingFeatured ? (
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              {Array.from({ length: 3 }).map((_, idx) => (
+                <div key={idx} className="bg-white rounded-2xl border border-slate-200 p-6 space-y-4 animate-pulse">
+                  <div className="flex items-center gap-3.5">
+                    <div className="w-14 h-14 rounded-full bg-slate-200" />
+                    <div className="flex-1 space-y-2">
+                      <div className="h-4 bg-slate-200 rounded w-2/3" />
+                      <div className="h-3 bg-slate-200 rounded w-1/2" />
+                    </div>
+                  </div>
+                  <div className="h-8 bg-slate-100 rounded-xl" />
+                </div>
+              ))}
+            </div>
+          ) : featuredProfessors.length === 0 ? (
+            <div className="bg-white rounded-2xl border border-slate-200 p-10 text-center space-y-3">
+              <GraduationCap size={32} className="mx-auto text-slate-400" />
+              <h3 className="text-base font-bold text-slate-900 font-display">No featured professors yet</h3>
+              <p className="text-xs text-slate-500 max-w-md mx-auto">
+                Registered professors and their active research opportunities will appear here as they join Scholivo.
+              </p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              {featuredProfessors.map((prof) => (
+                <div
+                  key={prof.uid}
+                  className="bg-white rounded-2xl border border-slate-200 shadow-2xs hover:shadow-md hover:border-slate-300 transition-all duration-200 p-6 flex flex-col justify-between"
+                >
+                  {/* Professor Info Header */}
+                  <div className="space-y-4">
+                    <div className="flex items-start gap-3.5">
+                      <Avatar src={prof.photoURL} name={prof.fullName} size="lg" />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <h3 className="font-display text-base font-bold text-slate-900 truncate">
+                            {prof.fullName}
+                          </h3>
+                        </div>
+                        <p className="text-xs text-slate-600 mt-1 font-medium">
+                          {prof.academicTitle}{prof.department ? ` · ${prof.department}` : ''}
+                        </p>
+                        <p className="text-xs font-bold text-slate-900 mt-0.5">{prof.university}</p>
                       </div>
-                      <p className="text-xs text-slate-600 mt-2 font-medium">
-                        {prof.academicTitle} · {prof.department}
-                      </p>
-                      <p className="text-xs font-bold text-slate-900 mt-0.5">{prof.university}</p>
+                    </div>
+
+                    {/* Research Area Tags */}
+                    <div className="flex flex-wrap gap-1.5 pt-2">
+                      {(prof.researchAreas || []).slice(0, 3).map((area) => (
+                        <span key={area} className="tag text-xs">
+                          {area}
+                        </span>
+                      ))}
                     </div>
                   </div>
 
-                  {/* Research Area Tags */}
-                  <div className="flex flex-wrap gap-1.5 pt-2">
-                    {prof.researchAreas.map((area) => (
-                      <span key={area} className="tag text-xs">
-                        {area}
-                      </span>
-                    ))}
+                  {/* Bottom Meta & Action */}
+                  <div className="pt-6 mt-6 border-t border-slate-100 flex items-center justify-between gap-2 flex-wrap">
+                    <div className="flex items-center gap-2">
+                      {prof.isRecruiting && (
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                          Recruiting
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-2 ml-auto">
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        onClick={() => navigate(`/professor/${prof.username}`)}
+                        className="text-xs py-1.5 px-3"
+                      >
+                        <span>View</span>
+                        <ArrowRight size={12} />
+                      </Button>
+                    </div>
                   </div>
                 </div>
-
-                {/* Bottom Meta & Action */}
-                <div className="pt-6 mt-6 border-t border-slate-100 flex items-center justify-between gap-2 flex-wrap">
-                  <div className="flex items-center gap-2">
-                    <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
-                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                      Recruiting
-                    </span>
-                    <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-slate-100 text-slate-600">
-                      Fully funded
-                    </span>
-                  </div>
-
-                  <div className="flex items-center gap-2 ml-auto">
-                    <span className="text-xs font-bold text-emerald-700">
-                      {prof.matchScore}% Match
-                    </span>
-                    <Button
-                      variant="primary"
-                      size="sm"
-                      onClick={() => navigate(`/professor/${prof.username}`)}
-                      className="text-xs py-1.5 px-3"
-                    >
-                      <span>View</span>
-                      <ArrowRight size={12} />
-                    </Button>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
         </div>
       </section>
 

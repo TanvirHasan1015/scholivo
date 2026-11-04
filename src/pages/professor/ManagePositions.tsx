@@ -1,14 +1,15 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { collection, doc, getDoc, getDocs, limit, query, setDoc, updateDoc, where } from 'firebase/firestore'
 import { 
-  Plus, ArrowLeft, Trash2, Calendar, DollarSign, Check, 
-  Edit3, X, Briefcase, GraduationCap, Users, 
-  Sparkles, ExternalLink, ChevronDown, CheckCircle2 
+  Plus, ArrowLeft, Calendar, DollarSign, Check, 
+  Edit3, X, Briefcase, AlertCircle, RefreshCw
 } from 'lucide-react'
 import { useAuth } from '@/context/AuthContext'
-import { isDemoMode } from '@/lib/firebase'
+import { db } from '@/lib/firebase'
+import type { ProfessorProfile } from '@/types/user.types'
 import type { Position, DegreeType, FundingType } from '@/types/position.types'
-import { DEMO_PROFESSORS, DEMO_PROFESSOR_APPLICATIONS } from '@/lib/demoData'
+import type { Application } from '@/types/application.types'
 import { Button } from '@/components/common/Button'
 import { TagInput } from '@/components/common/TagInput'
 import { RESEARCH_AREAS, FUNDING_LABELS, formatDate } from '@/utils/helpers'
@@ -17,20 +18,13 @@ export default function ManagePositions() {
   const { user } = useAuth()
   const navigate = useNavigate()
 
-  // Default positions from Prof. Minji Kim
-  const defaultPositions = DEMO_PROFESSORS[0].positions
-
-  const [positions, setPositions] = useState<Position[]>(() => {
-    const local = localStorage.getItem('rm_demo_positions')
-    if (local) {
-      try {
-        return JSON.parse(local)
-      } catch {
-        // fallback
-      }
-    }
-    return defaultPositions
-  })
+  const [profProfile, setProfProfile] = useState<ProfessorProfile | null>(null)
+  const [positions, setPositions] = useState<Position[]>([])
+  const [applications, setApplications] = useState<Application[]>([])
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
+  const [actionError, setActionError] = useState('')
+  const [saving, setSaving] = useState(false)
 
   // Editing or creating modal/panel state
   const [isFormOpen, setIsFormOpen] = useState(false)
@@ -40,7 +34,7 @@ export default function ManagePositions() {
   // Form inputs
   const [title, setTitle] = useState('')
   const [degreeType, setDegreeType] = useState<DegreeType>('PhD')
-  const [researchArea, setResearchArea] = useState('Computer Vision')
+  const [researchArea, setResearchArea] = useState(RESEARCH_AREAS[0] || 'Artificial Intelligence')
   const [description, setDescription] = useState('')
   const [researchTopics, setResearchTopics] = useState<string[]>([])
   const [requiredSkills, setRequiredSkills] = useState<string[]>([])
@@ -49,35 +43,74 @@ export default function ManagePositions() {
   const [fundingType, setFundingType] = useState<FundingType>('fully_funded')
   const [stipend, setStipend] = useState('')
   const [applicationDeadline, setApplicationDeadline] = useState('')
-  const [startDate, setStartDate] = useState('Spring 2027')
+  const [startDate, setStartDate] = useState('')
 
-  useEffect(() => {
-    if (isDemoMode) {
-      const local = localStorage.getItem('rm_demo_positions')
-      if (local) {
-        try {
-          setPositions(JSON.parse(local))
-        } catch {
-          setPositions(defaultPositions)
+  const loadPositionsAndProfile = useCallback(async () => {
+    if (!user) {
+      setLoading(false)
+      return
+    }
+    setLoading(true)
+    setLoadError('')
+
+    try {
+      // 1. Load Professor Profile
+      let loadedProf: ProfessorProfile | null = null
+      const directSnap = await getDoc(doc(db, 'professors', user.uid))
+      if (directSnap.exists()) {
+        loadedProf = { ...(directSnap.data() as ProfessorProfile), uid: user.uid }
+      } else {
+        const fallbackSnap = await getDocs(
+          query(collection(db, 'professors'), where('uid', '==', user.uid), limit(1))
+        )
+        if (!fallbackSnap.empty) {
+          loadedProf = { ...(fallbackSnap.docs[0].data() as ProfessorProfile), uid: user.uid }
         }
       }
+      setProfProfile(loadedProf)
+
+      // 2. Load Professor's Positions
+      const posSnap = await getDocs(
+        query(collection(db, 'positions'), where('professorId', '==', user.uid))
+      )
+      const posList: Position[] = []
+      posSnap.forEach((d) => posList.push({ id: d.id, ...d.data() } as Position))
+      setPositions(posList)
+
+      // 3. Load Professor's Applications (for applicant counts per position)
+      const appSnap = await getDocs(
+        query(collection(db, 'applications'), where('professorId', '==', user.uid))
+      )
+      const appList: Application[] = []
+      appSnap.forEach((d) => appList.push({ id: d.id, ...d.data() } as Application))
+      setApplications(appList)
+    } catch (err) {
+      console.error('Error loading positions:', err)
+      setLoadError('Failed to load your research positions from Firebase. Please try again.')
+    } finally {
+      setLoading(false)
     }
   }, [user])
+
+  useEffect(() => {
+    loadPositionsAndProfile()
+  }, [loadPositionsAndProfile])
 
   const openCreateForm = () => {
     setEditingPositionId(null)
     setTitle('')
     setDegreeType('PhD')
-    setResearchArea('Computer Vision')
+    setResearchArea(profProfile?.researchAreas?.[0] || RESEARCH_AREAS[0] || 'Artificial Intelligence')
     setDescription('')
-    setResearchTopics(['Computer Vision', 'Deep Learning'])
-    setRequiredSkills(['Python', 'PyTorch'])
-    setPreferredSkills(['Medical Imaging'])
+    setResearchTopics([])
+    setRequiredSkills([])
+    setPreferredSkills([])
     setMinimumGPA('3.5')
     setFundingType('fully_funded')
-    setStipend('2,200,000 KRW/month')
-    setApplicationDeadline('2026-12-31')
-    setStartDate('Spring 2027')
+    setStipend('')
+    setApplicationDeadline('')
+    setStartDate('')
+    setActionError('')
     setIsFormOpen(true)
   }
 
@@ -95,93 +128,158 @@ export default function ManagePositions() {
     setStipend(pos.stipend || '')
     setApplicationDeadline(pos.applicationDeadline || '')
     setStartDate(pos.startDate || '')
+    setActionError('')
     setIsFormOpen(true)
   }
 
-  const handleSavePosition = (e: React.FormEvent) => {
+  const handleSavePosition = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!title.trim() || !description.trim()) return
+    if (!user || !title.trim() || !description.trim()) return
 
-    if (editingPositionId) {
-      // Update existing position
-      const updated = positions.map((p) => {
-        if (p.id === editingPositionId) {
-          return {
-            ...p,
-            title,
-            degreeType,
-            researchArea,
-            description,
-            researchTopics: researchTopics.length ? researchTopics : [researchArea],
-            requiredSkills,
-            preferredSkills,
-            minimumGPA: parseFloat(minimumGPA) || 3.0,
-            fundingType,
-            stipend,
-            applicationDeadline,
-            startDate,
-            updatedAt: new Date().toISOString(),
-          }
+    setSaving(true)
+    setActionError('')
+    const nowIso = new Date().toISOString()
+
+    try {
+      if (editingPositionId) {
+        const existingPos = positions.find((p) => p.id === editingPositionId)
+        if (!existingPos || existingPos.professorId !== user.uid) {
+          setActionError('You are not authorized to edit this position.')
+          setSaving(false)
+          return
         }
-        return p
-      })
-      setPositions(updated)
-      localStorage.setItem('rm_demo_positions', JSON.stringify(updated))
-      setSuccessMsg('Research position updated successfully!')
-    } else {
-      // Create new position
-      const newPos: Position = {
-        id: `pos-${Date.now()}`,
-        professorId: user?.uid || 'demo-1',
-        professorName: user?.displayName || 'Prof. Minji Kim',
-        professorTitle: 'Associate Professor',
-        university: 'KAIST',
-        department: 'School of Computing',
-        country: 'South Korea',
-        title,
-        degreeType,
-        researchArea,
-        description,
-        researchTopics: researchTopics.length ? researchTopics : [researchArea],
-        requiredSkills,
-        preferredSkills,
-        minimumGPA: parseFloat(minimumGPA) || 3.0,
-        gpaScale: 4.0,
-        languageRequirements: [{ type: 'IELTS', minimumScore: '6.5' }],
-        otherRequirements: '',
-        fundingType,
-        stipend,
-        applicationDeadline: applicationDeadline || '2026-12-31',
-        startDate: startDate || 'Spring 2027',
-        isOpen: true,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
+
+        const updatedFields = {
+          title: title.trim(),
+          degreeType,
+          researchArea,
+          description: description.trim(),
+          researchTopics: researchTopics.length ? researchTopics : [researchArea],
+          requiredSkills,
+          preferredSkills,
+          minimumGPA: parseFloat(minimumGPA) || 3.0,
+          fundingType,
+          stipend: stipend.trim(),
+          applicationDeadline,
+          startDate: startDate.trim(),
+          updatedAt: nowIso,
+        }
+
+        await updateDoc(doc(db, 'positions', editingPositionId), updatedFields)
+        setPositions((prev) =>
+          prev.map((p) => (p.id === editingPositionId ? { ...p, ...updatedFields } : p))
+        )
+        setSuccessMsg('Research position updated successfully!')
+      } else {
+        if (!profProfile) {
+          setActionError('Please complete your faculty profile before posting a position.')
+          setSaving(false)
+          return
+        }
+
+        const newPos: Position = {
+          id: `pos-${Date.now()}`,
+          professorId: user.uid,
+          professorName: profProfile.fullName || user.displayName || 'Professor',
+          professorTitle: profProfile.academicTitle || 'Faculty',
+          university: profProfile.university || '',
+          department: profProfile.department || '',
+          country: profProfile.country || '',
+          title: title.trim(),
+          degreeType,
+          researchArea,
+          description: description.trim(),
+          researchTopics: researchTopics.length ? researchTopics : [researchArea],
+          requiredSkills,
+          preferredSkills,
+          minimumGPA: parseFloat(minimumGPA) || 3.0,
+          gpaScale: 4.0,
+          languageRequirements: [],
+          otherRequirements: '',
+          fundingType,
+          stipend: stipend.trim(),
+          applicationDeadline,
+          startDate: startDate.trim(),
+          isOpen: true,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        }
+
+        await setDoc(doc(db, 'positions', newPos.id), newPos)
+        setPositions((prev) => [newPos, ...prev])
+        setSuccessMsg('New research position published!')
       }
-      const updated = [newPos, ...positions]
-      setPositions(updated)
-      localStorage.setItem('rm_demo_positions', JSON.stringify(updated))
-      setSuccessMsg('New research position published!')
+
+      setIsFormOpen(false)
+      setTimeout(() => setSuccessMsg(''), 4000)
+    } catch (err) {
+      console.error('Error saving position to Firestore:', err)
+      setActionError('Failed to save position to Firestore. Please try again.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const toggleStatus = async (id: string) => {
+    if (!user) return
+    const targetPos = positions.find((p) => p.id === id)
+    if (!targetPos || targetPos.professorId !== user.uid) {
+      setActionError('You are not authorized to modify this position.')
+      return
     }
 
-    setIsFormOpen(false)
-    setTimeout(() => setSuccessMsg(''), 4000)
+    setActionError('')
+    const nextOpen = !targetPos.isOpen
+    const nowIso = new Date().toISOString()
+
+    try {
+      await updateDoc(doc(db, 'positions', id), {
+        isOpen: nextOpen,
+        updatedAt: nowIso,
+      })
+      setPositions((prev) =>
+        prev.map((p) => (p.id === id ? { ...p, isOpen: nextOpen, updatedAt: nowIso } : p))
+      )
+    } catch (err) {
+      console.error('Error toggling position status:', err)
+      setActionError('Failed to update position status in Firestore. Please try again.')
+    }
   }
 
-  const toggleStatus = (id: string) => {
-    const updated = positions.map((p) => (p.id === id ? { ...p, isOpen: !p.isOpen } : p))
-    setPositions(updated)
-    localStorage.setItem('rm_demo_positions', JSON.stringify(updated))
-  }
-
-  const deletePosition = (id: string) => {
-    const updated = positions.filter((p) => p.id !== id)
-    setPositions(updated)
-    localStorage.setItem('rm_demo_positions', JSON.stringify(updated))
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-50/70 flex items-center justify-center px-4">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-10 h-10 rounded-2xl bg-blue-600/20 border border-blue-600 animate-pulse" />
+          <p className="text-xs font-medium text-slate-500">Loading your research opportunities…</p>
+        </div>
+      </div>
+    )
   }
 
   return (
     <div className="min-h-screen bg-slate-50/70 pt-8 pb-20 px-4 sm:px-6 lg:px-8">
       <div className="max-w-5xl mx-auto space-y-8">
+
+        {loadError && (
+          <div className="rounded-2xl bg-rose-50 border border-rose-200 px-5 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 text-xs font-semibold text-rose-700">
+              <AlertCircle size={16} className="text-rose-600 shrink-0" />
+              <span>{loadError}</span>
+            </div>
+            <Button size="sm" variant="outline" onClick={loadPositionsAndProfile} className="flex items-center gap-1.5 self-start sm:self-auto">
+              <RefreshCw size={13} />
+              <span>Retry</span>
+            </Button>
+          </div>
+        )}
+
+        {actionError && (
+          <div className="rounded-2xl bg-rose-50 border border-rose-200 px-5 py-3 text-xs font-semibold text-rose-700 flex items-center gap-2">
+            <AlertCircle size={15} className="text-rose-600 shrink-0" />
+            <span>{actionError}</span>
+          </div>
+        )}
         
         {/* Top Header Bar */}
         <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-6 border-b border-slate-200/80 gap-4">
@@ -341,7 +439,7 @@ export default function ManagePositions() {
                     required
                     value={description}
                     onChange={(e) => setDescription(e.target.value)}
-                    placeholder="Describe research responsibilities, clinical collaborations, compute clusters, and publication goals…"
+                    placeholder="Describe research responsibilities, collaborations, compute clusters, and publication goals…"
                     className="w-full bg-white border border-slate-200 rounded-xl p-3.5 text-sm text-slate-900 focus:border-blue-600 focus:ring-2 focus:ring-blue-100 outline-none transition-all"
                     id="position-desc"
                   />
@@ -410,8 +508,8 @@ export default function ManagePositions() {
                 >
                   Cancel
                 </Button>
-                <Button type="submit" id="save-position-submit-btn">
-                  {editingPositionId ? 'Save Changes' : 'Publish Position'}
+                <Button type="submit" disabled={saving} id="save-position-submit-btn">
+                  {saving ? 'Saving…' : editingPositionId ? 'Save Changes' : 'Publish Position'}
                 </Button>
               </div>
             </form>
@@ -421,7 +519,7 @@ export default function ManagePositions() {
         {/* Positions List */}
         <div className="space-y-5">
           {positions.map((pos) => {
-            const applicantCount = DEMO_PROFESSOR_APPLICATIONS.filter((a) => a.positionId === pos.id).length
+            const applicantCount = applications.filter((a) => a.positionId === pos.id).length
             return (
               <div
                 key={pos.id}
@@ -448,7 +546,7 @@ export default function ManagePositions() {
 
                     <h3 className="text-lg font-bold text-slate-900 font-display pt-1">{pos.title}</h3>
                     <p className="text-xs text-slate-500">
-                      Department of {pos.department} • {pos.university}
+                      {pos.department ? `Department of ${pos.department} • ` : ''}{pos.university}
                     </p>
                   </div>
 
@@ -473,15 +571,6 @@ export default function ManagePositions() {
                     >
                       {pos.isOpen ? 'Close Opening' : 'Reopen Opening'}
                     </Button>
-
-                    <button
-                      onClick={() => deletePosition(pos.id)}
-                      className="p-2 rounded-xl text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors cursor-pointer"
-                      title="Delete opening"
-                      id={`delete-pos-${pos.id}`}
-                    >
-                      <Trash2 size={15} />
-                    </button>
                   </div>
                 </div>
 
@@ -490,17 +579,19 @@ export default function ManagePositions() {
                 </p>
 
                 {/* Topics & Skills Tags */}
-                <div className="flex flex-wrap items-center gap-1.5 pt-1">
-                  <span className="text-xs font-semibold text-slate-500 mr-1">Skills:</span>
-                  {(pos.requiredSkills || []).map((skill) => (
-                    <span
-                      key={skill}
-                      className="text-xs font-medium px-2 py-0.5 rounded-md bg-slate-100 text-slate-700"
-                    >
-                      {skill}
-                    </span>
-                  ))}
-                </div>
+                {(pos.requiredSkills || []).length > 0 && (
+                  <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                    <span className="text-xs font-semibold text-slate-500 mr-1">Skills:</span>
+                    {(pos.requiredSkills || []).map((skill) => (
+                      <span
+                        key={skill}
+                        className="text-xs font-medium px-2 py-0.5 rounded-md bg-slate-100 text-slate-700"
+                      >
+                        {skill}
+                      </span>
+                    ))}
+                  </div>
+                )}
 
                 {/* Footer Meta */}
                 <div className="pt-3 border-t border-slate-100 flex flex-wrap items-center justify-between text-xs text-slate-500 gap-3">

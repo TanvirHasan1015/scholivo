@@ -1,14 +1,13 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { collection, getDocs, query, where, limit } from 'firebase/firestore'
+import { collection, doc, getDoc, getDocs, query, where, limit } from 'firebase/firestore'
 import { 
-  MapPin, Globe, BookOpen, Users, ExternalLink, Heart, HeartOff, 
-  ChevronDown, ChevronUp, Calendar, DollarSign, GraduationCap, Mail,
-  Sparkles, CheckCircle2, ArrowLeft, ArrowUpRight, Award,
-  Building, Briefcase
+  MapPin, Globe, ExternalLink, Heart, 
+  Calendar, DollarSign, GraduationCap, Mail,
+  Sparkles, ArrowLeft, ArrowUpRight,
+  Building, Briefcase, AlertCircle, RefreshCw
 } from 'lucide-react'
-import { db, isDemoMode } from '@/lib/firebase'
-import { DEMO_PROFESSORS, DEMO_STUDENT_PROFILE, DEMO_SAVED_PROFESSORS, type SavedProfessorItem } from '@/lib/demoData'
+import { db } from '@/lib/firebase'
 import { useAuth } from '@/context/AuthContext'
 import type { ProfessorProfile, StudentProfile } from '@/types/user.types'
 import type { Position } from '@/types/position.types'
@@ -22,104 +21,154 @@ import { formatDate, FUNDING_LABELS, cn } from '@/utils/helpers'
 
 type Tab = 'overview' | 'research' | 'positions' | 'publications' | 'lab'
 
+function normalizeStudentForMatch(raw: Partial<StudentProfile>, uid: string): StudentProfile {
+  return {
+    uid: raw.uid || uid,
+    fullName: raw.fullName ?? '',
+    username: raw.username ?? '',
+    email: raw.email ?? '',
+    country: raw.country ?? '',
+    university: raw.university ?? '',
+    department: raw.department ?? '',
+    major: raw.major ?? '',
+    degree: raw.degree ?? 'Master',
+    currentSemester: raw.currentSemester ?? '',
+    expectedGraduation: raw.expectedGraduation ?? '',
+    gpa: typeof raw.gpa === 'number' ? raw.gpa : 0,
+    gpaScale: typeof raw.gpaScale === 'number' ? raw.gpaScale : 4.0,
+    researchInterests: Array.isArray(raw.researchInterests) ? raw.researchInterests : [],
+    researchAreas: Array.isArray(raw.researchAreas) ? raw.researchAreas : [],
+    researchExperience: Array.isArray(raw.researchExperience) ? raw.researchExperience : [],
+    projects: Array.isArray(raw.projects) ? raw.projects : [],
+    publications: Array.isArray(raw.publications) ? raw.publications : [],
+    programmingLanguages: Array.isArray(raw.programmingLanguages) ? raw.programmingLanguages : [],
+    frameworks: Array.isArray(raw.frameworks) ? raw.frameworks : [],
+    technicalSkills: Array.isArray(raw.technicalSkills) ? raw.technicalSkills : [],
+    researchTools: Array.isArray(raw.researchTools) ? raw.researchTools : [],
+    languageScores: Array.isArray(raw.languageScores) ? raw.languageScores : [],
+    profileCompleteness: raw.profileCompleteness ?? 0,
+    createdAt: raw.createdAt ?? '',
+    updatedAt: raw.updatedAt ?? '',
+  }
+}
+
 export default function ProfessorProfilePage() {
   const { username } = useParams<{ username: string }>()
   const navigate = useNavigate()
   const { user, role } = useAuth()
 
   const [professor, setProfessor] = useState<(ProfessorProfile & { positions: Position[] }) | null>(null)
-  const [studentProfile, setStudentProfile] = useState<StudentProfile | null>(DEMO_STUDENT_PROFILE)
+  const [studentProfile, setStudentProfile] = useState<StudentProfile | null>(null)
   const [matchResult, setMatchResult] = useState<MatchResult | null>(null)
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [activeTab, setActiveTab] = useState<Tab>('overview')
   const [isSaved, setIsSaved] = useState(false)
 
-  // Sync saved status from localStorage
-  useEffect(() => {
-    if (!professor) return
-    const raw = localStorage.getItem('rm_demo_saved_professors')
-    const list: SavedProfessorItem[] = raw ? JSON.parse(raw) : DEMO_SAVED_PROFESSORS
-    setIsSaved(list.some((p) => p.uid === professor.uid || p.username === professor.username))
-  }, [professor])
-
   const toggleSave = () => {
-    if (!professor) return
-    const raw = localStorage.getItem('rm_demo_saved_professors')
-    let list: SavedProfessorItem[] = raw ? JSON.parse(raw) : [...DEMO_SAVED_PROFESSORS]
-
-    if (isSaved) {
-      list = list.filter((p) => p.uid !== professor.uid && p.username !== professor.username)
-      setIsSaved(false)
-    } else {
-      const newItem: SavedProfessorItem = {
-        uid: professor.uid,
-        username: professor.username,
-        fullName: professor.fullName,
-        academicTitle: professor.academicTitle,
-        university: professor.university,
-        country: professor.country,
-        photoURL: professor.photoURL,
-        researchAreas: professor.researchAreas,
-        matchScore: matchResult?.score || 85,
-        openPositionsCount: professor.positions.length,
-        isRecruiting: professor.isRecruiting,
-      }
-      list.push(newItem)
-      setIsSaved(true)
-    }
-    localStorage.setItem('rm_demo_saved_professors', JSON.stringify(list))
+    setIsSaved((prev) => !prev)
   }
 
-  // Load professor
-  useEffect(() => {
-    const load = async () => {
-      setLoading(true)
-      if (isDemoMode) {
-        const found = DEMO_PROFESSORS.find((p) => p.username === username)
-        setProfessor(found || null)
-        setLoading(false)
-        return
-      }
-
-      try {
-        const snap = await getDocs(
-          query(collection(db, 'professors'), where('username', '==', username), limit(1))
-        )
-        if (!snap.empty) {
-          const prof = snap.docs[0].data() as ProfessorProfile
-          const posSnap = await getDocs(
-            query(collection(db, 'positions'), where('professorId', '==', prof.uid), where('isOpen', '==', true))
-          )
-          const positions = posSnap.docs.map((d) => ({ id: d.id, ...d.data() } as Position))
-          setProfessor({ ...prof, positions })
-        } else {
-          const found = DEMO_PROFESSORS.find((p) => p.username === username)
-          setProfessor(found || null)
-        }
-      } catch (err) {
-        console.error('Failed to query professor, falling back to demo:', err)
-        const found = DEMO_PROFESSORS.find((p) => p.username === username)
-        setProfessor(found || null)
-      } finally {
-        setLoading(false)
-      }
+  // Load professor from Firestore
+  const loadProfessor = useCallback(async () => {
+    if (!username) {
+      setProfessor(null)
+      setLoading(false)
+      return
     }
-    load()
+    setLoading(true)
+    setLoadError('')
+
+    try {
+      const snap = await getDocs(
+        query(collection(db, 'professors'), where('username', '==', username), limit(1))
+      )
+      if (!snap.empty) {
+        const docSnap = snap.docs[0]
+        const rawProf = docSnap.data() as Partial<ProfessorProfile>
+        const profUid = rawProf.uid || docSnap.id
+
+        const posSnap = await getDocs(
+          query(collection(db, 'positions'), where('professorId', '==', profUid), where('isOpen', '==', true))
+        )
+        const positions = posSnap.docs.map((d) => {
+          const rawPos = d.data() as Partial<Position>
+          return {
+            ...rawPos,
+            id: d.id,
+            researchTopics: Array.isArray(rawPos.researchTopics) ? rawPos.researchTopics : [],
+            requiredSkills: Array.isArray(rawPos.requiredSkills) ? rawPos.requiredSkills : [],
+            preferredSkills: Array.isArray(rawPos.preferredSkills) ? rawPos.preferredSkills : [],
+            languageRequirements: Array.isArray(rawPos.languageRequirements) ? rawPos.languageRequirements : [],
+            researchArea: rawPos.researchArea ?? '',
+          } as Position
+        })
+
+        setProfessor({
+          ...(rawProf as ProfessorProfile),
+          uid: profUid,
+          fullName: rawProf.fullName ?? 'Professor',
+          username: rawProf.username ?? username,
+          academicTitle: rawProf.academicTitle ?? '',
+          university: rawProf.university ?? '',
+          department: rawProf.department ?? '',
+          country: rawProf.country ?? '',
+          biography: rawProf.biography ?? '',
+          researchAreas: Array.isArray(rawProf.researchAreas) ? rawProf.researchAreas : [],
+          researchInterests: Array.isArray(rawProf.researchInterests) ? rawProf.researchInterests : [],
+          currentProjects: Array.isArray(rawProf.currentProjects) ? rawProf.currentProjects : [],
+          publications: Array.isArray(rawProf.publications) ? rawProf.publications : [],
+          labMembers: Array.isArray(rawProf.labMembers) ? rawProf.labMembers : [],
+          recruitingStatus: rawProf.recruitingStatus ?? 'not_recruiting',
+          isRecruiting: Boolean(rawProf.isRecruiting),
+          positions,
+        })
+      } else {
+        setProfessor(null)
+      }
+    } catch (err) {
+      console.error('Failed to query professor:', err)
+      setLoadError('Failed to load faculty profile from Firebase. Please check your connection and try again.')
+      setProfessor(null)
+    } finally {
+      setLoading(false)
+    }
   }, [username])
+
+  useEffect(() => {
+    loadProfessor()
+  }, [loadProfessor])
 
   // Load student profile for match calculation
   useEffect(() => {
-    if (isDemoMode) {
-      setStudentProfile(DEMO_STUDENT_PROFILE)
+    if (!user || role !== 'student') {
+      setStudentProfile(null)
       return
     }
 
-    if (user && role === 'student') {
-      getDocs(query(collection(db, 'students'), where('uid', '==', user.uid), limit(1)))
-        .then((snap) => {
-          if (!snap.empty) setStudentProfile(snap.docs[0].data() as StudentProfile)
-        })
-        .catch(() => {})
+    let cancelled = false
+    async function fetchStudent() {
+      try {
+        const directSnap = await getDoc(doc(db, 'students', user!.uid))
+        if (directSnap.exists()) {
+          if (!cancelled) {
+            setStudentProfile(normalizeStudentForMatch(directSnap.data() as Partial<StudentProfile>, user!.uid))
+          }
+          return
+        }
+        const fallbackSnap = await getDocs(
+          query(collection(db, 'students'), where('uid', '==', user!.uid), limit(1))
+        )
+        if (!fallbackSnap.empty && !cancelled) {
+          setStudentProfile(normalizeStudentForMatch(fallbackSnap.docs[0].data() as Partial<StudentProfile>, user!.uid))
+        }
+      } catch (err) {
+        console.error('Failed to load student profile for matching:', err)
+      }
+    }
+    fetchStudent()
+    return () => {
+      cancelled = true
     }
   }, [user, role])
 
@@ -129,6 +178,8 @@ export default function ProfessorProfilePage() {
       const results = professor.positions.map((p) => computeMatch(studentProfile, p))
       const best = results.reduce((a, b) => (a.score > b.score ? a : b))
       setMatchResult(best)
+    } else {
+      setMatchResult(null)
     }
   }, [studentProfile, professor])
 
@@ -143,6 +194,27 @@ export default function ProfessorProfilePage() {
               <div className="h-4 w-48 bg-slate-200 rounded" />
               <div className="h-4 w-32 bg-slate-200 rounded" />
             </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  if (loadError) {
+    return (
+      <div className="min-h-screen bg-slate-50/70 pt-20 px-4 flex items-center justify-center">
+        <div className="bg-white rounded-3xl border border-rose-200 p-10 text-center shadow-2xs max-w-md space-y-4">
+          <div className="w-12 h-12 rounded-2xl bg-rose-50 text-rose-600 flex items-center justify-center mx-auto">
+            <AlertCircle size={24} />
+          </div>
+          <h2 className="text-xl font-bold text-slate-900 font-display">Unable to Load Profile</h2>
+          <p className="text-sm text-slate-500">{loadError}</p>
+          <div className="flex items-center justify-center gap-3 pt-2">
+            <Button variant="outline" onClick={() => navigate('/search')}>Back to Directory</Button>
+            <Button onClick={loadProfessor} className="flex items-center gap-1.5">
+              <RefreshCw size={14} />
+              <span>Retry</span>
+            </Button>
           </div>
         </div>
       </div>
@@ -219,13 +291,21 @@ export default function ProfessorProfilePage() {
                       <Building size={13} className="text-slate-400" />
                       <strong className="text-slate-800">{professor.university}</strong>
                     </span>
-                    <span>•</span>
-                    <span>{professor.department}</span>
-                    <span>•</span>
-                    <span className="flex items-center gap-1 text-slate-500">
-                      <MapPin size={13} className="text-slate-400" />
-                      {professor.country}
-                    </span>
+                    {professor.department && (
+                      <>
+                        <span>•</span>
+                        <span>{professor.department}</span>
+                      </>
+                    )}
+                    {professor.country && (
+                      <>
+                        <span>•</span>
+                        <span className="flex items-center gap-1 text-slate-500">
+                          <MapPin size={13} className="text-slate-400" />
+                          {professor.country}
+                        </span>
+                      </>
+                    )}
                   </div>
                 </div>
 
@@ -236,7 +316,7 @@ export default function ProfessorProfilePage() {
 
               {/* Research Areas */}
               <div className="flex flex-wrap gap-1.5">
-                {professor.researchAreas.map((area) => (
+                {(professor.researchAreas || []).map((area) => (
                   <span
                     key={area}
                     className="text-xs font-semibold px-2.5 py-1 rounded-lg bg-blue-50/80 border border-blue-200/70 text-blue-800"
@@ -377,22 +457,26 @@ export default function ProfessorProfilePage() {
                 <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-2xs space-y-4">
                   <h3 className="font-display text-lg font-bold text-slate-900">Faculty Biography</h3>
                   <div className="text-slate-600 text-sm leading-relaxed whitespace-pre-line">
-                    {professor.biography}
+                    {professor.biography || 'No biography provided yet.'}
                   </div>
                 </div>
 
                 <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-2xs space-y-4">
                   <h3 className="font-display text-lg font-bold text-slate-900">Research Interests</h3>
-                  <div className="flex flex-wrap gap-2">
-                    {professor.researchInterests.map((interest) => (
-                      <span
-                        key={interest}
-                        className="px-3 py-1.5 rounded-xl bg-slate-50 border border-slate-200 text-slate-800 text-xs font-medium"
-                      >
-                        {interest}
-                      </span>
-                    ))}
-                  </div>
+                  {(professor.researchInterests || []).length > 0 ? (
+                    <div className="flex flex-wrap gap-2">
+                      {(professor.researchInterests || []).map((interest) => (
+                        <span
+                          key={interest}
+                          className="px-3 py-1.5 rounded-xl bg-slate-50 border border-slate-200 text-slate-800 text-xs font-medium"
+                        >
+                          {interest}
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-slate-400 italic">No research interests listed yet.</p>
+                  )}
                 </div>
 
                 {professor.labDescription && (
@@ -409,112 +493,124 @@ export default function ProfessorProfilePage() {
             {/* TAB CONTENT: Research Projects */}
             {activeTab === 'research' && (
               <div className="space-y-4">
-                {professor.currentProjects.map((project) => (
-                  <div
-                    key={project.id}
-                    className="bg-white rounded-3xl p-6 sm:p-7 border border-slate-200/80 shadow-2xs space-y-3"
-                  >
-                    <div className="flex items-start justify-between gap-4">
-                      <h4 className="font-display text-base font-bold text-slate-900">{project.title}</h4>
-                      <span className="text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 shrink-0">
-                        Ongoing Project
-                      </span>
-                    </div>
-
-                    <p className="text-slate-600 text-sm leading-relaxed">
-                      {project.description}
-                    </p>
-
-                    {project.fundingSource && (
-                      <div className="pt-2 flex items-center gap-2 text-xs text-slate-500 font-medium">
-                        <DollarSign size={13} className="text-emerald-600 shrink-0" />
-                        <span>Funded by: <strong className="text-slate-700">{project.fundingSource}</strong></span>
-                      </div>
-                    )}
+                {(professor.currentProjects || []).length === 0 ? (
+                  <div className="bg-white rounded-3xl p-8 border border-slate-200/80 shadow-2xs text-center text-xs text-slate-400 italic">
+                    No active research projects listed yet.
                   </div>
-                ))}
+                ) : (
+                  (professor.currentProjects || []).map((project) => (
+                    <div
+                      key={project.id}
+                      className="bg-white rounded-3xl p-6 sm:p-7 border border-slate-200/80 shadow-2xs space-y-3"
+                    >
+                      <div className="flex items-start justify-between gap-4">
+                        <h4 className="font-display text-base font-bold text-slate-900">{project.title}</h4>
+                        <span className="text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 shrink-0">
+                          Ongoing Project
+                        </span>
+                      </div>
+
+                      <p className="text-slate-600 text-sm leading-relaxed">
+                        {project.description}
+                      </p>
+
+                      {project.fundingSource && (
+                        <div className="pt-2 flex items-center gap-2 text-xs text-slate-500 font-medium">
+                          <DollarSign size={13} className="text-emerald-600 shrink-0" />
+                          <span>Funded by: <strong className="text-slate-700">{project.fundingSource}</strong></span>
+                        </div>
+                      )}
+                    </div>
+                  ))
+                )}
               </div>
             )}
 
             {/* TAB CONTENT: Open Positions */}
             {activeTab === 'positions' && (
               <div className="space-y-5">
-                {professor.positions.map((pos) => (
-                  <div
-                    key={pos.id}
-                    className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-2xs space-y-5 hover:border-blue-300 transition-all"
-                  >
-                    <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
-                      <div>
-                        <div className="flex flex-wrap items-center gap-2 mb-1.5">
-                          <span className="px-2.5 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200 text-xs font-bold">
-                            {pos.degreeType.replace('_', ' ')}
-                          </span>
-                          <span className="px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-bold">
-                            {FUNDING_LABELS[pos.fundingType] || pos.fundingType}
-                          </span>
-                        </div>
-                        <h4 className="text-lg font-bold text-slate-900 font-display">{pos.title}</h4>
-                        <p className="text-xs text-slate-500 mt-0.5">
-                          Department of {pos.department} • {pos.university}
-                        </p>
-                      </div>
-
-                      <Button
-                        onClick={() => navigate(`/apply/${pos.id}`)}
-                        className="flex items-center gap-1.5 shrink-0 shadow-xs"
-                      >
-                        <span>Apply Now</span>
-                        <ArrowUpRight size={15} />
-                      </Button>
-                    </div>
-
-                    <p className="text-slate-600 text-sm leading-relaxed whitespace-pre-line">
-                      {pos.description}
-                    </p>
-
-                    {/* Requirements Breakdown */}
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2 border-t border-slate-100 text-xs">
-                      <div>
-                        <span className="font-semibold text-slate-700 block mb-1">Required Skills:</span>
-                        <div className="flex flex-wrap gap-1">
-                          {pos.requiredSkills.map((s) => (
-                            <span key={s} className="px-2 py-0.5 rounded-md bg-slate-100 text-slate-700 font-medium">
-                              {s}
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-
-                      <div>
-                        <span className="font-semibold text-slate-700 block mb-1">Preferred Background:</span>
-                        <div className="flex flex-wrap gap-1">
-                          {pos.preferredSkills.map((s) => (
-                            <span key={s} className="px-2 py-0.5 rounded-md bg-slate-50 border border-slate-200 text-slate-600 font-medium">
-                              {s}
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Stipend & Deadline Meta */}
-                    <div className="flex flex-wrap items-center gap-4 pt-3 border-t border-slate-100 text-xs text-slate-500 font-medium">
-                      {pos.stipend && (
-                        <div className="flex items-center gap-1 text-slate-700">
-                          <DollarSign size={13} className="text-emerald-600" />
-                          <span>Stipend: <strong className="text-slate-900">{pos.stipend}</strong></span>
-                        </div>
-                      )}
-                      {pos.applicationDeadline && (
-                        <div className="flex items-center gap-1">
-                          <Calendar size={13} className="text-blue-600" />
-                          <span>Deadline: <strong className="text-slate-900">{formatDate(pos.applicationDeadline)}</strong></span>
-                        </div>
-                      )}
-                    </div>
+                {professor.positions.length === 0 ? (
+                  <div className="bg-white rounded-3xl p-8 border border-slate-200/80 shadow-2xs text-center text-xs text-slate-400 italic">
+                    No open research positions posted at this time.
                   </div>
-                ))}
+                ) : (
+                  professor.positions.map((pos) => (
+                    <div
+                      key={pos.id}
+                      className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-2xs space-y-5 hover:border-blue-300 transition-all"
+                    >
+                      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
+                        <div>
+                          <div className="flex flex-wrap items-center gap-2 mb-1.5">
+                            <span className="px-2.5 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200 text-xs font-bold">
+                              {pos.degreeType.replace('_', ' ')}
+                            </span>
+                            <span className="px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-bold">
+                              {FUNDING_LABELS[pos.fundingType] || pos.fundingType}
+                            </span>
+                          </div>
+                          <h4 className="text-lg font-bold text-slate-900 font-display">{pos.title}</h4>
+                          <p className="text-xs text-slate-500 mt-0.5">
+                            {pos.department ? `Department of ${pos.department} • ` : ''}{pos.university}
+                          </p>
+                        </div>
+
+                        <Button
+                          onClick={() => navigate(`/apply/${pos.id}`)}
+                          className="flex items-center gap-1.5 shrink-0 shadow-xs"
+                        >
+                          <span>Apply Now</span>
+                          <ArrowUpRight size={15} />
+                        </Button>
+                      </div>
+
+                      <p className="text-slate-600 text-sm leading-relaxed whitespace-pre-line">
+                        {pos.description}
+                      </p>
+
+                      {/* Requirements Breakdown */}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2 border-t border-slate-100 text-xs">
+                        <div>
+                          <span className="font-semibold text-slate-700 block mb-1">Required Skills:</span>
+                          <div className="flex flex-wrap gap-1">
+                            {(pos.requiredSkills || []).map((s) => (
+                              <span key={s} className="px-2 py-0.5 rounded-md bg-slate-100 text-slate-700 font-medium">
+                                {s}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+
+                        <div>
+                          <span className="font-semibold text-slate-700 block mb-1">Preferred Background:</span>
+                          <div className="flex flex-wrap gap-1">
+                            {(pos.preferredSkills || []).map((s) => (
+                              <span key={s} className="px-2 py-0.5 rounded-md bg-slate-50 border border-slate-200 text-slate-600 font-medium">
+                                {s}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Stipend & Deadline Meta */}
+                      <div className="flex flex-wrap items-center gap-4 pt-3 border-t border-slate-100 text-xs text-slate-500 font-medium">
+                        {pos.stipend && (
+                          <div className="flex items-center gap-1 text-slate-700">
+                            <DollarSign size={13} className="text-emerald-600" />
+                            <span>Stipend: <strong className="text-slate-900">{pos.stipend}</strong></span>
+                          </div>
+                        )}
+                        {pos.applicationDeadline && (
+                          <div className="flex items-center gap-1">
+                            <Calendar size={13} className="text-blue-600" />
+                            <span>Deadline: <strong className="text-slate-900">{formatDate(pos.applicationDeadline)}</strong></span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))
+                )}
               </div>
             )}
 
@@ -522,20 +618,24 @@ export default function ProfessorProfilePage() {
             {activeTab === 'publications' && (
               <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-2xs space-y-4">
                 <h3 className="font-display text-lg font-bold text-slate-900 mb-2">Featured Publications</h3>
-                <div className="space-y-3.5">
-                  {professor.publications.map((pub) => (
-                    <div
-                      key={pub.id}
-                      className="p-4 rounded-2xl bg-slate-50/70 border border-slate-200/80 space-y-1.5"
-                    >
-                      <h5 className="font-bold text-slate-900 text-sm leading-snug">{pub.title}</h5>
-                      <p className="text-xs text-slate-500">
-                        {pub.journal || pub.conference} ({pub.year}) • Authors: {pub.authors.join(', ')}
-                      </p>
-                      {pub.doi && <p className="text-[11px] text-blue-600 font-mono">DOI: {pub.doi}</p>}
-                    </div>
-                  ))}
-                </div>
+                {(professor.publications || []).length === 0 ? (
+                  <p className="text-xs text-slate-400 italic">No publications listed yet.</p>
+                ) : (
+                  <div className="space-y-3.5">
+                    {(professor.publications || []).map((pub) => (
+                      <div
+                        key={pub.id}
+                        className="p-4 rounded-2xl bg-slate-50/70 border border-slate-200/80 space-y-1.5"
+                      >
+                        <h5 className="font-bold text-slate-900 text-sm leading-snug">{pub.title}</h5>
+                        <p className="text-xs text-slate-500">
+                          {pub.journal || pub.conference} ({pub.year}) • Authors: {(pub.authors || []).join(', ')}
+                        </p>
+                        {pub.doi && <p className="text-[11px] text-blue-600 font-mono">DOI: {pub.doi}</p>}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
 
@@ -544,27 +644,31 @@ export default function ProfessorProfilePage() {
               <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-2xs space-y-6">
                 <div>
                   <h3 className="font-display text-lg font-bold text-slate-900">{professor.labName || 'Research Group'}</h3>
-                  <p className="text-sm text-slate-600 mt-1">{professor.labDescription}</p>
+                  <p className="text-sm text-slate-600 mt-1">{professor.labDescription || 'No lab description provided yet.'}</p>
                 </div>
 
                 <div>
                   <h4 className="text-xs font-semibold text-slate-700 uppercase tracking-wide mb-3">
                     Active Lab Members
                   </h4>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    {(professor.labMembers || []).map((member) => (
-                      <div
-                        key={member.id}
-                        className="p-3 rounded-2xl border border-slate-200/80 bg-slate-50/60 flex items-center gap-3"
-                      >
-                        <Avatar name={member.name} size="sm" />
-                        <div>
-                          <p className="text-xs font-bold text-slate-900">{member.name}</p>
-                          <p className="text-[11px] text-slate-500">{member.role}</p>
+                  {(professor.labMembers || []).length === 0 ? (
+                    <p className="text-xs text-slate-400 italic">No lab members listed yet.</p>
+                  ) : (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      {(professor.labMembers || []).map((member) => (
+                        <div
+                          key={member.id}
+                          className="p-3 rounded-2xl border border-slate-200/80 bg-slate-50/60 flex items-center gap-3"
+                        >
+                          <Avatar name={member.name} size="sm" />
+                          <div>
+                            <p className="text-xs font-bold text-slate-900">{member.name}</p>
+                            <p className="text-[11px] text-slate-500">{member.role}</p>
+                          </div>
                         </div>
-                      </div>
-                    ))}
-                  </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -618,18 +722,20 @@ export default function ProfessorProfilePage() {
               <div className="space-y-3 text-xs">
                 <div className="flex items-center gap-2.5 text-slate-600">
                   <Building size={14} className="text-slate-400 shrink-0" />
-                  <span>{professor.department}</span>
+                  <span>{professor.department || 'Department not listed'}</span>
                 </div>
                 <div className="flex items-center gap-2.5 text-slate-600">
                   <MapPin size={14} className="text-slate-400 shrink-0" />
-                  <span>{professor.university}, {professor.country}</span>
+                  <span>{professor.university}{professor.country ? `, ${professor.country}` : ''}</span>
                 </div>
-                <div className="flex items-center gap-2.5 text-slate-600">
-                  <Mail size={14} className="text-slate-400 shrink-0" />
-                  <a href={`mailto:${professor.email}`} className="text-blue-600 hover:underline">
-                    {professor.email}
-                  </a>
-                </div>
+                {professor.email && (
+                  <div className="flex items-center gap-2.5 text-slate-600">
+                    <Mail size={14} className="text-slate-400 shrink-0" />
+                    <a href={`mailto:${professor.email}`} className="text-blue-600 hover:underline">
+                      {professor.email}
+                    </a>
+                  </div>
+                )}
                 <div className="flex items-center gap-2.5 text-slate-600">
                   <Briefcase size={14} className="text-slate-400 shrink-0" />
                   <span>{professor.positions.length} Active Position{professor.positions.length !== 1 ? 's' : ''}</span>

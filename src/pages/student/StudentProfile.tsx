@@ -1,108 +1,180 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { doc, getDoc, updateDoc } from 'firebase/firestore'
+import { collection, doc, getDoc, getDocs, limit, query, updateDoc, where } from 'firebase/firestore'
 import { 
-  User, GraduationCap, BookOpen, Cpu, Globe, 
+  GraduationCap, BookOpen, Cpu, 
   Save, Check, Award, FileText, ArrowLeft, Plus, Trash2,
-  ExternalLink, Sparkles, AlertCircle
+  ExternalLink, AlertCircle, RefreshCw
 } from 'lucide-react'
-import { db, isDemoMode } from '@/lib/firebase'
+import { db } from '@/lib/firebase'
 import { useAuth } from '@/context/AuthContext'
-import type { StudentProfile, ResearchExperience, Project, Publication, LanguageScore } from '@/types/user.types'
-import { DEMO_STUDENT_PROFILE } from '@/lib/demoData'
+import type { StudentProfile, ResearchExperience, Project } from '@/types/user.types'
 import { Button } from '@/components/common/Button'
 import { TagInput } from '@/components/common/TagInput'
 import { Avatar } from '@/components/common/Avatar'
-
 import { calculateProfileCompleteness } from '@/utils/helpers'
+
+function normalizeStudentProfile(raw: Partial<StudentProfile>, fallbackUid: string): StudentProfile {
+  const normalized: StudentProfile = {
+    uid: raw.uid || fallbackUid,
+    fullName: raw.fullName ?? '',
+    username: raw.username ?? '',
+    email: raw.email ?? '',
+    universityEmail: raw.universityEmail,
+    country: raw.country ?? '',
+    photoURL: raw.photoURL,
+    university: raw.university ?? '',
+    department: raw.department ?? '',
+    major: raw.major ?? '',
+    degree: raw.degree ?? 'Master',
+    currentSemester: raw.currentSemester ?? '',
+    expectedGraduation: raw.expectedGraduation ?? '',
+    gpa: typeof raw.gpa === 'number' ? raw.gpa : 0,
+    gpaScale: typeof raw.gpaScale === 'number' ? raw.gpaScale : 4.0,
+    researchInterests: Array.isArray(raw.researchInterests) ? raw.researchInterests : [],
+    researchAreas: Array.isArray(raw.researchAreas) ? raw.researchAreas : [],
+    researchExperience: Array.isArray(raw.researchExperience) ? raw.researchExperience : [],
+    projects: Array.isArray(raw.projects) ? raw.projects : [],
+    publications: Array.isArray(raw.publications) ? raw.publications : [],
+    programmingLanguages: Array.isArray(raw.programmingLanguages) ? raw.programmingLanguages : [],
+    frameworks: Array.isArray(raw.frameworks) ? raw.frameworks : [],
+    technicalSkills: Array.isArray(raw.technicalSkills) ? raw.technicalSkills : [],
+    researchTools: Array.isArray(raw.researchTools) ? raw.researchTools : [],
+    languageScores: Array.isArray(raw.languageScores) ? raw.languageScores : [],
+    cvUrl: raw.cvUrl ?? '',
+    transcriptUrl: raw.transcriptUrl ?? '',
+    portfolioUrl: raw.portfolioUrl ?? '',
+    bio: raw.bio ?? '',
+    accountStatus: raw.accountStatus ?? 'active',
+    profileCompleteness: 0,
+    createdAt: raw.createdAt ?? '',
+    updatedAt: raw.updatedAt ?? '',
+  }
+  normalized.profileCompleteness = calculateProfileCompleteness(normalized)
+  return normalized
+}
 
 export default function StudentProfilePage() {
   const { user } = useAuth()
   const navigate = useNavigate()
-  const [profile, setProfile] = useState<StudentProfile>(() => {
-    // Check localStorage for persisted demo changes
-    const local = localStorage.getItem('rm_demo_student_profile')
-    if (local) {
-      try {
-        const parsed = JSON.parse(local)
-        return { ...parsed, profileCompleteness: calculateProfileCompleteness(parsed) }
-      } catch {
-        // fallback
-      }
-    }
-    return { ...DEMO_STUDENT_PROFILE, profileCompleteness: calculateProfileCompleteness(DEMO_STUDENT_PROFILE) }
-  })
+  const [profile, setProfile] = useState<StudentProfile | null>(null)
+  const [docId, setDocId] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
+  const [notFound, setNotFound] = useState(false)
   const [saving, setSaving] = useState(false)
   const [saveSuccess, setSaveSuccess] = useState(false)
+  const [saveError, setSaveError] = useState('')
 
-  useEffect(() => {
-    async function loadProfile() {
-      if (isDemoMode) {
-        const local = localStorage.getItem('rm_demo_student_profile')
-        if (local) {
-          try {
-            const parsed = JSON.parse(local)
-            setProfile({ ...parsed, profileCompleteness: calculateProfileCompleteness(parsed) })
-          } catch {
-            setProfile(DEMO_STUDENT_PROFILE)
-          }
-        }
+  const loadProfile = useCallback(async () => {
+    if (!user) {
+      setLoading(false)
+      return
+    }
+    setLoading(true)
+    setLoadError('')
+    setNotFound(false)
+
+    try {
+      const directSnap = await getDoc(doc(db, 'students', user.uid))
+      if (directSnap.exists()) {
+        setDocId(directSnap.id)
+        setProfile(normalizeStudentProfile(directSnap.data() as Partial<StudentProfile>, user.uid))
+        setLoading(false)
         return
       }
 
-      if (!user) return
-      try {
-        const snap = await getDoc(doc(db, 'students', user.uid))
-        if (snap.exists()) {
-          const remote = snap.data() as StudentProfile
-          setProfile({ ...DEMO_STUDENT_PROFILE, ...remote, profileCompleteness: calculateProfileCompleteness(remote) })
-        }
-      } catch (err) {
-        console.warn('Using default demo profile:', err)
+      const fallbackSnap = await getDocs(
+        query(collection(db, 'students'), where('uid', '==', user.uid), limit(1))
+      )
+      if (!fallbackSnap.empty) {
+        const matchDoc = fallbackSnap.docs[0]
+        setDocId(matchDoc.id)
+        setProfile(normalizeStudentProfile(matchDoc.data() as Partial<StudentProfile>, user.uid))
+        setLoading(false)
+        return
       }
+
+      setProfile(null)
+      setDocId(null)
+      setNotFound(true)
+    } catch (err) {
+      console.error('Error loading student profile:', err)
+      setLoadError('Failed to load your academic profile from Firebase. Please check your connection and try again.')
+    } finally {
+      setLoading(false)
     }
-    loadProfile()
   }, [user])
+
+  useEffect(() => {
+    loadProfile()
+  }, [loadProfile])
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (!user || !profile || !docId || notFound || loadError) return
+
     setSaving(true)
+    setSaveError('')
+    setSaveSuccess(false)
 
-    const updatedProfile = {
-      ...profile,
-      profileCompleteness: calculateProfileCompleteness(profile),
-      updatedAt: new Date().toISOString(),
+    const completeness = calculateProfileCompleteness(profile)
+    const nowIso = new Date().toISOString()
+
+    const editableFields = {
+      fullName: profile.fullName.trim(),
+      university: profile.university.trim(),
+      department: profile.department.trim(),
+      major: profile.major.trim(),
+      degree: profile.degree,
+      currentSemester: profile.currentSemester.trim(),
+      expectedGraduation: profile.expectedGraduation.trim(),
+      gpa: profile.gpa,
+      gpaScale: profile.gpaScale,
+      researchInterests: profile.researchInterests,
+      researchAreas: profile.researchAreas,
+      programmingLanguages: profile.programmingLanguages,
+      frameworks: profile.frameworks,
+      technicalSkills: profile.technicalSkills,
+      researchTools: profile.researchTools,
+      researchExperience: profile.researchExperience,
+      projects: profile.projects,
+      publications: profile.publications,
+      languageScores: profile.languageScores,
+      cvUrl: profile.cvUrl || '',
+      transcriptUrl: profile.transcriptUrl || '',
+      portfolioUrl: profile.portfolioUrl || '',
+      bio: profile.bio || '',
+      profileCompleteness: completeness,
+      updatedAt: nowIso,
     }
-    setProfile(updatedProfile)
 
-    // Save to localStorage for demo persistence
-    localStorage.setItem('rm_demo_student_profile', JSON.stringify(updatedProfile))
-
-    if (!isDemoMode && user) {
-      try {
-        await updateDoc(doc(db, 'students', user.uid), {
-          ...updatedProfile,
-        })
-      } catch (err) {
-        console.warn('Firestore update failed in demo:', err)
-      }
+    try {
+      await updateDoc(doc(db, 'students', docId), editableFields)
+      setProfile({
+        ...profile,
+        ...editableFields,
+      })
+      setSaveSuccess(true)
+      setTimeout(() => setSaveSuccess(false), 4000)
+    } catch (err) {
+      console.error('Firestore update failed:', err)
+      setSaveError('Failed to save profile changes. Please try again.')
+    } finally {
+      setSaving(false)
     }
-
-    setSaving(false)
-    setSaveSuccess(true)
-    setTimeout(() => setSaveSuccess(false), 4000)
   }
 
-  // Helper to add research experience item
   const addExperience = () => {
+    if (!profile) return
     const newExp: ResearchExperience = {
       id: `exp-${Date.now()}`,
-      title: 'Undergraduate Researcher',
-      organization: 'University AI Lab',
-      role: 'Research Assistant',
-      startDate: '2025-01',
+      title: '',
+      organization: '',
+      role: '',
+      startDate: '',
       isCurrent: true,
-      description: 'Conducting empirical experiments on transformer training dynamics.',
+      description: '',
     }
     setProfile({
       ...profile,
@@ -111,20 +183,21 @@ export default function StudentProfilePage() {
   }
 
   const removeExperience = (id: string) => {
+    if (!profile) return
     setProfile({
       ...profile,
       researchExperience: profile.researchExperience.filter((e) => e.id !== id),
     })
   }
 
-  // Helper to add project
   const addProject = () => {
+    if (!profile) return
     const newProj: Project = {
       id: `proj-${Date.now()}`,
-      title: 'Neural Vision System',
-      description: 'Deep neural network for semantic segmentation of clinical images.',
-      url: 'https://github.com/example/project',
-      technologies: ['PyTorch', 'Python'],
+      title: '',
+      description: '',
+      url: '',
+      technologies: [],
     }
     setProfile({
       ...profile,
@@ -133,10 +206,66 @@ export default function StudentProfilePage() {
   }
 
   const removeProject = (id: string) => {
+    if (!profile) return
     setProfile({
       ...profile,
       projects: profile.projects.filter((p) => p.id !== id),
     })
+  }
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-50/70 flex items-center justify-center px-4">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-10 h-10 rounded-2xl bg-blue-600/20 border border-blue-600 animate-pulse" />
+          <p className="text-xs font-medium text-slate-500">Loading your academic profile…</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (loadError) {
+    return (
+      <div className="min-h-screen bg-slate-50/70 pt-16 pb-20 px-4">
+        <div className="max-w-lg mx-auto bg-white rounded-3xl border border-rose-200 p-8 text-center space-y-4 shadow-2xs">
+          <div className="w-12 h-12 rounded-2xl bg-rose-50 text-rose-600 flex items-center justify-center mx-auto">
+            <AlertCircle size={24} />
+          </div>
+          <h1 className="text-xl font-bold font-display text-slate-900">Unable to Load Profile</h1>
+          <p className="text-xs text-slate-600 leading-relaxed">{loadError}</p>
+          <div className="flex items-center justify-center gap-3 pt-2">
+            <Button variant="outline" size="sm" onClick={() => navigate('/dashboard/student')}>
+              Back to Dashboard
+            </Button>
+            <Button size="sm" onClick={loadProfile} className="flex items-center gap-1.5">
+              <RefreshCw size={14} />
+              <span>Retry</span>
+            </Button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  if (notFound || !profile) {
+    return (
+      <div className="min-h-screen bg-slate-50/70 pt-16 pb-20 px-4">
+        <div className="max-w-lg mx-auto bg-white rounded-3xl border border-slate-200 p-8 text-center space-y-4 shadow-2xs">
+          <div className="w-12 h-12 rounded-2xl bg-blue-50 text-blue-600 flex items-center justify-center mx-auto">
+            <GraduationCap size={24} />
+          </div>
+          <h1 className="text-xl font-bold font-display text-slate-900">Student Profile Not Found</h1>
+          <p className="text-xs text-slate-600 leading-relaxed">
+            No student profile document was found in Firestore for your account ({user?.email}).
+          </p>
+          <div className="flex items-center justify-center gap-3 pt-2">
+            <Button variant="outline" size="sm" onClick={() => navigate('/dashboard/student')}>
+              Back to Dashboard
+            </Button>
+          </div>
+        </div>
+      </div>
+    )
   }
 
   return (
@@ -167,7 +296,7 @@ export default function StudentProfilePage() {
             {saveSuccess && (
               <span className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-50 border border-emerald-200 text-xs font-semibold text-emerald-700 animate-fade-in">
                 <Check size={14} className="text-emerald-600" />
-                <span>Profile Saved (Demo Local)</span>
+                <span>Profile Saved</span>
               </span>
             )}
             <Button
@@ -183,25 +312,31 @@ export default function StudentProfilePage() {
           </div>
         </div>
 
+        {saveError && (
+          <div className="rounded-2xl bg-rose-50 border border-rose-200 px-4 py-3 text-xs font-semibold text-rose-700 flex items-center gap-2">
+            <AlertCircle size={15} className="text-rose-600 shrink-0" />
+            <span>{saveError}</span>
+          </div>
+        )}
+
         {/* Profile Card Summary Banner */}
         <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-2xs flex flex-col sm:flex-row items-center sm:items-start gap-6">
-          <Avatar src={profile.photoURL} name={profile.fullName} size="xl" />
+          <Avatar src={profile.photoURL} name={profile.fullName || user?.displayName || 'Student'} size="xl" />
           <div className="flex-1 text-center sm:text-left space-y-1.5">
             <div className="flex flex-wrap items-center justify-center sm:justify-start gap-2">
               <h2 className="text-xl sm:text-2xl font-bold text-slate-900 font-display">
-                {profile.fullName}
+                {profile.fullName || user?.displayName || 'Student'}
               </h2>
-              <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
-                {profile.degree} Candidate
-              </span>
-              <span className="text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200">
-                Demonstration Profile
-              </span>
+              {profile.degree && (
+                <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
+                  {profile.degree} Candidate
+                </span>
+              )}
             </div>
             <p className="text-sm font-medium text-slate-600">
-              {profile.major} • <span className="text-blue-600 font-semibold">{profile.university}</span>
+              {profile.major || 'Major not set'} • <span className="text-blue-600 font-semibold">{profile.university || 'University not set'}</span>
             </p>
-            <p className="text-xs text-slate-400">{profile.email}</p>
+            <p className="text-xs text-slate-400">{profile.email || user?.email}</p>
 
             <div className="pt-3 flex flex-wrap items-center justify-center sm:justify-start gap-4 text-xs">
               <div className="bg-slate-50 px-3 py-1 rounded-lg border border-slate-200/70">
@@ -307,7 +442,7 @@ export default function StudentProfilePage() {
                   type="text"
                   value={profile.currentSemester}
                   onChange={(e) => setProfile({ ...profile, currentSemester: e.target.value })}
-                  placeholder="e.g. 8th Semester (Senior)"
+                  placeholder="e.g. 4th Semester"
                   className="w-full bg-white border border-slate-200 rounded-xl px-3.5 py-2.5 text-sm text-slate-900 focus:border-blue-600 focus:ring-2 focus:ring-blue-100 outline-none transition-all"
                   id="profile-semester"
                 />
@@ -419,19 +554,34 @@ export default function StudentProfilePage() {
                 </div>
               </div>
 
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={addExperience}
-                className="flex items-center gap-1.5 text-xs font-semibold"
-              >
-                <Plus size={13} />
-                <span>Add Experience</span>
-              </Button>
+              <div className="flex items-center gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={addExperience}
+                  className="flex items-center gap-1.5 text-xs font-semibold"
+                >
+                  <Plus size={13} />
+                  <span>Add Experience</span>
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={addProject}
+                  className="flex items-center gap-1.5 text-xs font-semibold"
+                >
+                  <Plus size={13} />
+                  <span>Add Project</span>
+                </Button>
+              </div>
             </div>
 
             <div className="space-y-4">
+              {profile.researchExperience.length === 0 && profile.projects.length === 0 && (
+                <p className="text-xs text-slate-400 italic">No research experience or projects added yet.</p>
+              )}
               {profile.researchExperience.map((exp, index) => (
                 <div
                   key={exp.id}
@@ -444,7 +594,7 @@ export default function StudentProfilePage() {
                         value={exp.title}
                         onChange={(e) => {
                           const updated = [...profile.researchExperience]
-                          updated[index].title = e.target.value
+                          updated[index] = { ...updated[index], title: e.target.value }
                           setProfile({ ...profile, researchExperience: updated })
                         }}
                         placeholder="Position Title"
@@ -455,7 +605,7 @@ export default function StudentProfilePage() {
                         value={exp.organization}
                         onChange={(e) => {
                           const updated = [...profile.researchExperience]
-                          updated[index].organization = e.target.value
+                          updated[index] = { ...updated[index], organization: e.target.value }
                           setProfile({ ...profile, researchExperience: updated })
                         }}
                         placeholder="Lab or Organization"
@@ -477,10 +627,64 @@ export default function StudentProfilePage() {
                     value={exp.description}
                     onChange={(e) => {
                       const updated = [...profile.researchExperience]
-                      updated[index].description = e.target.value
+                      updated[index] = { ...updated[index], description: e.target.value }
                       setProfile({ ...profile, researchExperience: updated })
                     }}
                     placeholder="Description of duties, findings, and publications…"
+                    className="w-full bg-white border border-slate-200 rounded-lg p-2.5 text-xs text-slate-700 outline-none focus:border-blue-600 resize-none"
+                  />
+                </div>
+              ))}
+
+              {profile.projects.map((proj, index) => (
+                <div
+                  key={proj.id}
+                  className="p-4 rounded-2xl bg-slate-50/70 border border-slate-200/80 space-y-3 relative group"
+                >
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 flex-1">
+                      <input
+                        type="text"
+                        value={proj.title}
+                        onChange={(e) => {
+                          const updated = [...profile.projects]
+                          updated[index] = { ...updated[index], title: e.target.value }
+                          setProfile({ ...profile, projects: updated })
+                        }}
+                        placeholder="Project Title"
+                        className="bg-white border border-slate-200 rounded-lg px-3 py-1.5 text-xs font-bold text-slate-900"
+                      />
+                      <input
+                        type="url"
+                        value={proj.url || ''}
+                        onChange={(e) => {
+                          const updated = [...profile.projects]
+                          updated[index] = { ...updated[index], url: e.target.value }
+                          setProfile({ ...profile, projects: updated })
+                        }}
+                        placeholder="Project / Repository URL"
+                        className="bg-white border border-slate-200 rounded-lg px-3 py-1.5 text-xs text-slate-700"
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => removeProject(proj.id)}
+                      className="text-slate-400 hover:text-rose-500 p-1 transition-colors"
+                      title="Remove Project"
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+
+                  <textarea
+                    rows={2}
+                    value={proj.description}
+                    onChange={(e) => {
+                      const updated = [...profile.projects]
+                      updated[index] = { ...updated[index], description: e.target.value }
+                      setProfile({ ...profile, projects: updated })
+                    }}
+                    placeholder="Project description and key technical contributions…"
                     className="w-full bg-white border border-slate-200 rounded-lg p-2.5 text-xs text-slate-700 outline-none focus:border-blue-600 resize-none"
                   />
                 </div>
@@ -504,37 +708,45 @@ export default function StudentProfilePage() {
               <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wide">
                 Conference & Journal Papers
               </label>
-              {profile.publications.map((pub, idx) => (
-                <div key={pub.id} className="p-3.5 rounded-xl bg-slate-50/70 border border-slate-200/80 flex items-start justify-between gap-3">
-                  <div>
-                    <p className="text-xs font-bold text-slate-900">{pub.title}</p>
-                    <p className="text-[11px] text-slate-500 mt-0.5">
-                      {pub.conference || pub.journal} ({pub.year}) • Authors: {pub.authors.join(', ')}
-                    </p>
-                    {pub.doi && <p className="text-[10px] text-blue-600 font-mono mt-0.5">DOI: {pub.doi}</p>}
+              {profile.publications.length === 0 ? (
+                <p className="text-xs text-slate-400 italic">No publications listed yet.</p>
+              ) : (
+                profile.publications.map((pub) => (
+                  <div key={pub.id} className="p-3.5 rounded-xl bg-slate-50/70 border border-slate-200/80 flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-bold text-slate-900">{pub.title}</p>
+                      <p className="text-[11px] text-slate-500 mt-0.5">
+                        {pub.conference || pub.journal} ({pub.year}) • Authors: {(pub.authors || []).join(', ')}
+                      </p>
+                      {pub.doi && <p className="text-[10px] text-blue-600 font-mono mt-0.5">DOI: {pub.doi}</p>}
+                    </div>
+                    {pub.url && (
+                      <a href={pub.url} target="_blank" rel="noopener noreferrer" className="text-slate-400 hover:text-blue-600">
+                        <ExternalLink size={14} />
+                      </a>
+                    )}
                   </div>
-                  {pub.url && (
-                    <a href={pub.url} target="_blank" rel="noopener noreferrer" className="text-slate-400 hover:text-blue-600">
-                      <ExternalLink size={14} />
-                    </a>
-                  )}
-                </div>
-              ))}
+                ))
+              )}
 
               <div className="pt-2">
                 <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wide mb-2">
                   Language & Exam Scores
                 </label>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  {profile.languageScores.map((score, sIdx) => (
-                    <div key={score.id} className="p-3 rounded-xl bg-slate-50/70 border border-slate-200/80 flex items-center justify-between">
-                      <span className="text-xs font-bold text-slate-800">{score.type}</span>
-                      <span className="text-xs font-semibold text-blue-700 bg-blue-50 px-2 py-0.5 rounded-md border border-blue-200">
-                        {score.score}
-                      </span>
-                    </div>
-                  ))}
-                </div>
+                {profile.languageScores.length === 0 ? (
+                  <p className="text-xs text-slate-400 italic">No language scores listed yet.</p>
+                ) : (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {profile.languageScores.map((score) => (
+                      <div key={score.id} className="p-3 rounded-xl bg-slate-50/70 border border-slate-200/80 flex items-center justify-between">
+                        <span className="text-xs font-bold text-slate-800">{score.type}</span>
+                        <span className="text-xs font-semibold text-blue-700 bg-blue-50 px-2 py-0.5 rounded-md border border-blue-200">
+                          {score.score}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -597,12 +809,7 @@ export default function StudentProfilePage() {
           </div>
 
           {/* Form Actions Footer */}
-          <div className="flex flex-col sm:flex-row items-center justify-between gap-4 pt-4">
-            <div className="flex items-center gap-2 text-xs text-slate-500">
-              <AlertCircle size={14} className="text-blue-600" />
-              <span>In demo mode, changes are saved to your local session browser state.</span>
-            </div>
-
+          <div className="flex flex-col sm:flex-row items-center justify-end gap-4 pt-4">
             <Button
               type="submit"
               disabled={saving}

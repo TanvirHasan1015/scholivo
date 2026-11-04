@@ -1,29 +1,17 @@
-import { useState, useEffect } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
-import { Heart, MapPin, Building, ArrowLeft, ExternalLink, BookmarkCheck, Search, ArrowUpRight, GraduationCap } from 'lucide-react'
+import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { Heart, MapPin, Building, ArrowLeft, BookmarkCheck, Search, ArrowUpRight } from 'lucide-react'
 import { Button } from '@/components/common/Button'
 import { Avatar } from '@/components/common/Avatar'
 import { MatchChip } from '@/components/matching/MatchScore'
-import { DEMO_SAVED_PROFESSORS, type SavedProfessorItem } from '@/lib/demoData'
+import type { SavedProfessorItem } from '@/lib/demoData'
 
 export default function SavedProfessors() {
   const navigate = useNavigate()
-  const [saved, setSaved] = useState<SavedProfessorItem[]>(() => {
-    const local = localStorage.getItem('rm_demo_saved_professors')
-    if (local) {
-      try {
-        return JSON.parse(local)
-      } catch {
-        // fallback
-      }
-    }
-    return DEMO_SAVED_PROFESSORS
-  })
+  const [saved, setSaved] = useState<SavedProfessorItem[]>([])
 
   const handleRemove = (uid: string) => {
-    const updated = saved.filter((p) => p.uid !== uid)
-    setSaved(updated)
-    localStorage.setItem('rm_demo_saved_professors', JSON.stringify(updated))
+    setSaved((prev) => prev.filter((p) => p.uid !== uid))
   }
 
   return (
@@ -74,7 +62,7 @@ export default function SavedProfessors() {
             </div>
             <h2 className="text-lg font-bold text-slate-900 font-display">No saved professors yet</h2>
             <p className="text-sm text-slate-500">
-              When exploring faculty profiles and positions, click the bookmark icon to save professors for quick access here.
+              When exploring faculty profiles and positions, bookmark professors to keep track of them here.
             </p>
             <Button onClick={() => navigate('/search')} className="mt-2">
               Browse Faculty Directory

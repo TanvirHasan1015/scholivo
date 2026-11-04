@@ -86,60 +86,33 @@ export default function ProfessorSignup() {
 
       const newProfProfile = {
         uid: user.uid,
-        fullName: accountData.fullName,
-        username: accountData.username,
-        email: accountData.email,
-        academicTitle: accountData.academicTitle || 'Assistant Professor',
-        country: accountData.country || 'United States',
-        university: profile.university || 'Stanford University',
-        department: profile.department || 'Computer Science',
-        faculty: profile.faculty || 'School of Engineering',
-        universityProfileUrl: profile.universityProfileUrl || 'https://stanford.edu/faculty',
-        googleScholarUrl: profile.googleScholarUrl || 'https://scholar.google.com',
-        orcid: profile.orcid || '0000-0002-1825-0097',
-        personalWebpageUrl: profile.personalWebpageUrl || '',
-        biography: profile.biography || 'Researching advanced computing and intelligence systems.',
-        researchAreas: research.researchAreas || ['Artificial Intelligence'],
-        researchInterests: research.researchInterests || ['Machine Learning'],
+        fullName: accountData.fullName.trim(),
+        username: accountData.username.trim(),
+        email: accountData.email.trim(),
+        academicTitle: accountData.academicTitle,
+        country: accountData.country,
+        university: profile.university.trim(),
+        department: profile.department.trim(),
+        faculty: profile.faculty.trim(),
+        universityProfileUrl: profile.universityProfileUrl.trim(),
+        googleScholarUrl: profile.googleScholarUrl.trim(),
+        orcid: profile.orcid.trim(),
+        personalWebpageUrl: profile.personalWebpageUrl.trim(),
+        biography: profile.biography.trim(),
+        researchAreas: research.researchAreas,
+        researchInterests: research.researchInterests,
         currentProjects: [],
         publications: [],
         accountStatus: 'active' as const,
         isRecruiting: false,
         recruitingStatus: 'not_recruiting' as const,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
       }
 
-      // 1. Save profile to localStorage
-      localStorage.setItem('rm_demo_professor_profile', JSON.stringify(newProfProfile))
-
-      // 2. Add to rm_demo_system_users
-      const newSystemUser = {
-        uid: user.uid,
-        displayName: accountData.fullName,
-        email: accountData.email,
-        role: 'professor' as const,
-        university: profile.university || 'Stanford University',
-        department: profile.department || 'Computer Science',
-        academicTitleOrDegree: accountData.academicTitle || 'Assistant Professor',
-        accountStatus: 'active' as const,
-        createdAt: new Date().toISOString().slice(0, 10),
-        openPositionsCount: 0,
-        applicationsCount: 0,
-      }
-      const existingUsers = localStorage.getItem('rm_demo_system_users')
-      const usersList = existingUsers ? JSON.parse(existingUsers) : []
-      localStorage.setItem('rm_demo_system_users', JSON.stringify([newSystemUser, ...usersList]))
-
-      try {
-        await setDoc(doc(db, 'professors', user.uid), {
-          ...newProfProfile,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        })
-      } catch {
-        // demo mode Firestore fallback
-      }
+      await setDoc(doc(db, 'professors', user.uid), {
+        ...newProfProfile,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
 
       navigate('/dashboard/professor')
     } catch (err: unknown) {
