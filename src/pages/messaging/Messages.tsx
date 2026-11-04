@@ -1,6 +1,6 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Send, ArrowLeft, MessageSquare, CheckCheck, Clock, ShieldAlert, Search, Sparkles } from 'lucide-react'
+import { Send, MessageSquare, CheckCheck } from 'lucide-react'
 import { useAuth } from '@/context/AuthContext'
 import { Avatar } from '@/components/common/Avatar'
 import { Button } from '@/components/common/Button'
@@ -25,116 +25,18 @@ interface Conversation {
   messages: Message[]
 }
 
-const INITIAL_CONVERSATIONS: Conversation[] = [
-  {
-    id: 'conv-1',
-    participantName: 'Prof. Sungho Kim',
-    participantRole: 'Associate Professor, KAIST',
-    participantAvatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150',
-    positionTitle: 'PhD Position — Computer Vision & Medical AI',
-    lastMessage: 'Your experience with MICCAI is very promising. Are you available for a brief Zoom meeting next Tuesday?',
-    lastMessageAt: '10:45 AM',
-    unread: true,
-    messages: [
-      {
-        id: 'm1',
-        senderId: 'prof',
-        senderName: 'Prof. Sungho Kim',
-        content: 'Hello, thank you for submitting your application for our PhD opening in medical AI.',
-        sentAt: 'Yesterday at 3:15 PM'
-      },
-      {
-        id: 'm2',
-        senderId: 'student',
-        senderName: 'Student Applicant',
-        content: 'Thank you Professor! I am very excited about your recent work on 3D diffusion models for pathology synthesis.',
-        sentAt: 'Yesterday at 4:02 PM'
-      },
-      {
-        id: 'm3',
-        senderId: 'prof',
-        senderName: 'Prof. Sungho Kim',
-        content: 'Your experience with MICCAI is very promising. Are you available for a brief Zoom meeting next Tuesday at 2 PM KST?',
-        sentAt: '10:45 AM'
-      }
-    ]
-  },
-  {
-    id: 'conv-2',
-    participantName: 'Prof. Emily Chen',
-    participantRole: 'Full Professor, MIT',
-    participantAvatar: 'https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?w=150',
-    positionTitle: "Master's in NLP / AI",
-    lastMessage: 'We received your transcript and are reviewing it alongside other candidates.',
-    lastMessageAt: 'Oct 03',
-    unread: false,
-    messages: [
-      {
-        id: 'm10',
-        senderId: 'prof',
-        senderName: 'Prof. Emily Chen',
-        content: 'We received your transcript and are reviewing it alongside other candidates. We will update the status portal next week.',
-        sentAt: 'Oct 03 at 9:00 AM'
-      }
-    ]
-  }
-]
-
 export default function Messages() {
   const { user, role } = useAuth()
   const navigate = useNavigate()
-  const [conversations, setConversations] = useState<Conversation[]>(INITIAL_CONVERSATIONS)
-  const [activeConvId, setActiveConvId] = useState<string>('conv-1')
+  const [conversations, setConversations] = useState<Conversation[]>([])
+  const [activeConvId, setActiveConvId] = useState<string>('')
   const [inputMessage, setInputMessage] = useState('')
-
-  // Verification status check for student
-  const [verificationStatus, setVerificationStatus] = useState<string>(() => {
-    if (role === 'student') {
-      const savedVerifications = localStorage.getItem('rm_demo_verifications')
-      if (savedVerifications) {
-        try {
-          const list = JSON.parse(savedVerifications)
-          const myRecord = list.find((item: any) =>
-            (user && (item.userId === user.uid || (item.applicantEmail && user.email && item.applicantEmail.toLowerCase() === user.email.toLowerCase()))) ||
-            (!user && item.userId === 'demo-student')
-          )
-          if (myRecord) return myRecord.status
-        } catch {}
-      }
-      const savedStudent = localStorage.getItem('rm_demo_student_profile')
-      if (savedStudent) {
-        try {
-          const p = JSON.parse(savedStudent)
-          if (p.verificationStatus) return p.verificationStatus
-        } catch {}
-      }
-    }
-    return 'verified'
-  })
-
-  useEffect(() => {
-    if (role === 'student') {
-      const savedVerifications = localStorage.getItem('rm_demo_verifications')
-      if (savedVerifications) {
-        try {
-          const list = JSON.parse(savedVerifications)
-          const myRecord = list.find((item: any) =>
-            (user && (item.userId === user.uid || (item.applicantEmail && user.email && item.applicantEmail.toLowerCase() === user.email.toLowerCase()))) ||
-            (!user && item.userId === 'demo-student')
-          )
-          if (myRecord) setVerificationStatus(myRecord.status)
-        } catch {}
-      }
-    }
-  }, [user, role])
-
-  const isRestrictedStudent = role === 'student' && verificationStatus !== 'verified'
 
   const activeConv = conversations.find(c => c.id === activeConvId) || conversations[0]
 
   const handleSendMessage = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!inputMessage.trim() || isRestrictedStudent) return
+    if (!inputMessage.trim() || !activeConv) return
 
     const newMsg: Message = {
       id: `msg-${Date.now()}`,
@@ -145,7 +47,7 @@ export default function Messages() {
     }
 
     setConversations(prev => prev.map(c => {
-      if (c.id === activeConvId) {
+      if (c.id === activeConv.id) {
         return {
           ...c,
           lastMessage: inputMessage,
@@ -160,78 +62,6 @@ export default function Messages() {
     setInputMessage('')
   }
 
-  // If student is unverified / pending, render restriction barrier
-  if (isRestrictedStudent) {
-    return (
-      <div className="min-h-screen bg-slate-50/70 pt-20 pb-20 px-4 sm:px-6">
-        <div className="max-w-2xl mx-auto space-y-6">
-          <div className="flex items-center justify-between">
-            <button
-              onClick={() => navigate('/dashboard/student')}
-              className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-500 hover:text-slate-900 transition-colors py-1 px-2.5 rounded-lg hover:bg-slate-200/60"
-            >
-              <ArrowLeft size={14} />
-              Back to Student Dashboard
-            </button>
-          </div>
-
-          <div className="bg-white rounded-3xl border border-slate-200/80 p-8 sm:p-12 text-center shadow-xs space-y-6">
-            <div className="w-16 h-16 rounded-2xl bg-amber-50 border border-amber-200 flex items-center justify-center mx-auto text-amber-600">
-              <ShieldAlert size={32} />
-            </div>
-
-            <div>
-              <span className="inline-block px-3 py-1 rounded-full text-xs font-semibold bg-amber-100/80 text-amber-800 border border-amber-200 uppercase tracking-wider mb-2">
-                Verification Required
-              </span>
-              <h1 className="text-2xl sm:text-3xl font-bold font-display text-slate-900 tracking-tight">
-                Academic Messaging Restricted
-              </h1>
-            </div>
-
-            <p className="text-slate-600 text-xs sm:text-sm leading-relaxed max-w-lg mx-auto">
-              Your student affiliation is currently{' '}
-              <strong className="text-amber-800 capitalize font-semibold">{verificationStatus.replace('_', ' ')}</strong>.
-              Direct messaging with faculty is reserved for verified students to protect academic communication standards. You may still search research opportunities and save faculty profiles.
-            </p>
-
-            <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200/70 max-w-md mx-auto text-left text-xs space-y-2 text-slate-600">
-              <div className="flex items-center gap-2 font-semibold text-slate-800">
-                <Sparkles size={14} className="text-blue-600" />
-                Available During Pending Status:
-              </div>
-              <ul className="list-disc list-inside space-y-1 text-slate-500 pl-1">
-                <li>Browse complete faculty profiles and publications</li>
-                <li>Search matching research opportunities</li>
-                <li>Save professors to your personal shortlist</li>
-                <li>Update your academic profile and credentials</li>
-              </ul>
-            </div>
-
-            <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-3">
-              <Button
-                variant="primary"
-                onClick={() => navigate('/search')}
-                className="text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white"
-                id="browse-professors-btn"
-              >
-                <Search size={14} className="mr-1.5" />
-                Browse Faculty Directory
-              </Button>
-              <Button
-                variant="secondary"
-                onClick={() => navigate('/dashboard/student')}
-                className="text-xs font-semibold"
-              >
-                Return to Dashboard
-              </Button>
-            </div>
-          </div>
-        </div>
-      </div>
-    )
-  }
-
   return (
     <div className="min-h-screen bg-slate-50/70 pt-8 pb-16 px-4 sm:px-6 max-w-7xl mx-auto flex flex-col">
       <div className="flex-1 bg-white rounded-3xl border border-slate-200/80 shadow-2xs overflow-hidden grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 min-h-[640px]">
@@ -244,37 +74,47 @@ export default function Messages() {
           </div>
 
           <div className="flex-1 overflow-y-auto divide-y divide-slate-100">
-            {conversations.map(c => {
-              const active = c.id === activeConvId
-              return (
-                <button
-                  key={c.id}
-                  onClick={() => {
-                    setActiveConvId(c.id)
-                    setConversations(prev => prev.map(item => item.id === c.id ? { ...item, unread: false } : item))
-                  }}
-                  className={`w-full p-4 text-left transition-colors flex items-start gap-3 cursor-pointer ${
-                    active ? 'bg-blue-50/80 border-l-4 border-blue-600' : 'hover:bg-slate-100/60'
-                  }`}
-                  id={`conv-item-${c.id}`}
-                >
-                  <div className="relative shrink-0">
-                    <Avatar src={c.participantAvatar} name={c.participantName} size="md" />
-                    {c.unread && (
-                      <span className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 bg-blue-600 rounded-full border-2 border-white" />
-                    )}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center justify-between">
-                      <h3 className={`text-xs font-bold truncate ${active ? 'text-blue-900' : 'text-slate-900'}`}>{c.participantName}</h3>
-                      <span className="text-[10px] text-slate-400 shrink-0">{c.lastMessageAt}</span>
+            {conversations.length === 0 ? (
+              <div className="p-8 text-center space-y-2">
+                <MessageSquare size={28} className="mx-auto text-slate-300" />
+                <p className="text-xs font-semibold text-slate-600">No conversations yet</p>
+                <p className="text-[11px] text-slate-400">
+                  Your active academic inquiries will appear here.
+                </p>
+              </div>
+            ) : (
+              conversations.map(c => {
+                const active = c.id === activeConv?.id
+                return (
+                  <button
+                    key={c.id}
+                    onClick={() => {
+                      setActiveConvId(c.id)
+                      setConversations(prev => prev.map(item => item.id === c.id ? { ...item, unread: false } : item))
+                    }}
+                    className={`w-full p-4 text-left transition-colors flex items-start gap-3 cursor-pointer ${
+                      active ? 'bg-blue-50/80 border-l-4 border-blue-600' : 'hover:bg-slate-100/60'
+                    }`}
+                    id={`conv-item-${c.id}`}
+                  >
+                    <div className="relative shrink-0">
+                      <Avatar src={c.participantAvatar} name={c.participantName} size="md" />
+                      {c.unread && (
+                        <span className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 bg-blue-600 rounded-full border-2 border-white" />
+                      )}
                     </div>
-                    <p className="text-[11px] font-medium text-blue-700 truncate mt-0.5">{c.positionTitle}</p>
-                    <p className="text-xs text-slate-500 truncate mt-1">{c.lastMessage}</p>
-                  </div>
-                </button>
-              )
-            })}
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center justify-between">
+                        <h3 className={`text-xs font-bold truncate ${active ? 'text-blue-900' : 'text-slate-900'}`}>{c.participantName}</h3>
+                        <span className="text-[10px] text-slate-400 shrink-0">{c.lastMessageAt}</span>
+                      </div>
+                      <p className="text-[11px] font-medium text-blue-700 truncate mt-0.5">{c.positionTitle}</p>
+                      <p className="text-xs text-slate-500 truncate mt-1">{c.lastMessage}</p>
+                    </div>
+                  </button>
+                )
+              })
+            )}
           </div>
         </div>
 
@@ -324,25 +164,6 @@ export default function Messages() {
                 })}
               </div>
 
-              {/* Quick suggestions */}
-              <div className="px-4 py-2.5 border-t border-slate-200/60 bg-slate-50/60 flex items-center gap-2 overflow-x-auto text-xs text-slate-500">
-                <span className="text-[11px] font-semibold text-slate-400 shrink-0">Quick reply:</span>
-                <button
-                  type="button"
-                  onClick={() => setInputMessage('Yes, that time works perfectly for me. Looking forward to speaking with you!')}
-                  className="px-3 py-1 rounded-full bg-white hover:bg-slate-200/70 border border-slate-200 text-slate-700 shrink-0 transition-colors cursor-pointer text-xs"
-                >
-                  Yes, that time works for me &rarr;
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setInputMessage('Could you provide the Zoom / Google Meet link?')}
-                  className="px-3 py-1 rounded-full bg-white hover:bg-slate-200/70 border border-slate-200 text-slate-700 shrink-0 transition-colors cursor-pointer text-xs"
-                >
-                  Request meeting link &rarr;
-                </button>
-              </div>
-
               {/* Input bar */}
               <form onSubmit={handleSendMessage} className="p-4 border-t border-slate-200/80 bg-white flex items-center gap-3">
                 <input
@@ -366,8 +187,22 @@ export default function Messages() {
               </form>
             </>
           ) : (
-            <div className="flex-1 flex items-center justify-center text-slate-400 text-sm">
-              Select a conversation to begin
+            <div className="flex-1 flex flex-col items-center justify-center p-8 text-center space-y-3">
+              <div className="w-14 h-14 rounded-2xl bg-slate-50 border border-slate-200 flex items-center justify-center text-slate-400">
+                <MessageSquare size={26} />
+              </div>
+              <h2 className="text-base font-bold text-slate-800 font-display">No Active Conversations</h2>
+              <p className="text-xs text-slate-500 max-w-sm">
+                You don't have any messages yet. Explore open positions or review applications to connect with researchers.
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => navigate(role === 'professor' ? '/dashboard/professor' : '/search')}
+                className="mt-2"
+              >
+                {role === 'professor' ? 'Back to Dashboard' : 'Explore Faculty Directory'}
+              </Button>
             </div>
           )}
         </div>

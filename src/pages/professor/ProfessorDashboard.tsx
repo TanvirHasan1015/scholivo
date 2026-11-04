@@ -1,26 +1,21 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { collection, getDocs, query, where } from 'firebase/firestore'
+import { collection, doc, getDoc, getDocs, limit, query, updateDoc, where } from 'firebase/firestore'
 import { 
   Users, Briefcase, Plus, CheckCircle2, Clock, 
-  MessageSquare, Eye, Calendar, Sparkles, Building, 
-  GraduationCap, ArrowUpRight, ChevronRight, Filter, 
-  Settings, Award, ShieldCheck, Check, AlertCircle, FileText
+  Sparkles, Building, 
+  ArrowUpRight, ChevronRight, 
+  Settings, Award, FileText, AlertCircle, RefreshCw
 } from 'lucide-react'
-import { db, isDemoMode } from '@/lib/firebase'
+import { db } from '@/lib/firebase'
 import { useAuth } from '@/context/AuthContext'
+import type { ProfessorProfile } from '@/types/user.types'
 import type { Position } from '@/types/position.types'
 import type { Application, ApplicationStatus } from '@/types/application.types'
-import { 
-  DEMO_PROFESSORS, 
-  DEMO_PROFESSOR_APPLICATIONS, 
-  DEMO_STUDENT_PROFILE,
-  type ProfessorWithPositions 
-} from '@/lib/demoData'
 import { Button } from '@/components/common/Button'
 import { Avatar } from '@/components/common/Avatar'
 import { MatchChip } from '@/components/matching/MatchScore'
-import { STATUS_LABELS, FUNDING_LABELS, formatRelativeDate } from '@/utils/helpers'
+import { STATUS_LABELS, formatRelativeDate } from '@/utils/helpers'
 
 const STATUS_PILL_STYLES: Record<string, string> = {
   submitted: 'bg-blue-50 text-blue-700 border-blue-200',
@@ -35,137 +30,129 @@ export default function ProfessorDashboard() {
   const { user } = useAuth()
   const navigate = useNavigate()
 
-  // Default demo professor: Prof. Minji Kim
-  const defaultProf = DEMO_PROFESSORS[0]
-
-  const [profile, setProfile] = useState<ProfessorWithPositions>(() => {
-    const local = localStorage.getItem('rm_demo_professor_profile')
-    if (local) {
-      try {
-        return JSON.parse(local)
-      } catch {
-        // fallback
-      }
-    }
-    return defaultProf
-  })
-
-  const [positions, setPositions] = useState<Position[]>(() => {
-    const local = localStorage.getItem('rm_demo_positions')
-    if (local) {
-      try {
-        return JSON.parse(local)
-      } catch {
-        // fallback
-      }
-    }
-    return defaultProf.positions
-  })
-
-  const [applications, setApplications] = useState<Application[]>(() => {
-    const local = localStorage.getItem('rm_demo_applications')
-    if (local) {
-      try {
-        return JSON.parse(local)
-      } catch {
-        // fallback
-      }
-    }
-    return DEMO_PROFESSOR_APPLICATIONS
-  })
-
+  const [profile, setProfile] = useState<ProfessorProfile | null>(null)
+  const [profDocId, setProfDocId] = useState<string | null>(null)
+  const [positions, setPositions] = useState<Position[]>([])
+  const [applications, setApplications] = useState<Application[]>([])
   const [selectedStatusFilter, setSelectedStatusFilter] = useState<string>('all')
-  const [isRecruiting, setIsRecruiting] = useState<boolean>(() => {
-    const local = localStorage.getItem('rm_demo_is_recruiting')
-    return local !== null ? local === 'true' : true
-  })
+  const [isRecruiting, setIsRecruiting] = useState<boolean>(false)
+  const [loading, setLoading] = useState<boolean>(true)
+  const [loadError, setLoadError] = useState<string>('')
+  const [actionError, setActionError] = useState<string>('')
 
-  useEffect(() => {
-    if (isDemoMode) {
-      // Sync from local storage
-      const localProf = localStorage.getItem('rm_demo_professor_profile')
-      if (localProf) {
-        try { setProfile(JSON.parse(localProf)) } catch {}
-      }
-      const localPos = localStorage.getItem('rm_demo_positions')
-      if (localPos) {
-        try { setPositions(JSON.parse(localPos)) } catch {}
-      }
-      const localApps = localStorage.getItem('rm_demo_applications')
-      if (localApps) {
-        try { setApplications(JSON.parse(localApps)) } catch {}
-      }
-      const savedVerifications = localStorage.getItem('rm_demo_verifications')
-      if (savedVerifications) {
-        try {
-          const list = JSON.parse(savedVerifications)
-          const myRecord = list.find((item: any) =>
-            (user && (item.userId === user.uid || (item.applicantEmail && user.email && item.applicantEmail.toLowerCase() === user.email.toLowerCase()))) ||
-            (!user && item.userId === 'demo-1')
-          )
-          if (myRecord) {
-            setProfile((prev) => ({ ...prev, verificationStatus: myRecord.status }))
-          }
-        } catch {}
-      }
+  const loadData = useCallback(async () => {
+    if (!user) {
+      setLoading(false)
       return
     }
+    setLoading(true)
+    setLoadError('')
 
-    if (!user) return
-    async function loadData() {
-      try {
-        const posQ = query(collection(db, 'positions'), where('professorId', '==', user?.uid))
-        const posSnap = await getDocs(posQ)
-        if (!posSnap.empty) {
-          const list: Position[] = []
-          posSnap.forEach((d) => list.push({ id: d.id, ...d.data() } as Position))
-          setPositions(list)
+    try {
+      // 1. Load Professor Profile
+      let loadedProfile: ProfessorProfile | null = null
+      let resolvedDocId: string | null = null
+      const directSnap = await getDoc(doc(db, 'professors', user.uid))
+      if (directSnap.exists()) {
+        resolvedDocId = directSnap.id
+        loadedProfile = { ...(directSnap.data() as ProfessorProfile), uid: user.uid }
+      } else {
+        const fallbackSnap = await getDocs(
+          query(collection(db, 'professors'), where('uid', '==', user.uid), limit(1))
+        )
+        if (!fallbackSnap.empty) {
+          resolvedDocId = fallbackSnap.docs[0].id
+          loadedProfile = { ...(fallbackSnap.docs[0].data() as ProfessorProfile), uid: user.uid }
         }
-
-        const appQ = query(collection(db, 'applications'), where('professorId', '==', user?.uid))
-        const appSnap = await getDocs(appQ)
-        if (!appSnap.empty) {
-          const list: Application[] = []
-          appSnap.forEach((d) => list.push({ id: d.id, ...d.data() } as Application))
-          setApplications(list)
-        }
-      } catch (err) {
-        console.error('Error fetching professor data:', err)
       }
+
+      setProfile(loadedProfile)
+      setProfDocId(resolvedDocId)
+      setIsRecruiting(Boolean(loadedProfile?.isRecruiting))
+
+      // 2. Load Professor's Positions
+      const posQ = query(collection(db, 'positions'), where('professorId', '==', user.uid))
+      const posSnap = await getDocs(posQ)
+      const posList: Position[] = []
+      posSnap.forEach((d) => posList.push({ id: d.id, ...d.data() } as Position))
+      setPositions(posList)
+
+      // 3. Load Professor's Incoming Applications
+      const appQ = query(collection(db, 'applications'), where('professorId', '==', user.uid))
+      const appSnap = await getDocs(appQ)
+      const appList: Application[] = []
+      appSnap.forEach((d) => appList.push({ id: d.id, ...d.data() } as Application))
+      setApplications(appList)
+    } catch (err) {
+      console.error('Error fetching professor data:', err)
+      setLoadError('Failed to load faculty dashboard data from Firebase. Please check your connection and try again.')
+    } finally {
+      setLoading(false)
     }
-    loadData()
   }, [user])
 
-  const toggleRecruiting = () => {
+  useEffect(() => {
+    loadData()
+  }, [loadData])
+
+  const toggleRecruiting = async () => {
+    if (!user || !profile || !profDocId) return
+    setActionError('')
     const next = !isRecruiting
-    setIsRecruiting(next)
-    localStorage.setItem('rm_demo_is_recruiting', String(next))
-    const updatedProf = { ...profile, isRecruiting: next }
-    setProfile(updatedProf)
-    localStorage.setItem('rm_demo_professor_profile', JSON.stringify(updatedProf))
+    const nextStatus = next ? 'actively_recruiting' : 'not_recruiting'
+    const nowIso = new Date().toISOString()
+
+    try {
+      await updateDoc(doc(db, 'professors', profDocId), {
+        isRecruiting: next,
+        recruitingStatus: nextStatus,
+        updatedAt: nowIso,
+      })
+      setIsRecruiting(next)
+      setProfile({
+        ...profile,
+        isRecruiting: next,
+        recruitingStatus: nextStatus,
+        updatedAt: nowIso,
+      })
+    } catch (err) {
+      console.error('Failed to update recruiting status:', err)
+      setActionError('Failed to update recruiting status in Firestore. Please try again.')
+    }
   }
 
-  const handleStatusChange = (appId: string, newStatus: ApplicationStatus) => {
-    if ((profile.verificationStatus || 'verified') !== 'verified') {
-      alert('Faculty verification required to change candidate application stages.')
+  const handleStatusChange = async (appId: string, newStatus: ApplicationStatus) => {
+    if (!user) return
+    const targetApp = applications.find((a) => a.id === appId)
+    if (!targetApp || targetApp.professorId !== user.uid) {
+      setActionError('You are not authorized to modify this application.')
       return
     }
-    const updated = applications.map((app) => {
-      if (app.id === appId) {
-        return {
-          ...app,
-          status: newStatus,
-          statusHistory: [
-            ...app.statusHistory,
-            { status: newStatus, changedAt: new Date().toISOString(), note: `Updated to ${STATUS_LABELS[newStatus]}` },
-          ],
-          updatedAt: new Date().toISOString(),
-        }
-      }
-      return app
-    })
-    setApplications(updated)
-    localStorage.setItem('rm_demo_applications', JSON.stringify(updated))
+
+    setActionError('')
+    const nowIso = new Date().toISOString()
+    const updatedHistory = [
+      ...(targetApp.statusHistory || []),
+      { status: newStatus, changedAt: nowIso, note: `Updated to ${STATUS_LABELS[newStatus]}` },
+    ]
+
+    try {
+      await updateDoc(doc(db, 'applications', appId), {
+        status: newStatus,
+        statusHistory: updatedHistory,
+        updatedAt: nowIso,
+      })
+      setApplications((prev) =>
+        prev.map((app) =>
+          app.id === appId
+            ? { ...app, status: newStatus, statusHistory: updatedHistory, updatedAt: nowIso }
+            : app
+        )
+      )
+    } catch (err) {
+      console.error('Failed to update application status:', err)
+      setActionError('Failed to update application status in Firestore. Please try again.')
+    }
   }
 
   const filteredApplications = selectedStatusFilter === 'all'
@@ -190,9 +177,40 @@ export default function ProfessorDashboard() {
     { id: 'accepted', label: 'Offered / Accepted', count: stats.accepted },
   ]
 
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-50/70 flex items-center justify-center px-4">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-10 h-10 rounded-2xl bg-blue-600/20 border border-blue-600 animate-pulse" />
+          <p className="text-xs font-medium text-slate-500">Loading your faculty dashboard…</p>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="min-h-screen bg-slate-50/70 pt-8 pb-20 px-4 sm:px-6 lg:px-8">
       <div className="max-w-7xl mx-auto space-y-8">
+
+        {loadError && (
+          <div className="rounded-2xl bg-rose-50 border border-rose-200 px-5 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 text-xs font-semibold text-rose-700">
+              <AlertCircle size={16} className="text-rose-600 shrink-0" />
+              <span>{loadError}</span>
+            </div>
+            <Button size="sm" variant="outline" onClick={loadData} className="flex items-center gap-1.5 self-start sm:self-auto">
+              <RefreshCw size={13} />
+              <span>Retry</span>
+            </Button>
+          </div>
+        )}
+
+        {actionError && (
+          <div className="rounded-2xl bg-rose-50 border border-rose-200 px-5 py-3 text-xs font-semibold text-rose-700 flex items-center gap-2">
+            <AlertCircle size={15} className="text-rose-600 shrink-0" />
+            <span>{actionError}</span>
+          </div>
+        )}
         
         {/* Top Header Banner */}
         <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-2xs flex flex-col md:flex-row md:items-center justify-between gap-6">
@@ -200,39 +218,40 @@ export default function ProfessorDashboard() {
             <div className="flex items-center gap-2">
               <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-blue-50 border border-blue-200 text-blue-700 text-xs font-semibold">
                 <Sparkles size={13} className="text-blue-600" />
-                <span>Faculty Research Portal (Demonstration Mode)</span>
+                <span>Faculty Research Portal</span>
               </div>
-              <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold border ${
-                (profile.verificationStatus || 'verified') === 'verified'
-                  ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                  : 'bg-amber-50 text-amber-700 border-amber-200'
-              }`}>
-                <ShieldCheck size={13} className={(profile.verificationStatus || 'verified') === 'verified' ? 'text-emerald-600' : 'text-amber-600'} />
-                <span>{(profile.verificationStatus || 'verified') === 'verified' ? 'Verified Lab' : `Affiliation: ${profile.verificationStatus}`}</span>
-              </span>
             </div>
 
             <h1 className="font-display text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight">
-              Welcome back, {profile.fullName} 👋
+              Welcome back, {profile?.fullName || user?.displayName || 'Professor'} 👋
             </h1>
-            <p className="text-slate-500 text-sm max-w-xl">
-              {profile.academicTitle} at <strong className="text-slate-700">{profile.university}</strong> ({profile.department}). Manage open recruitment calls and evaluate prospective researchers.
-            </p>
+            {profile ? (
+              <p className="text-slate-500 text-sm max-w-xl">
+                {profile.academicTitle || 'Faculty'} at <strong className="text-slate-700">{profile.university || 'University not set'}</strong>
+                {profile.department ? ` (${profile.department})` : ''}. Manage open recruitment calls and evaluate prospective researchers.
+              </p>
+            ) : (
+              <p className="text-slate-500 text-sm max-w-xl">
+                Manage open recruitment calls and evaluate prospective researchers.
+              </p>
+            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
-            <button
-              onClick={toggleRecruiting}
-              className={`px-4 py-2.5 rounded-xl border text-xs font-semibold transition-all flex items-center gap-2 cursor-pointer shadow-2xs ${
-                isRecruiting
-                  ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
-                  : 'bg-slate-100 border-slate-200 text-slate-600'
-              }`}
-              id="toggle-recruiting-btn"
-            >
-              <span className={`w-2 h-2 rounded-full ${isRecruiting ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'}`} />
-              <span>{isRecruiting ? 'Recruiting Active' : 'Recruiting Paused'}</span>
-            </button>
+            {profile && (
+              <button
+                onClick={toggleRecruiting}
+                className={`px-4 py-2.5 rounded-xl border text-xs font-semibold transition-all flex items-center gap-2 cursor-pointer shadow-2xs ${
+                  isRecruiting
+                    ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                    : 'bg-slate-100 border-slate-200 text-slate-600'
+                }`}
+                id="toggle-recruiting-btn"
+              >
+                <span className={`w-2 h-2 rounded-full ${isRecruiting ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'}`} />
+                <span>{isRecruiting ? 'Recruiting Active' : 'Recruiting Paused'}</span>
+              </button>
+            )}
 
             <Button
               variant="outline"
@@ -346,19 +365,6 @@ export default function ProfessorDashboard() {
                 ))}
               </div>
 
-              {/* Pending Faculty Verification Alert */}
-              {(profile.verificationStatus || 'verified') !== 'verified' && (
-                <div className="p-4 rounded-2xl bg-amber-50/90 border border-amber-200 text-amber-900 text-xs flex items-start gap-3 mb-6">
-                  <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                  <div>
-                    <p className="font-semibold text-amber-950">Faculty Verification Pending</p>
-                    <p className="mt-0.5 text-amber-800 leading-relaxed">
-                      Candidate dossier evaluation and application stage transitions are locked until institutional affiliation is approved by an administrator. You may still update your research profile and prepare draft opportunities.
-                    </p>
-                  </div>
-                </div>
-              )}
-
               {/* Applications List */}
               <div className="space-y-4">
                 {filteredApplications.map((app) => (
@@ -375,7 +381,7 @@ export default function ProfessorDashboard() {
                             <h3 className="text-base font-bold text-slate-900 group-hover:text-blue-600 transition-colors truncate">
                               {app.studentName}
                             </h3>
-                            <MatchChip score={app.matchScore} />
+                            {typeof app.matchScore === 'number' && <MatchChip score={app.matchScore} />}
                           </div>
                           <p className="text-xs font-semibold text-blue-700 mt-0.5">
                             {app.positionTitle}
@@ -407,9 +413,7 @@ export default function ProfessorDashboard() {
                         <select
                           value={app.status}
                           onChange={(e) => handleStatusChange(app.id, e.target.value as ApplicationStatus)}
-                          disabled={(profile.verificationStatus || 'verified') !== 'verified'}
-                          title={(profile.verificationStatus || 'verified') !== 'verified' ? 'Faculty verification required to change stage' : undefined}
-                          className="bg-white border border-slate-200 rounded-lg px-2.5 py-1 text-xs font-semibold text-slate-800 focus:border-blue-600 outline-none cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-slate-100"
+                          className="bg-white border border-slate-200 rounded-lg px-2.5 py-1 text-xs font-semibold text-slate-800 focus:border-blue-600 outline-none cursor-pointer"
                           id={`change-status-${app.id}`}
                         >
                           <option value="submitted">Submitted</option>
@@ -439,7 +443,11 @@ export default function ProfessorDashboard() {
                   <div className="text-center py-12 px-4 bg-slate-50 rounded-2xl border border-dashed border-slate-200">
                     <FileText size={36} className="mx-auto text-slate-400 mb-2 opacity-60" />
                     <p className="text-sm font-semibold text-slate-800">No applications in this category</p>
-                    <p className="text-xs text-slate-500 mt-1">Select "All Candidates" to inspect your complete applicant queue</p>
+                    <p className="text-xs text-slate-500 mt-1">
+                      {applications.length === 0
+                        ? 'You have not received any student applications yet.'
+                        : 'Select "All Candidates" to inspect your complete applicant queue.'}
+                    </p>
                   </div>
                 )}
               </div>
@@ -466,39 +474,43 @@ export default function ProfessorDashboard() {
                 </Link>
               </div>
 
-              <div className="space-y-3.5">
-                {positions.map((pos) => {
-                  const applicantCount = applications.filter((a) => a.positionId === pos.id).length
-                  return (
-                    <div
-                      key={pos.id}
-                      onClick={() => navigate('/positions/manage')}
-                      className="p-3.5 rounded-2xl border border-slate-200/80 hover:border-blue-300 hover:bg-slate-50/60 transition-all cursor-pointer group"
-                      id={`lab-pos-${pos.id}`}
-                    >
-                      <div className="flex items-start justify-between gap-2 mb-1.5">
-                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
-                          {pos.degreeType.replace('_', ' ')}
-                        </span>
-                        <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${
-                          pos.isOpen ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-slate-100 text-slate-600'
-                        }`}>
-                          {pos.isOpen ? 'Accepting' : 'Closed'}
-                        </span>
-                      </div>
+              {positions.length === 0 ? (
+                <p className="text-xs text-slate-400 italic py-2">No positions posted yet.</p>
+              ) : (
+                <div className="space-y-3.5">
+                  {positions.map((pos) => {
+                    const applicantCount = applications.filter((a) => a.positionId === pos.id).length
+                    return (
+                      <div
+                        key={pos.id}
+                        onClick={() => navigate('/positions/manage')}
+                        className="p-3.5 rounded-2xl border border-slate-200/80 hover:border-blue-300 hover:bg-slate-50/60 transition-all cursor-pointer group"
+                        id={`lab-pos-${pos.id}`}
+                      >
+                        <div className="flex items-start justify-between gap-2 mb-1.5">
+                          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
+                            {pos.degreeType.replace('_', ' ')}
+                          </span>
+                          <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${
+                            pos.isOpen ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-slate-100 text-slate-600'
+                          }`}>
+                            {pos.isOpen ? 'Accepting' : 'Closed'}
+                          </span>
+                        </div>
 
-                      <h4 className="text-xs font-bold text-slate-900 group-hover:text-blue-600 transition-colors line-clamp-1">
-                        {pos.title}
-                      </h4>
+                        <h4 className="text-xs font-bold text-slate-900 group-hover:text-blue-600 transition-colors line-clamp-1">
+                          {pos.title}
+                        </h4>
 
-                      <div className="mt-2 pt-2 border-t border-slate-100 flex items-center justify-between text-[11px] text-slate-500">
-                        <span>{applicantCount} applicant{applicantCount !== 1 ? 's' : ''}</span>
-                        <span className="text-blue-600 font-semibold group-hover:underline">Edit opening →</span>
+                        <div className="mt-2 pt-2 border-t border-slate-100 flex items-center justify-between text-[11px] text-slate-500">
+                          <span>{applicantCount} applicant{applicantCount !== 1 ? 's' : ''}</span>
+                          <span className="text-blue-600 font-semibold group-hover:underline">Edit opening →</span>
+                        </div>
                       </div>
-                    </div>
-                  )
-                })}
-              </div>
+                    )
+                  })}
+                </div>
+              )}
 
               <Button
                 variant="outline"
@@ -515,52 +527,68 @@ export default function ProfessorDashboard() {
 
             {/* Quick Profile Overview */}
             <div className="bg-white rounded-3xl border border-slate-200/80 shadow-2xs p-6 space-y-4">
-              <div className="flex items-center gap-3 pb-3 border-b border-slate-100">
-                <Avatar src={profile.photoURL} name={profile.fullName} size="md" />
-                <div className="min-w-0">
-                  <h4 className="text-sm font-bold text-slate-900 truncate">{profile.fullName}</h4>
-                  <p className="text-xs text-slate-500 truncate">{profile.academicTitle}</p>
-                </div>
-              </div>
+              {profile ? (
+                <>
+                  <div className="flex items-center gap-3 pb-3 border-b border-slate-100">
+                    <Avatar src={profile.photoURL} name={profile.fullName || user?.displayName || 'Professor'} size="md" />
+                    <div className="min-w-0">
+                      <h4 className="text-sm font-bold text-slate-900 truncate">{profile.fullName || user?.displayName}</h4>
+                      <p className="text-xs text-slate-500 truncate">{profile.academicTitle}</p>
+                    </div>
+                  </div>
 
-              <div className="space-y-2 text-xs text-slate-600">
-                <div className="flex items-center gap-2">
-                  <Building size={14} className="text-slate-400 shrink-0" />
-                  <span>{profile.university} ({profile.department})</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Award size={14} className="text-slate-400 shrink-0" />
-                  <span>{profile.publications?.length || 0} Peer-reviewed Publications</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Users size={14} className="text-slate-400 shrink-0" />
-                  <span>{profile.labName || 'Research Laboratory'}</span>
-                </div>
-              </div>
+                  <div className="space-y-2 text-xs text-slate-600">
+                    <div className="flex items-center gap-2">
+                      <Building size={14} className="text-slate-400 shrink-0" />
+                      <span>{profile.university || 'University not set'}{profile.department ? ` (${profile.department})` : ''}</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Award size={14} className="text-slate-400 shrink-0" />
+                      <span>{profile.publications?.length || 0} Peer-reviewed Publications</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Users size={14} className="text-slate-400 shrink-0" />
+                      <span>{profile.labName || 'Research Laboratory'}</span>
+                    </div>
+                  </div>
 
-              <div className="pt-2 flex flex-col gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  fullWidth
-                  onClick={() => navigate('/profile/professor/edit')}
-                  className="text-xs font-semibold"
-                  id="dashboard-edit-faculty-btn"
-                >
-                  Edit Profile & Lab Info
-                </Button>
+                  <div className="pt-2 flex flex-col gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      fullWidth
+                      onClick={() => navigate('/profile/professor/edit')}
+                      className="text-xs font-semibold"
+                      id="dashboard-edit-faculty-btn"
+                    >
+                      Edit Profile & Lab Info
+                    </Button>
 
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  fullWidth
-                  onClick={() => navigate(`/professor/${profile.username || 'profkim'}`)}
-                  className="text-xs font-semibold text-blue-600 hover:text-blue-700"
-                  id="dashboard-view-public-btn"
-                >
-                  View Public Profile →
-                </Button>
-              </div>
+                    {profile.username && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        fullWidth
+                        onClick={() => navigate(`/professor/${profile.username}`)}
+                        className="text-xs font-semibold text-blue-600 hover:text-blue-700"
+                        id="dashboard-view-public-btn"
+                      >
+                        View Public Profile →
+                      </Button>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <div className="text-center py-4 space-y-3">
+                  <div className="w-12 h-12 rounded-2xl bg-blue-50 text-blue-600 flex items-center justify-center mx-auto">
+                    <Building size={22} />
+                  </div>
+                  <h4 className="text-sm font-bold text-slate-900">Faculty Profile Not Found</h4>
+                  <p className="text-xs text-slate-500">
+                    No professor profile document was found in Firestore for your account.
+                  </p>
+                </div>
+              )}
             </div>
 
           </div>

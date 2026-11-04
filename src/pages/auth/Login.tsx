@@ -3,9 +3,8 @@ import { Link, useNavigate } from 'react-router-dom'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { Mail, Lock, Eye, EyeOff, Sparkles, ArrowRight, Shield } from 'lucide-react'
+import { Mail, Lock, Eye, EyeOff } from 'lucide-react'
 import { useAuth } from '@/context/AuthContext'
-import { isDemoMode } from '@/lib/firebase'
 import { Input } from '@/components/common/Input'
 import { Button } from '@/components/common/Button'
 import { BrandLogo } from '@/components/common/BrandLogo'
@@ -18,7 +17,7 @@ const schema = z.object({
 type FormData = z.infer<typeof schema>
 
 export default function Login() {
-  const { signIn, role } = useAuth()
+  const { signIn } = useAuth()
   const navigate = useNavigate()
   const [showPassword, setShowPassword] = useState(false)
   const [authError, setAuthError] = useState('')
@@ -32,13 +31,14 @@ export default function Login() {
   const onSubmit = async (data: FormData) => {
     setAuthError('')
     try {
-      await signIn(data.email, data.password)
-      setTimeout(() => {
-        const currentRole = role
-        if (currentRole === 'professor') navigate('/dashboard/professor')
-        else if (currentRole === 'admin') navigate('/admin')
-        else navigate('/dashboard/student')
-      }, 100)
+      const resolvedRole = await signIn(data.email, data.password)
+      if (resolvedRole === 'professor') {
+        navigate('/dashboard/professor')
+      } else if (resolvedRole === 'student') {
+        navigate('/dashboard/student')
+      } else {
+        setAuthError('Account role not found. Please contact support.')
+      }
     } catch (err: unknown) {
       const code = (err as { code?: string })?.code
       if (code === 'auth/user-not-found' || code === 'auth/wrong-password' || code === 'auth/invalid-credential') {
@@ -46,36 +46,6 @@ export default function Login() {
       } else {
         setAuthError('Sign in failed. Please try again.')
       }
-    }
-  }
-
-  const handleDemoSignIn = async () => {
-    setAuthError('')
-    try {
-      await signIn('alex.rivera@university.edu', 'demo123')
-      navigate('/dashboard/student')
-    } catch {
-      setAuthError('Demo sign in failed.')
-    }
-  }
-
-  const handleDemoProfSignIn = async () => {
-    setAuthError('')
-    try {
-      await signIn('prof.kim@kaist.ac.kr', 'demo123')
-      navigate('/dashboard/professor')
-    } catch {
-      setAuthError('Demo professor sign in failed.')
-    }
-  }
-
-  const handleDemoAdminSignIn = async () => {
-    setAuthError('')
-    try {
-      await signIn('admin@scholivo.edu', 'demo123')
-      navigate('/admin')
-    } catch {
-      setAuthError('Demo admin sign in failed.')
     }
   }
 
@@ -130,49 +100,6 @@ export default function Login() {
               Sign In
             </Button>
           </form>
-
-          {isDemoMode && (
-            <div className="pt-2 space-y-2">
-              <Button
-                type="button"
-                variant="outline"
-                fullWidth
-                size="md"
-                onClick={handleDemoSignIn}
-                className="flex items-center justify-center gap-2 border-dashed border-blue-300 bg-blue-50/50 text-blue-700 hover:bg-blue-50 cursor-pointer font-semibold"
-                id="demo-student-login-btn"
-              >
-                <Sparkles size={14} className="text-blue-600" />
-                <span>Quick Sign-in as Demo Student (Alex)</span>
-              </Button>
-
-              <Button
-                type="button"
-                variant="outline"
-                fullWidth
-                size="md"
-                onClick={handleDemoProfSignIn}
-                className="flex items-center justify-center gap-2 border-dashed border-indigo-300 bg-indigo-50/50 text-indigo-700 hover:bg-indigo-50 cursor-pointer font-semibold"
-                id="demo-professor-login-btn"
-              >
-                <Sparkles size={14} className="text-indigo-600" />
-                <span>Quick Sign-in as Demo Professor (Prof. Kim)</span>
-              </Button>
-
-              <Button
-                type="button"
-                variant="outline"
-                fullWidth
-                size="md"
-                onClick={handleDemoAdminSignIn}
-                className="flex items-center justify-center gap-2 border-dashed border-purple-300 bg-purple-50/50 text-purple-700 hover:bg-purple-50 cursor-pointer font-semibold"
-                id="demo-admin-login-btn"
-              >
-                <Shield size={14} className="text-purple-600" />
-                <span>Quick Sign-in as Demo Administrator</span>
-              </Button>
-            </div>
-          )}
 
           <div className="pt-4 border-t border-slate-100">
             <p className="text-center text-xs text-slate-500">

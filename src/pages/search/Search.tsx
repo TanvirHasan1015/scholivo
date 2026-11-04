@@ -1,12 +1,12 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
-import { collection, getDocs, query, where, limit } from 'firebase/firestore'
+import { collection, doc, getDoc, getDocs, query, where, limit } from 'firebase/firestore'
 import { 
-  Search, Filter, MapPin, GraduationCap, X, SlidersHorizontal, 
-  ChevronDown, BookOpen, Sparkles, Building, ArrowUpRight
+  Search, MapPin, GraduationCap, X, SlidersHorizontal, 
+  Sparkles, ArrowUpRight, AlertCircle, RefreshCw
 } from 'lucide-react'
-import { db, isDemoMode } from '@/lib/firebase'
-import { DEMO_PROFESSORS, DEMO_STUDENT_PROFILE, type ProfessorWithPositions } from '@/lib/demoData'
+import { db } from '@/lib/firebase'
+import type { ProfessorWithPositions } from '@/lib/demoData'
 import { useAuth } from '@/context/AuthContext'
 import type { ProfessorProfile, StudentProfile } from '@/types/user.types'
 import type { Position } from '@/types/position.types'
@@ -14,11 +14,42 @@ import { computeMatch } from '@/lib/matching'
 import { Avatar } from '@/components/common/Avatar'
 import { Button } from '@/components/common/Button'
 import { MatchChip } from '@/components/matching/MatchScore'
-import { VerificationBadge, RecruitingBadge } from '@/components/common/Badges'
+import { RecruitingBadge } from '@/components/common/Badges'
 import { RESEARCH_AREAS, COUNTRIES, FUNDING_LABELS, cn } from '@/utils/helpers'
 
 const DEGREE_FILTER_OPTIONS = ['Master', 'PhD', 'Research_Assistant', 'PostDoc']
 const FUNDING_FILTER_OPTIONS = Object.keys(FUNDING_LABELS)
+
+function normalizeStudentForMatch(raw: Partial<StudentProfile>, uid: string): StudentProfile {
+  return {
+    uid: raw.uid || uid,
+    fullName: raw.fullName ?? '',
+    username: raw.username ?? '',
+    email: raw.email ?? '',
+    country: raw.country ?? '',
+    university: raw.university ?? '',
+    department: raw.department ?? '',
+    major: raw.major ?? '',
+    degree: raw.degree ?? 'Master',
+    currentSemester: raw.currentSemester ?? '',
+    expectedGraduation: raw.expectedGraduation ?? '',
+    gpa: typeof raw.gpa === 'number' ? raw.gpa : 0,
+    gpaScale: typeof raw.gpaScale === 'number' ? raw.gpaScale : 4.0,
+    researchInterests: Array.isArray(raw.researchInterests) ? raw.researchInterests : [],
+    researchAreas: Array.isArray(raw.researchAreas) ? raw.researchAreas : [],
+    researchExperience: Array.isArray(raw.researchExperience) ? raw.researchExperience : [],
+    projects: Array.isArray(raw.projects) ? raw.projects : [],
+    publications: Array.isArray(raw.publications) ? raw.publications : [],
+    programmingLanguages: Array.isArray(raw.programmingLanguages) ? raw.programmingLanguages : [],
+    frameworks: Array.isArray(raw.frameworks) ? raw.frameworks : [],
+    technicalSkills: Array.isArray(raw.technicalSkills) ? raw.technicalSkills : [],
+    researchTools: Array.isArray(raw.researchTools) ? raw.researchTools : [],
+    languageScores: Array.isArray(raw.languageScores) ? raw.languageScores : [],
+    profileCompleteness: raw.profileCompleteness ?? 0,
+    createdAt: raw.createdAt ?? '',
+    updatedAt: raw.updatedAt ?? '',
+  }
+}
 
 export default function SearchPage() {
   const [searchParams, setSearchParams] = useSearchParams()
@@ -27,8 +58,9 @@ export default function SearchPage() {
 
   const [q, setQ] = useState(searchParams.get('q') || '')
   const [professors, setProfessors] = useState<ProfessorWithPositions[]>([])
-  const [studentProfile, setStudentProfile] = useState<StudentProfile | null>(DEMO_STUDENT_PROFILE)
+  const [studentProfile, setStudentProfile] = useState<StudentProfile | null>(null)
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [showFilters, setShowFilters] = useState(false)
 
   // Keep search query synced with URL searchParams
@@ -48,61 +80,99 @@ export default function SearchPage() {
 
   // Load student profile for matching
   useEffect(() => {
-    if (isDemoMode) {
-      setStudentProfile(DEMO_STUDENT_PROFILE)
+    if (!user || role !== 'student') {
+      setStudentProfile(null)
       return
     }
 
-    if (user && role === 'student') {
-      getDocs(query(collection(db, 'students'), where('uid', '==', user.uid), limit(1)))
-        .then((snap) => {
-          if (!snap.empty) setStudentProfile(snap.docs[0].data() as StudentProfile)
-        })
-        .catch(() => {})
+    let cancelled = false
+    async function fetchStudent() {
+      try {
+        const directSnap = await getDoc(doc(db, 'students', user!.uid))
+        if (directSnap.exists()) {
+          if (!cancelled) {
+            setStudentProfile(normalizeStudentForMatch(directSnap.data() as Partial<StudentProfile>, user!.uid))
+          }
+          return
+        }
+        const fallbackSnap = await getDocs(
+          query(collection(db, 'students'), where('uid', '==', user!.uid), limit(1))
+        )
+        if (!fallbackSnap.empty && !cancelled) {
+          setStudentProfile(normalizeStudentForMatch(fallbackSnap.docs[0].data() as Partial<StudentProfile>, user!.uid))
+        }
+      } catch (err) {
+        console.error('Failed to load student profile for matching:', err)
+      }
+    }
+    fetchStudent()
+    return () => {
+      cancelled = true
     }
   }, [user, role])
 
-  // Load professors
-  useEffect(() => {
-    const load = async () => {
-      setLoading(true)
-      if (isDemoMode) {
-        setProfessors(DEMO_PROFESSORS)
-        setLoading(false)
-        return
-      }
+  // Load professors from Firestore
+  const loadProfessors = useCallback(async () => {
+    setLoading(true)
+    setLoadError('')
+    try {
+      const snap = await getDocs(
+        query(collection(db, 'professors'), limit(50))
+      )
 
-      try {
-        const snap = await getDocs(
-          query(collection(db, 'professors'), where('verificationStatus', '==', 'verified'), limit(50))
+      const results: ProfessorWithPositions[] = []
+
+      for (const docSnap of snap.docs) {
+        const rawProf = docSnap.data() as Partial<ProfessorProfile>
+        const profUid = rawProf.uid || docSnap.id
+
+        // Load open positions for this professor
+        const posSnap = await getDocs(
+          query(collection(db, 'positions'), where('professorId', '==', profUid), where('isOpen', '==', true))
         )
+        const positions = posSnap.docs.map((d) => {
+          const rawPos = d.data() as Partial<Position>
+          return {
+            ...rawPos,
+            id: d.id,
+            researchTopics: Array.isArray(rawPos.researchTopics) ? rawPos.researchTopics : [],
+            requiredSkills: Array.isArray(rawPos.requiredSkills) ? rawPos.requiredSkills : [],
+            preferredSkills: Array.isArray(rawPos.preferredSkills) ? rawPos.preferredSkills : [],
+            languageRequirements: Array.isArray(rawPos.languageRequirements) ? rawPos.languageRequirements : [],
+            researchArea: rawPos.researchArea ?? '',
+          } as Position
+        })
 
-        const results: ProfessorWithPositions[] = []
-
-        for (const docSnap of snap.docs) {
-          const prof = docSnap.data() as ProfessorProfile
-
-          // Load positions for this professor
-          const posSnap = await getDocs(
-            query(collection(db, 'positions'), where('professorId', '==', prof.uid), where('isOpen', '==', true))
-          )
-          const positions = posSnap.docs.map((d) => ({ id: d.id, ...d.data() } as Position))
-
-          results.push({ ...prof, positions })
-        }
-
-        const data = results.length > 0 ? results : DEMO_PROFESSORS
-        setProfessors(data)
-      } catch (err) {
-        console.error('Failed to load professors, falling back to demo:', err)
-        setProfessors(DEMO_PROFESSORS)
-      } finally {
-        setLoading(false)
+        results.push({
+          ...(rawProf as ProfessorProfile),
+          uid: profUid,
+          fullName: rawProf.fullName ?? 'Professor',
+          username: rawProf.username ?? profUid,
+          academicTitle: rawProf.academicTitle ?? '',
+          university: rawProf.university ?? '',
+          department: rawProf.department ?? '',
+          country: rawProf.country ?? '',
+          researchAreas: Array.isArray(rawProf.researchAreas) ? rawProf.researchAreas : [],
+          researchInterests: Array.isArray(rawProf.researchInterests) ? rawProf.researchInterests : [],
+          recruitingStatus: rawProf.recruitingStatus ?? 'not_recruiting',
+          isRecruiting: Boolean(rawProf.isRecruiting),
+          positions,
+        })
       }
-    }
 
-    load()
+      setProfessors(results)
+    } catch (err) {
+      console.error('Failed to load professors:', err)
+      setLoadError('Failed to load faculty directory from Firebase. Please check your connection and try again.')
+      setProfessors([])
+    } finally {
+      setLoading(false)
+    }
   }, [])
+
+  useEffect(() => {
+    loadProfessors()
+  }, [loadProfessors])
 
   // Compute match scores when student profile loads
   const professorsWithScores = professors.map((prof) => {
@@ -130,17 +200,17 @@ export default function SearchPage() {
         prof.fullName,
         prof.university,
         prof.department,
-        ...prof.researchAreas,
-        ...prof.researchInterests,
-        ...prof.positions.flatMap((p) => [p.title, p.researchArea, ...p.researchTopics]),
+        ...(prof.researchAreas || []),
+        ...(prof.researchInterests || []),
+        ...prof.positions.flatMap((p) => [p.title, p.researchArea, ...(p.researchTopics || [])]),
       ].some((val) => val && normalize(val).includes(qNorm))
 
     const matchesArea =
       !filters.researchArea ||
-      prof.researchAreas.some((a) => normalize(a) === normalize(filters.researchArea))
+      (prof.researchAreas || []).some((a) => normalize(a) === normalize(filters.researchArea))
     const matchesCountry = !filters.country || prof.country === filters.country
     const matchesUni =
-      !filters.university || normalize(prof.university).includes(normalize(filters.university))
+      !filters.university || normalize(prof.university || '').includes(normalize(filters.university))
     const matchesRecruiting = !filters.recruiting || prof.isRecruiting
     const matchesDegree = !filters.degree || prof.positions.some((p) => p.degreeType === filters.degree)
     const matchesFunding = !filters.funding || prof.positions.some((p) => p.fundingType === filters.funding)
@@ -176,13 +246,13 @@ export default function SearchPage() {
             <div>
               <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-blue-50 border border-blue-200 text-blue-700 text-xs font-semibold mb-2">
                 <Sparkles size={13} className="text-blue-600" />
-                <span>Verified Faculty Directory</span>
+                <span>Professor Directory</span>
               </div>
               <h1 className="font-display text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight">
                 Find Research Labs & Professors
               </h1>
               <p className="text-slate-500 text-sm mt-1">
-                Search verified faculty by research field, institution, and funded graduate openings
+                Search faculty by research field, institution, and funded graduate openings
               </p>
             </div>
           </div>
@@ -376,7 +446,7 @@ export default function SearchPage() {
           {studentProfile && (
             <p className="text-xs text-blue-700 font-medium flex items-center gap-1.5 bg-blue-50 px-3 py-1 rounded-full border border-blue-200">
               <span className="w-2 h-2 rounded-full bg-blue-600 animate-pulse" />
-              <span>Match scores computed for Alex Rivera</span>
+              <span>Match scores computed for {studentProfile.fullName || user?.displayName || 'your profile'}</span>
             </p>
           )}
         </div>
@@ -401,6 +471,18 @@ export default function SearchPage() {
               </div>
             ))}
           </div>
+        ) : loadError ? (
+          <div className="bg-white rounded-3xl border border-rose-200 p-10 text-center shadow-2xs max-w-lg mx-auto space-y-4">
+            <div className="w-14 h-14 rounded-2xl bg-rose-50 border border-rose-100 flex items-center justify-center mx-auto text-rose-600">
+              <AlertCircle size={26} />
+            </div>
+            <h3 className="text-lg font-bold text-slate-900 font-display">Unable to Load Faculty Directory</h3>
+            <p className="text-sm text-slate-500">{loadError}</p>
+            <Button onClick={loadProfessors} className="flex items-center gap-1.5 mx-auto">
+              <RefreshCw size={14} />
+              <span>Retry</span>
+            </Button>
+          </div>
         ) : filtered.length === 0 ? (
           <div className="bg-white rounded-3xl border border-slate-200/80 p-12 text-center shadow-2xs max-w-lg mx-auto space-y-4">
             <div className="w-16 h-16 rounded-2xl bg-slate-50 border border-slate-200 flex items-center justify-center mx-auto text-slate-400">
@@ -408,19 +490,23 @@ export default function SearchPage() {
             </div>
             <h3 className="text-lg font-bold text-slate-900 font-display">No matching faculty found</h3>
             <p className="text-sm text-slate-500">
-              No professors matched your exact keywords or selected filters. Try broadening your search or resetting active filters.
+              {professors.length === 0
+                ? 'No professor profiles have been published in the directory yet.'
+                : 'No professors matched your exact keywords or selected filters. Try broadening your search or resetting active filters.'}
             </p>
-            <Button
-              variant="outline"
-              onClick={() => {
-                setQ('')
-                setSearchParams({})
-                setFilters({ researchArea: '', university: '', country: '', degree: '', funding: '', recruiting: false })
-              }}
-              className="mt-2"
-            >
-              Reset Search & Filters
-            </Button>
+            {(q || activeFilterCount > 0) && (
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setQ('')
+                  setSearchParams({})
+                  setFilters({ researchArea: '', university: '', country: '', degree: '', funding: '', recruiting: false })
+                }}
+                className="mt-2"
+              >
+                Reset Search & Filters
+              </Button>
+            )}
           </div>
         ) : (
           <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
@@ -478,17 +564,14 @@ function ProfessorCard({
           )}
         </div>
 
-        {/* Verification & Recruiting Badges */}
+        {/* Recruiting Badge */}
         <div className="flex flex-wrap items-center gap-1.5 mb-3.5">
-          {professor.verificationStatus === 'verified' && (
-            <VerificationBadge status="verified" />
-          )}
           <RecruitingBadge status={professor.recruitingStatus} />
         </div>
 
         {/* Research Area Tags */}
         <div className="flex flex-wrap gap-1.5 mb-5">
-          {professor.researchAreas.slice(0, 3).map((area) => (
+          {(professor.researchAreas || []).slice(0, 3).map((area) => (
             <span
               key={area}
               className="text-xs font-medium px-2.5 py-1 rounded-lg bg-slate-50 border border-slate-200/80 text-slate-700"
@@ -496,9 +579,9 @@ function ProfessorCard({
               {area}
             </span>
           ))}
-          {professor.researchAreas.length > 3 && (
+          {(professor.researchAreas || []).length > 3 && (
             <span className="text-xs font-semibold px-2 py-1 rounded-lg bg-slate-100 text-slate-500">
-              +{professor.researchAreas.length - 3}
+              +{(professor.researchAreas || []).length - 3}
             </span>
           )}
         </div>

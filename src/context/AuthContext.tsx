@@ -9,14 +9,14 @@ import {
 } from 'firebase/auth'
 import { doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore'
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react'
-import { auth, db, isDemoMode } from '@/lib/firebase'
+import { auth, db } from '@/lib/firebase'
 import type { UserRole } from '@/types/user.types'
 
 interface AuthContextValue {
   user: User | null
   role: UserRole | null
   loading: boolean
-  signIn: (email: string, password: string) => Promise<void>
+  signIn: (email: string, password: string) => Promise<UserRole | null>
   signUp: (email: string, password: string, displayName: string, role: UserRole) => Promise<User>
   logout: () => Promise<void>
   refreshUser: () => Promise<void>
@@ -29,11 +29,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [role, setRole] = useState<UserRole | null>(null)
   const [loading, setLoading] = useState(true)
 
+  const isValidRole = (value: unknown): value is UserRole =>
+    value === 'student' || value === 'professor'
+
   const fetchRole = async (uid: string): Promise<UserRole | null> => {
     try {
       const snap = await getDoc(doc(db, 'users', uid))
       if (snap.exists()) {
-        return snap.data().role as UserRole
+        const fetchedRole = snap.data().role
+        return isValidRole(fetchedRole) ? fetchedRole : null
       }
     } catch (e) {
       console.error('Failed to fetch role:', e)
@@ -42,42 +46,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   useEffect(() => {
-    if (isDemoMode) {
-      // In demo mode, load demo student session
-      const isLoggedOut = localStorage.getItem('rm_logged_out') === 'true'
-      const saved = localStorage.getItem('rm_demo_user')
-
-      if (saved && !isLoggedOut) {
-        try {
-          const parsed = JSON.parse(saved)
-          setUser(parsed.user)
-          setRole(parsed.role)
-        } catch {
-          localStorage.removeItem('rm_demo_user')
-          setUser(null)
-          setRole(null)
-        }
-      } else if (!isLoggedOut) {
-        // First-time visit in demo mode defaults to student session for frictionless preview
-        const defaultStudent = {
-          uid: 'demo-student',
-          email: 'alex.rivera@university.edu',
-          displayName: 'Alex Rivera',
-          photoURL: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&q=80&w=200',
-          emailVerified: true,
-        } as unknown as User
-        setUser(defaultStudent)
-        setRole('student')
-        localStorage.setItem('rm_demo_user', JSON.stringify({ user: defaultStudent, role: 'student' }))
-      } else {
-        setUser(null)
-        setRole(null)
-      }
-      setLoading(false)
-      return
-    }
-
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      setLoading(true)
       setUser(firebaseUser)
       if (firebaseUser) {
         const userRole = await fetchRole(firebaseUser.uid)
@@ -90,45 +60,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return unsubscribe
   }, [])
 
-  const signIn = async (email: string, password: string) => {
-    if (isDemoMode) {
-      localStorage.removeItem('rm_logged_out')
-      const lower = email.toLowerCase().trim()
-
-      // Check if user already exists in registered demo system users
-      let matchedSysUser: any = null
-      const systemUsersStr = localStorage.getItem('rm_demo_system_users')
-      if (systemUsersStr) {
-        try {
-          const sysUsers = JSON.parse(systemUsersStr)
-          matchedSysUser = sysUsers.find((u: any) => u.email && u.email.toLowerCase() === lower)
-        } catch {
-          // ignore
-        }
-      }
-
-      const assignedRole: UserRole = matchedSysUser?.role
-        ? matchedSysUser.role
-        : lower.includes('admin')
-        ? 'admin'
-        : (lower.includes('prof') || lower.includes('faculty') || lower.includes('kim'))
-        ? 'professor'
-        : 'student'
-
-      const demoUser = {
-        uid: matchedSysUser?.uid || (assignedRole === 'professor' ? 'demo-1' : assignedRole === 'admin' ? 'demo-admin' : 'demo-student'),
-        email: matchedSysUser?.email || email || (assignedRole === 'professor' ? 'minji.kim@kaist.ac.kr' : assignedRole === 'admin' ? 'admin@scholivo.edu' : 'alex.rivera@university.edu'),
-        displayName: matchedSysUser?.displayName || (assignedRole === 'professor' ? 'Prof. Minji Kim' : assignedRole === 'admin' ? 'System Administrator' : 'Alex Rivera'),
-        photoURL: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&q=80&w=200',
-        emailVerified: true,
-      } as unknown as User
-
-      setUser(demoUser)
-      setRole(assignedRole)
-      localStorage.setItem('rm_demo_user', JSON.stringify({ user: demoUser, role: assignedRole }))
-      return
+  const signIn = async (email: string, password: string): Promise<UserRole | null> => {
+    setLoading(true)
+    try {
+      const credential = await signInWithEmailAndPassword(auth, email, password)
+      const userRole = await fetchRole(credential.user.uid)
+      setUser(credential.user)
+      setRole(userRole)
+      return userRole
+    } finally {
+      setLoading(false)
     }
-    await signInWithEmailAndPassword(auth, email, password)
   }
 
   const signUp = async (
@@ -137,20 +79,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     displayName: string,
     userRole: UserRole
   ): Promise<User> => {
-    if (isDemoMode) {
-      localStorage.removeItem('rm_logged_out')
-      const demoUser = {
-        uid: `demo-${Date.now()}`,
-        email,
-        displayName,
-        photoURL: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&q=80&w=200',
-        emailVerified: true,
-      } as unknown as User
-      setUser(demoUser)
-      setRole(userRole)
-      localStorage.setItem('rm_demo_user', JSON.stringify({ user: demoUser, role: userRole }))
-      return demoUser
-    }
     const credential = await createUserWithEmailAndPassword(auth, email, password)
     const { user: newUser } = credential
 
@@ -173,14 +101,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   const logout = async () => {
-    if (isDemoMode) {
-      localStorage.removeItem('rm_demo_user')
-      localStorage.setItem('rm_logged_out', 'true')
-      setUser(null)
-      setRole(null)
-      return
-    }
     await signOut(auth)
+    setUser(null)
     setRole(null)
   }
 

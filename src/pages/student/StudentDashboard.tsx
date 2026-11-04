@@ -1,26 +1,22 @@
-import { useState, useEffect } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
-import { collection, getDocs, query, where, limit } from 'firebase/firestore'
+import { useState, useEffect, useCallback } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { collection, doc, getDoc, getDocs, query, where, limit } from 'firebase/firestore'
 import { 
-  User, BookOpen, Search, Heart, FileText, Bell, TrendingUp, 
-  ChevronRight, Star, GraduationCap, Award, CheckCircle2, ArrowUpRight,
-  Sparkles, Clock, Compass, ShieldCheck, MapPin
+  User, BookOpen, Search, Heart, FileText, TrendingUp, 
+  Star, GraduationCap, CheckCircle2, ArrowUpRight,
+  Sparkles, MapPin, AlertCircle, RefreshCw
 } from 'lucide-react'
-import { db, isDemoMode } from '@/lib/firebase'
+import { db } from '@/lib/firebase'
 import { useAuth } from '@/context/AuthContext'
-import type { StudentProfile } from '@/types/user.types'
+import type { StudentProfile, ProfessorProfile } from '@/types/user.types'
+import type { Position } from '@/types/position.types'
 import type { Application } from '@/types/application.types'
-import { 
-  DEMO_STUDENT_PROFILE, 
-  DEMO_APPLICATIONS, 
-  DEMO_SAVED_PROFESSORS, 
-  DEMO_PROFESSORS, 
-  type SavedProfessorItem 
-} from '@/lib/demoData'
+import type { ProfessorWithPositions, SavedProfessorItem } from '@/lib/demoData'
 import { Button } from '@/components/common/Button'
 import { Avatar } from '@/components/common/Avatar'
 import { MatchChip } from '@/components/matching/MatchScore'
-import { STATUS_LABELS } from '@/utils/helpers'
+import { STATUS_LABELS, calculateProfileCompleteness } from '@/utils/helpers'
+import { computeMatch } from '@/lib/matching'
 
 const STATUS_BADGE_STYLES: Record<string, string> = {
   submitted: 'bg-blue-50 text-blue-700 border-blue-200',
@@ -31,121 +27,151 @@ const STATUS_BADGE_STYLES: Record<string, string> = {
   rejected: 'bg-rose-50 text-rose-700 border-rose-200',
 }
 
-import { computeMatch } from '@/lib/matching'
-import { calculateProfileCompleteness } from '@/utils/helpers'
+function normalizeStudent(raw: Partial<StudentProfile>, fallbackUid: string): StudentProfile {
+  const normalized: StudentProfile = {
+    uid: raw.uid || fallbackUid,
+    fullName: raw.fullName ?? '',
+    username: raw.username ?? '',
+    email: raw.email ?? '',
+    universityEmail: raw.universityEmail,
+    country: raw.country ?? '',
+    photoURL: raw.photoURL,
+    university: raw.university ?? '',
+    department: raw.department ?? '',
+    major: raw.major ?? '',
+    degree: raw.degree ?? 'Master',
+    currentSemester: raw.currentSemester ?? '',
+    expectedGraduation: raw.expectedGraduation ?? '',
+    gpa: typeof raw.gpa === 'number' ? raw.gpa : 0,
+    gpaScale: typeof raw.gpaScale === 'number' ? raw.gpaScale : 4.0,
+    researchInterests: Array.isArray(raw.researchInterests) ? raw.researchInterests : [],
+    researchAreas: Array.isArray(raw.researchAreas) ? raw.researchAreas : [],
+    researchExperience: Array.isArray(raw.researchExperience) ? raw.researchExperience : [],
+    projects: Array.isArray(raw.projects) ? raw.projects : [],
+    publications: Array.isArray(raw.publications) ? raw.publications : [],
+    programmingLanguages: Array.isArray(raw.programmingLanguages) ? raw.programmingLanguages : [],
+    frameworks: Array.isArray(raw.frameworks) ? raw.frameworks : [],
+    technicalSkills: Array.isArray(raw.technicalSkills) ? raw.technicalSkills : [],
+    researchTools: Array.isArray(raw.researchTools) ? raw.researchTools : [],
+    languageScores: Array.isArray(raw.languageScores) ? raw.languageScores : [],
+    cvUrl: raw.cvUrl ?? '',
+    transcriptUrl: raw.transcriptUrl ?? '',
+    portfolioUrl: raw.portfolioUrl ?? '',
+    bio: raw.bio ?? '',
+    accountStatus: raw.accountStatus ?? 'active',
+    profileCompleteness: 0,
+    createdAt: raw.createdAt ?? '',
+    updatedAt: raw.updatedAt ?? '',
+  }
+  normalized.profileCompleteness = calculateProfileCompleteness(normalized)
+  return normalized
+}
 
 export default function StudentDashboard() {
   const { user } = useAuth()
   const navigate = useNavigate()
-  const [profile, setProfile] = useState<StudentProfile>(() => {
-    const local = localStorage.getItem('rm_demo_student_profile')
-    if (local) {
-      try {
-        const p = JSON.parse(local)
-        return { ...p, profileCompleteness: calculateProfileCompleteness(p) }
-      } catch {
-        // fallback
-      }
-    }
-    return { ...DEMO_STUDENT_PROFILE, profileCompleteness: calculateProfileCompleteness(DEMO_STUDENT_PROFILE) }
-  })
-  const loadSyncedApplications = (): Application[] => {
-    let apps = [...DEMO_APPLICATIONS]
-    const savedAppsStr = localStorage.getItem('rm_demo_applications')
-    if (savedAppsStr) {
-      try {
-        const profApps: Application[] = JSON.parse(savedAppsStr)
-        apps = apps.map((studentApp) => {
-          const match = profApps.find(
-            (pa) =>
-              pa.id === studentApp.id ||
-              (studentApp.id === 'app1' && pa.id === 'app-101') ||
-              pa.positionId === studentApp.positionId
-          )
-          if (match) {
-            return {
-              ...studentApp,
-              status: match.status,
-              statusHistory: match.statusHistory && match.statusHistory.length > 0 ? match.statusHistory : studentApp.statusHistory,
-              updatedAt: match.updatedAt || studentApp.updatedAt,
-            }
-          }
-          return studentApp
-        })
-      } catch {
-        // fallback to default apps
-      }
-    }
-    return apps
-  }
-
-  const [applications, setApplications] = useState<Application[]>(loadSyncedApplications)
-  const [savedProfessors, setSavedProfessors] = useState<SavedProfessorItem[]>(() => {
-    const localSaved = localStorage.getItem('rm_demo_saved_professors')
-    if (localSaved) {
-      try {
-        return JSON.parse(localSaved)
-      } catch {
-        // fallback
-      }
-    }
-    return DEMO_SAVED_PROFESSORS
-  })
+  const [profile, setProfile] = useState<StudentProfile | null>(null)
+  const [applications, setApplications] = useState<Application[]>([])
+  const [recommendedProfessors, setRecommendedProfessors] = useState<ProfessorWithPositions[]>([])
+  const [savedProfessors] = useState<SavedProfessorItem[]>([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
 
-  useEffect(() => {
-    if (isDemoMode) {
-      const local = localStorage.getItem('rm_demo_student_profile')
-      const p = local ? JSON.parse(local) : { ...DEMO_STUDENT_PROFILE }
-      const savedVerifications = localStorage.getItem('rm_demo_verifications')
-      if (savedVerifications) {
-        try {
-          const list = JSON.parse(savedVerifications)
-          const myRecord = list.find((item: any) =>
-            (user && (item.userId === user.uid || (item.applicantEmail && user.email && item.applicantEmail.toLowerCase() === user.email.toLowerCase()))) ||
-            (!user && item.userId === 'demo-student')
-          )
-          if (myRecord) {
-            p.verificationStatus = myRecord.status
-          }
-        } catch {}
-      }
-      setProfile({ ...p, profileCompleteness: calculateProfileCompleteness(p) })
-      setApplications(loadSyncedApplications())
-
-      const localSaved = localStorage.getItem('rm_demo_saved_professors')
-      if (localSaved) {
-        try {
-          setSavedProfessors(JSON.parse(localSaved))
-        } catch {
-          setSavedProfessors(DEMO_SAVED_PROFESSORS)
-        }
-      } else {
-        setSavedProfessors(DEMO_SAVED_PROFESSORS)
-      }
+  const loadDashboardData = useCallback(async () => {
+    if (!user) {
       setLoading(false)
       return
     }
+    setLoading(true)
+    setLoadError('')
 
-    if (user) {
-      getDocs(query(collection(db, 'students'), where('uid', '==', user.uid), limit(1)))
-        .then((snap) => {
-          if (!snap.empty) {
-            const data = snap.docs[0].data() as StudentProfile
-            setProfile({ ...data, profileCompleteness: calculateProfileCompleteness(data) })
-          }
-          setLoading(false)
+    try {
+      // 1. Load Student Profile
+      let loadedProfile: StudentProfile | null = null
+      const directSnap = await getDoc(doc(db, 'students', user.uid))
+      if (directSnap.exists()) {
+        loadedProfile = normalizeStudent(directSnap.data() as Partial<StudentProfile>, user.uid)
+      } else {
+        const fallbackSnap = await getDocs(
+          query(collection(db, 'students'), where('uid', '==', user.uid), limit(1))
+        )
+        if (!fallbackSnap.empty) {
+          loadedProfile = normalizeStudent(fallbackSnap.docs[0].data() as Partial<StudentProfile>, user.uid)
+        }
+      }
+      setProfile(loadedProfile)
+
+      // 2. Load Student Applications
+      const appSnap = await getDocs(
+        query(collection(db, 'applications'), where('studentId', '==', user.uid))
+      )
+      const appList: Application[] = []
+      appSnap.forEach((d) => appList.push({ id: d.id, ...d.data() } as Application))
+      setApplications(appList)
+
+      // 3. Load Recommended Professors from Firestore
+      const profSnap = await getDocs(query(collection(db, 'professors'), limit(8)))
+      const profList: ProfessorWithPositions[] = []
+      for (const d of profSnap.docs) {
+        const rawProf = d.data() as Partial<ProfessorProfile>
+        const profUid = rawProf.uid || d.id
+        const posSnap = await getDocs(
+          query(
+            collection(db, 'positions'),
+            where('professorId', '==', profUid),
+            where('isOpen', '==', true)
+          )
+        )
+        const positions: Position[] = []
+        posSnap.forEach((p) => {
+          const rawPos = p.data() as Partial<Position>
+          positions.push({
+            ...rawPos,
+            id: p.id,
+            researchTopics: Array.isArray(rawPos.researchTopics) ? rawPos.researchTopics : [],
+            requiredSkills: Array.isArray(rawPos.requiredSkills) ? rawPos.requiredSkills : [],
+            preferredSkills: Array.isArray(rawPos.preferredSkills) ? rawPos.preferredSkills : [],
+            languageRequirements: Array.isArray(rawPos.languageRequirements) ? rawPos.languageRequirements : [],
+            researchArea: rawPos.researchArea ?? '',
+          } as Position)
         })
-        .catch(() => setLoading(false))
-    } else {
+
+        const matchScore =
+          loadedProfile && positions.length > 0
+            ? Math.max(...positions.map((pos) => computeMatch(loadedProfile!, pos).score))
+            : undefined
+
+        profList.push({
+          ...(rawProf as ProfessorProfile),
+          uid: profUid,
+          fullName: rawProf.fullName ?? 'Professor',
+          username: rawProf.username ?? profUid,
+          university: rawProf.university ?? '',
+          researchAreas: Array.isArray(rawProf.researchAreas) ? rawProf.researchAreas : [],
+          researchInterests: Array.isArray(rawProf.researchInterests) ? rawProf.researchInterests : [],
+          positions,
+          matchScore,
+        })
+      }
+
+      profList.sort((a, b) => (b.matchScore ?? 0) - (a.matchScore ?? 0))
+      setRecommendedProfessors(profList.slice(0, 4))
+    } catch (err) {
+      console.error('Error loading student dashboard:', err)
+      setLoadError('Failed to load dashboard data from Firebase. Please check your connection and try again.')
+    } finally {
       setLoading(false)
     }
   }, [user])
 
-  const completeness = profile?.profileCompleteness ?? 92
+  useEffect(() => {
+    loadDashboardData()
+  }, [loadDashboardData])
+
+  const completeness = profile?.profileCompleteness ?? 0
 
   const completenessItems = [
-    { label: 'Basic & Contact Information', done: true },
+    { label: 'Basic & Contact Information', done: !!profile?.fullName && !!profile?.email },
     { label: 'Academic Background & GPA', done: !!profile?.university },
     { label: 'Research Interests & Topics', done: (profile?.researchInterests?.length ?? 0) > 0 },
     { label: 'Technical Skills & Frameworks', done: (profile?.programmingLanguages?.length ?? 0) > 0 },
@@ -154,11 +180,36 @@ export default function StudentDashboard() {
   ]
 
   const shortlistedCount = applications.filter((a) => a.status === 'shortlisted').length
+  const firstName = (profile?.fullName || user?.displayName || 'Student').split(' ')[0]
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-50/70 flex items-center justify-center px-4">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-10 h-10 rounded-2xl bg-blue-600/20 border border-blue-600 animate-pulse" />
+          <p className="text-xs font-medium text-slate-500">Loading your dashboard…</p>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="min-h-screen bg-slate-50/70 pt-8 pb-20 px-4 sm:px-6 lg:px-8">
       <div className="max-w-7xl mx-auto space-y-8">
         
+        {loadError && (
+          <div className="rounded-2xl bg-rose-50 border border-rose-200 px-5 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 text-xs font-semibold text-rose-700">
+              <AlertCircle size={16} className="text-rose-600 shrink-0" />
+              <span>{loadError}</span>
+            </div>
+            <Button size="sm" variant="outline" onClick={loadDashboardData} className="flex items-center gap-1.5 self-start sm:self-auto">
+              <RefreshCw size={13} />
+              <span>Retry</span>
+            </Button>
+          </div>
+        )}
+
         {/* Top Header Banner */}
         <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-2xs flex flex-col md:flex-row md:items-center justify-between gap-6">
           <div className="space-y-1.5">
@@ -167,21 +218,9 @@ export default function StudentDashboard() {
                 <Sparkles size={13} className="text-blue-600" />
                 <span>Student Research Portal</span>
               </div>
-              <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold border ${
-                (profile?.verificationStatus || 'verified') === 'verified'
-                  ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                  : (profile?.verificationStatus || 'verified') === 'more_info_required'
-                  ? 'bg-purple-50 text-purple-700 border-purple-200'
-                  : (profile?.verificationStatus || 'verified') === 'rejected'
-                  ? 'bg-rose-50 text-rose-700 border-rose-200'
-                  : 'bg-amber-50 text-amber-700 border-amber-200'
-              }`}>
-                <ShieldCheck size={13} className={(profile?.verificationStatus || 'verified') === 'verified' ? 'text-emerald-600' : 'text-amber-600'} />
-                <span>Affiliation: {profile?.verificationStatus ? (profile.verificationStatus === 'verified' ? 'Verified Student' : profile.verificationStatus.replace('_', ' ')) : 'Verified Student'}</span>
-              </span>
             </div>
             <h1 className="font-display text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight">
-              Welcome back, {user?.displayName ? user.displayName.split(' ')[0] : 'Alex'} 👋
+              Welcome back, {firstName} 👋
             </h1>
             <p className="text-slate-500 text-sm max-w-xl">
               Track your faculty applications, explore AI-matched research opportunities, and manage your academic profile.
@@ -260,14 +299,6 @@ export default function StudentDashboard() {
                     <p className="text-xs text-slate-500">Recent submissions and review progress</p>
                   </div>
                 </div>
-
-                <Link
-                  to="/applications"
-                  className="text-xs font-semibold text-blue-600 hover:text-blue-700 transition-colors flex items-center gap-1 group"
-                >
-                  <span>View All</span>
-                  <ChevronRight size={14} className="group-hover:translate-x-0.5 transition-transform" />
-                </Link>
               </div>
 
               <div className="space-y-3.5">
@@ -298,7 +329,7 @@ export default function StudentDashboard() {
                     </div>
 
                     <div className="flex items-center gap-2.5 shrink-0 self-end sm:self-center">
-                      <MatchChip score={app.matchScore} />
+                      {typeof app.matchScore === 'number' && <MatchChip score={app.matchScore} />}
                       <span className={`text-xs px-2.5 py-1 rounded-full font-semibold border ${STATUS_BADGE_STYLES[app.status] || 'bg-slate-100 text-slate-700'}`}>
                         {STATUS_LABELS[app.status] || app.status}
                       </span>
@@ -310,7 +341,7 @@ export default function StudentDashboard() {
                   <div className="text-center py-10 px-4 bg-slate-50 rounded-2xl border border-dashed border-slate-200">
                     <FileText size={36} className="mx-auto text-slate-400 mb-2 opacity-60" />
                     <p className="text-sm font-semibold text-slate-800">No applications submitted yet</p>
-                    <p className="text-xs text-slate-500 mt-1">Explore verified positions matching your research background</p>
+                    <p className="text-xs text-slate-500 mt-1">Explore positions matching your research background</p>
                     <Button variant="secondary" size="sm" className="mt-4" onClick={() => navigate('/search')}>
                       Browse Faculty Openings
                     </Button>
@@ -328,7 +359,7 @@ export default function StudentDashboard() {
                   </div>
                   <div>
                     <h2 className="font-display text-lg font-bold text-slate-900">Recommended Professors</h2>
-                    <p className="text-xs text-slate-500">Highest compatibility with your academic focus</p>
+                    <p className="text-xs text-slate-500">Faculty profiles from the Scholivo research directory</p>
                   </div>
                 </div>
 
@@ -343,12 +374,15 @@ export default function StudentDashboard() {
                 </Button>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                {DEMO_PROFESSORS.slice(0, 4).map((prof) => {
-                  const score = prof.positions?.length && profile
-                    ? Math.max(...prof.positions.map((pos) => computeMatch(profile, pos).score))
-                    : 75
-                  return (
+              {recommendedProfessors.length === 0 ? (
+                <div className="text-center py-10 px-4 bg-slate-50 rounded-2xl border border-dashed border-slate-200">
+                  <Search size={32} className="mx-auto text-slate-400 mb-2 opacity-60" />
+                  <p className="text-sm font-semibold text-slate-800">No professor profiles found yet</p>
+                  <p className="text-xs text-slate-500 mt-1">Once professors publish their profiles and openings, they will appear here.</p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  {recommendedProfessors.map((prof) => (
                     <div
                       key={prof.uid}
                       onClick={() => navigate(`/professor/${prof.username}`)}
@@ -357,7 +391,7 @@ export default function StudentDashboard() {
                     >
                       <div>
                         <div className="flex items-start justify-between gap-3 mb-3">
-                          <div className="flex items-center gap-3">
+                          <div className="flex items-center gap-3 min-w-0">
                             <Avatar src={prof.photoURL} name={prof.fullName} size="md" />
                             <div className="min-w-0">
                               <h3 className="text-sm font-bold text-slate-900 truncate group-hover:text-blue-600 transition-colors">
@@ -365,15 +399,15 @@ export default function StudentDashboard() {
                               </h3>
                               <p className="text-xs text-slate-500 truncate flex items-center gap-1 mt-0.5">
                                 <MapPin size={11} className="text-slate-400 shrink-0" />
-                                {prof.university}
+                                {prof.university || 'University not listed'}
                               </p>
                             </div>
                           </div>
-                          <MatchChip score={score} />
+                          {typeof prof.matchScore === 'number' && <MatchChip score={prof.matchScore} />}
                         </div>
 
                         <div className="flex flex-wrap gap-1.5 my-3">
-                          {prof.researchAreas.slice(0, 2).map((area) => (
+                          {(prof.researchAreas || []).slice(0, 2).map((area) => (
                             <span
                               key={area}
                               className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-white border border-slate-200/80 text-slate-600"
@@ -389,9 +423,9 @@ export default function StudentDashboard() {
                         <ArrowUpRight size={14} className="group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
                       </div>
                     </div>
-                  )
-                })}
-              </div>
+                  ))}
+                </div>
+              )}
             </div>
 
           </div>
@@ -401,84 +435,110 @@ export default function StudentDashboard() {
             
             {/* Student Profile Card */}
             <div className="bg-white rounded-3xl border border-slate-200/80 shadow-2xs p-6">
-              <div className="flex items-center gap-3.5 mb-5 pb-5 border-b border-slate-100">
-                <Avatar src={profile.photoURL} name={profile.fullName} size="lg" />
-                <div className="min-w-0">
-                  <h3 className="font-bold text-slate-900 text-base truncate">{profile.fullName}</h3>
-                  <p className="text-xs text-slate-500 truncate">{profile.degree} in {profile.major}</p>
-                  <p className="text-xs font-semibold text-blue-600 mt-0.5">{profile.university}</p>
-                </div>
-              </div>
-
-              {/* Completeness Bar */}
-              <div className="mb-4">
-                <div className="flex items-center justify-between text-xs mb-1.5">
-                  <span className="font-medium text-slate-600">Profile Completeness</span>
-                  <span className="font-bold text-blue-700">{completeness}%</span>
-                </div>
-                <div className="h-2 rounded-full bg-slate-100 overflow-hidden">
-                  <div
-                    className="h-full rounded-full bg-blue-600 transition-all duration-500"
-                    style={{ width: `${completeness}%` }}
-                  />
-                </div>
-              </div>
-
-              {/* Checklist */}
-              <div className="space-y-2 mb-6">
-                {completenessItems.map(({ label, done }) => (
-                  <div key={label} className="flex items-center gap-2 text-xs">
-                    <CheckCircle2
-                      size={14}
-                      className={done ? 'text-emerald-500 fill-emerald-50 shrink-0' : 'text-slate-300 shrink-0'}
-                    />
-                    <span className={done ? 'text-slate-700 font-medium' : 'text-slate-400'}>{label}</span>
+              {profile ? (
+                <>
+                  <div className="flex items-center gap-3.5 mb-5 pb-5 border-b border-slate-100">
+                    <Avatar src={profile.photoURL} name={profile.fullName || user?.displayName || 'Student'} size="lg" />
+                    <div className="min-w-0">
+                      <h3 className="font-bold text-slate-900 text-base truncate">{profile.fullName || user?.displayName}</h3>
+                      <p className="text-xs text-slate-500 truncate">
+                        {profile.degree}{profile.major ? ` in ${profile.major}` : ''}
+                      </p>
+                      <p className="text-xs font-semibold text-blue-600 mt-0.5">{profile.university || 'University not set'}</p>
+                    </div>
                   </div>
-                ))}
-              </div>
 
-              <Button
-                variant="outline"
-                fullWidth
-                size="sm"
-                onClick={() => navigate('/profile/student')}
-                className="flex items-center justify-center gap-2"
-                id="edit-profile-btn"
-              >
-                <User size={14} />
-                <span>Edit Academic Profile</span>
-              </Button>
+                  {/* Completeness Bar */}
+                  <div className="mb-4">
+                    <div className="flex items-center justify-between text-xs mb-1.5">
+                      <span className="font-medium text-slate-600">Profile Completeness</span>
+                      <span className="font-bold text-blue-700">{completeness}%</span>
+                    </div>
+                    <div className="h-2 rounded-full bg-slate-100 overflow-hidden">
+                      <div
+                        className="h-full rounded-full bg-blue-600 transition-all duration-500"
+                        style={{ width: `${completeness}%` }}
+                      />
+                    </div>
+                  </div>
+
+                  {/* Checklist */}
+                  <div className="space-y-2 mb-6">
+                    {completenessItems.map(({ label, done }) => (
+                      <div key={label} className="flex items-center gap-2 text-xs">
+                        <CheckCircle2
+                          size={14}
+                          className={done ? 'text-emerald-500 fill-emerald-50 shrink-0' : 'text-slate-300 shrink-0'}
+                        />
+                        <span className={done ? 'text-slate-700 font-medium' : 'text-slate-400'}>{label}</span>
+                      </div>
+                    ))}
+                  </div>
+
+                  <Button
+                    variant="outline"
+                    fullWidth
+                    size="sm"
+                    onClick={() => navigate('/profile/student')}
+                    className="flex items-center justify-center gap-2"
+                    id="edit-profile-btn"
+                  >
+                    <User size={14} />
+                    <span>Edit Academic Profile</span>
+                  </Button>
+                </>
+              ) : (
+                <div className="text-center py-6 space-y-3">
+                  <div className="w-12 h-12 rounded-2xl bg-blue-50 text-blue-600 flex items-center justify-center mx-auto">
+                    <User size={22} />
+                  </div>
+                  <h3 className="font-bold text-slate-900 text-sm">Academic Profile Not Found</h3>
+                  <p className="text-xs text-slate-500">
+                    No student profile record was found for your account in Firestore.
+                  </p>
+                </div>
+              )}
             </div>
 
             {/* Research Focus & Keywords */}
-            <div className="bg-white rounded-3xl border border-slate-200/80 shadow-2xs p-6">
-              <h3 className="font-display text-sm font-bold text-slate-900 mb-3 flex items-center gap-2">
-                <BookOpen size={16} className="text-blue-600" />
-                <span>My Research Focus</span>
-              </h3>
-              <div className="flex flex-wrap gap-1.5 mb-4">
-                {profile.researchInterests.map((interest) => (
-                  <span
-                    key={interest}
-                    className="px-2.5 py-1 rounded-lg bg-blue-50/70 border border-blue-200/70 text-blue-800 text-xs font-medium"
-                  >
-                    {interest}
-                  </span>
-                ))}
-              </div>
+            {profile && (
+              <div className="bg-white rounded-3xl border border-slate-200/80 shadow-2xs p-6">
+                <h3 className="font-display text-sm font-bold text-slate-900 mb-3 flex items-center gap-2">
+                  <BookOpen size={16} className="text-blue-600" />
+                  <span>My Research Focus</span>
+                </h3>
+                {profile.researchInterests.length > 0 ? (
+                  <div className="flex flex-wrap gap-1.5 mb-4">
+                    {profile.researchInterests.map((interest) => (
+                      <span
+                        key={interest}
+                        className="px-2.5 py-1 rounded-lg bg-blue-50/70 border border-blue-200/70 text-blue-800 text-xs font-medium"
+                      >
+                        {interest}
+                      </span>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-xs text-slate-400 italic mb-4">No research interests added yet.</p>
+                )}
 
-              <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Technical Skills</h4>
-              <div className="flex flex-wrap gap-1.5">
-                {profile.programmingLanguages.concat(profile.frameworks.slice(0, 3)).map((skill) => (
-                  <span
-                    key={skill}
-                    className="px-2 py-0.5 rounded-md bg-slate-100 text-slate-700 text-xs font-medium"
-                  >
-                    {skill}
-                  </span>
-                ))}
+                <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Technical Skills</h4>
+                {profile.programmingLanguages.length > 0 || profile.frameworks.length > 0 ? (
+                  <div className="flex flex-wrap gap-1.5">
+                    {profile.programmingLanguages.concat(profile.frameworks.slice(0, 3)).map((skill) => (
+                      <span
+                        key={skill}
+                        className="px-2 py-0.5 rounded-md bg-slate-100 text-slate-700 text-xs font-medium"
+                      >
+                        {skill}
+                      </span>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-xs text-slate-400 italic">No technical skills added yet.</p>
+                )}
               </div>
-            </div>
+            )}
 
             {/* Saved Faculty Quick Peek */}
             <div className="bg-white rounded-3xl border border-slate-200/80 shadow-2xs p-6">
@@ -492,25 +552,29 @@ export default function StudentDashboard() {
                 </span>
               </div>
 
-              <div className="space-y-3">
-                {savedProfessors.slice(0, 3).map((p) => (
-                  <div
-                    key={p.uid}
-                    onClick={() => navigate(`/professor/${p.username}`)}
-                    className="p-2.5 rounded-xl hover:bg-slate-50 border border-transparent hover:border-slate-200 transition-colors cursor-pointer flex items-center gap-3"
-                    id={`saved-prof-${p.uid}`}
-                  >
-                    <Avatar src={p.photoURL} name={p.fullName} size="sm" />
-                    <div className="min-w-0 flex-1">
-                      <p className="text-xs font-bold text-slate-900 truncate">{p.fullName}</p>
-                      <p className="text-[11px] text-slate-500 truncate">{p.university}</p>
+              {savedProfessors.length === 0 ? (
+                <p className="text-xs text-slate-400 italic py-2">No saved professors yet.</p>
+              ) : (
+                <div className="space-y-3">
+                  {savedProfessors.slice(0, 3).map((p) => (
+                    <div
+                      key={p.uid}
+                      onClick={() => navigate(`/professor/${p.username}`)}
+                      className="p-2.5 rounded-xl hover:bg-slate-50 border border-transparent hover:border-slate-200 transition-colors cursor-pointer flex items-center gap-3"
+                      id={`saved-prof-${p.uid}`}
+                    >
+                      <Avatar src={p.photoURL} name={p.fullName} size="sm" />
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs font-bold text-slate-900 truncate">{p.fullName}</p>
+                        <p className="text-[11px] text-slate-500 truncate">{p.university}</p>
+                      </div>
+                      <span className="text-xs font-bold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200">
+                        {p.matchScore}%
+                      </span>
                     </div>
-                    <span className="text-xs font-bold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200">
-                      {p.matchScore}%
-                    </span>
-                  </div>
-                ))}
-              </div>
+                  ))}
+                </div>
+              )}
 
               <Button
                 variant="ghost"

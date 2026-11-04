@@ -1,12 +1,12 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { doc, getDoc } from 'firebase/firestore'
+import { collection, doc, getDoc, getDocs, limit, query, updateDoc, where } from 'firebase/firestore'
 import {
   ArrowLeft, CheckCircle2, Clock, FileText, ExternalLink,
-  MessageSquare, Sparkles, Building, User, Calendar, GraduationCap,
-  Award, Globe, Check, AlertCircle, X, ChevronRight, FileCheck, ShieldAlert
+  MessageSquare, Sparkles, Building, Calendar, GraduationCap,
+  Award, Globe, Check, AlertCircle, X, FileCheck, ShieldAlert
 } from 'lucide-react'
-import { db, isDemoMode } from '@/lib/firebase'
+import { db } from '@/lib/firebase'
 import { useAuth } from '@/context/AuthContext'
 import type { Application, ApplicationStatus } from '@/types/application.types'
 import type { StudentProfile } from '@/types/user.types'
@@ -14,7 +14,6 @@ import { Button } from '@/components/common/Button'
 import { Avatar } from '@/components/common/Avatar'
 import { MatchScoreBadge, MatchBreakdownPanel } from '@/components/matching/MatchScore'
 import { STATUS_LABELS, formatDate } from '@/utils/helpers'
-import { DEMO_PROFESSOR_APPLICATIONS, DEMO_APPLICANT_PROFILES, DEMO_APPLICATIONS } from '@/lib/demoData'
 
 const ALL_STATUSES: ApplicationStatus[] = [
   'submitted',
@@ -40,185 +39,213 @@ export default function ApplicationDetail() {
 
   const [app, setApp] = useState<Application | null>(null)
   const [candidateProfile, setCandidateProfile] = useState<Partial<StudentProfile> | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [accessDenied, setAccessDenied] = useState(false)
+  const [notFound, setNotFound] = useState(false)
+  const [loadError, setLoadError] = useState(false)
+  const [actionError, setActionError] = useState<string | null>(null)
   const [isUpdating, setIsUpdating] = useState(false)
   const [statusNote, setStatusNote] = useState('')
   const [selectedNewStatus, setSelectedNewStatus] = useState<ApplicationStatus | null>(null)
   const [showNoteModal, setShowNoteModal] = useState(false)
   const [successToast, setSuccessToast] = useState<string | null>(null)
 
-  // Faculty verification status
-  const [profVerificationStatus, setProfVerificationStatus] = useState<string>(() => {
+  const isAuthorizedForApplication = (targetApp: Application | null): boolean => {
+    if (!targetApp || !user?.uid || !role) return false
     if (role === 'professor') {
-      const savedVerifications = localStorage.getItem('rm_demo_verifications')
-      if (savedVerifications) {
-        try {
-          const list = JSON.parse(savedVerifications)
-          const myRecord = list.find((item: any) =>
-            (user && (item.userId === user.uid || (item.applicantEmail && user.email && item.applicantEmail.toLowerCase() === user.email.toLowerCase()))) ||
-            (!user && item.userId === 'demo-1')
-          )
-          if (myRecord) return myRecord.status
-        } catch {}
-      }
-      const savedProf = localStorage.getItem('rm_demo_professor_profile')
-      if (savedProf) {
-        try {
-          const p = JSON.parse(savedProf)
-          if (p.verificationStatus) return p.verificationStatus
-        } catch {}
-      }
+      return Boolean(targetApp.professorId && targetApp.professorId === user.uid)
     }
-    return 'verified'
-  })
+    if (role === 'student') {
+      return Boolean(targetApp.studentId && targetApp.studentId === user.uid)
+    }
+    return false
+  }
 
-  // 1. Load Application
+  // 1. Load Application and Applicant Profile from Firestore
   useEffect(() => {
-    if (!applicationId) return
+    let isCancelled = false
 
-    // Priority A: Check localStorage
-    const savedApps = localStorage.getItem('rm_demo_applications')
-    if (savedApps) {
-      try {
-        const parsed: Application[] = JSON.parse(savedApps)
-        const found = parsed.find(
-          (a) =>
-            a.id === applicationId ||
-            (applicationId === 'app1' && a.id === 'app-101') ||
-            (applicationId === 'app-101' && a.id === 'app1')
-        )
-        if (found) {
-          setApp(found)
-          resolveCandidateProfile(found.studentId)
-          return
-        }
-      } catch (e) {
-        console.warn('Error reading rm_demo_applications', e)
+    setLoading(true)
+    setAccessDenied(false)
+    setNotFound(false)
+    setLoadError(false)
+    setActionError(null)
+    setApp(null)
+    setCandidateProfile(null)
+
+    if (!applicationId) {
+      setNotFound(true)
+      setLoading(false)
+      return () => {
+        isCancelled = true
       }
     }
 
-    // Priority B: Check static demo applications
-    const demoFound =
-      DEMO_PROFESSOR_APPLICATIONS.find(
-        (a) => a.id === applicationId || (applicationId === 'app1' && a.id === 'app-101')
-      ) || DEMO_APPLICATIONS.find((a) => a.id === applicationId)
-    if (demoFound) {
-      setApp(demoFound)
-      resolveCandidateProfile(demoFound.studentId)
-      return
+    if (!user?.uid || (role !== 'student' && role !== 'professor')) {
+      setAccessDenied(true)
+      setLoading(false)
+      return () => {
+        isCancelled = true
+      }
     }
 
-    // Priority C: Firebase Firestore fallback
     async function fetchFromFirebase() {
       try {
         const snap = await getDoc(doc(db, 'applications', applicationId!))
-        if (snap.exists()) {
-          const data = { id: snap.id, ...snap.data() } as Application
-          setApp(data)
-          resolveCandidateProfile(data.studentId)
-        } else {
-          // Default fallback to first demo application
-          setApp(DEMO_PROFESSOR_APPLICATIONS[0])
-          resolveCandidateProfile(DEMO_PROFESSOR_APPLICATIONS[0].studentId)
+        if (isCancelled) return
+        if (!snap.exists()) {
+          setApp(null)
+          setCandidateProfile(null)
+          setNotFound(true)
+          setLoading(false)
+          return
+        }
+
+        const data = { id: snap.id, ...snap.data() } as Application
+        if (!isAuthorizedForApplication(data)) {
+          setApp(null)
+          setCandidateProfile(null)
+          setAccessDenied(true)
+          setLoading(false)
+          return
+        }
+
+        setApp(data)
+
+        if (data.studentId) {
+          try {
+            const directStudentSnap = await getDoc(doc(db, 'students', data.studentId))
+            if (!isCancelled) {
+              if (directStudentSnap.exists()) {
+                setCandidateProfile(directStudentSnap.data() as StudentProfile)
+              } else {
+                const studentQ = query(
+                  collection(db, 'students'),
+                  where('uid', '==', data.studentId),
+                  limit(1)
+                )
+                const studentSnap = await getDocs(studentQ)
+                if (!isCancelled) {
+                  if (!studentSnap.empty) {
+                    setCandidateProfile(studentSnap.docs[0].data() as StudentProfile)
+                  } else {
+                    setCandidateProfile(null)
+                  }
+                }
+              }
+            }
+          } catch {
+            if (!isCancelled) {
+              setCandidateProfile(null)
+            }
+          }
+        }
+
+        if (!isCancelled) {
+          setLoading(false)
         }
       } catch {
-        setApp(DEMO_PROFESSOR_APPLICATIONS[0])
-        resolveCandidateProfile(DEMO_PROFESSOR_APPLICATIONS[0].studentId)
+        if (isCancelled) return
+        setApp(null)
+        setCandidateProfile(null)
+        setLoadError(true)
+        setLoading(false)
       }
     }
 
     fetchFromFirebase()
-  }, [applicationId])
 
-  const resolveCandidateProfile = (studentId?: string) => {
-    if (!studentId) return
-
-    // Check localStorage student profile if same user
-    const localStudent = localStorage.getItem('rm_demo_student_profile')
-    if (localStudent && (studentId === 'demo-student' || studentId === 'student-1')) {
-      try {
-        setCandidateProfile(JSON.parse(localStudent))
-        return
-      } catch (e) {
-        // pass
-      }
+    return () => {
+      isCancelled = true
     }
-
-    if (DEMO_APPLICANT_PROFILES[studentId]) {
-      setCandidateProfile(DEMO_APPLICANT_PROFILES[studentId])
-    }
-  }
+  }, [applicationId, user?.uid, role])
 
   // 2. Status Update Handler
   const handleInitiateStatusChange = (newStatus: ApplicationStatus) => {
+    if (!user?.uid || role !== 'professor' || !app || app.professorId !== user.uid) return
+    setActionError(null)
     setSelectedNewStatus(newStatus)
     setStatusNote('')
     setShowNoteModal(true)
   }
 
-  const handleConfirmStatusChange = () => {
+  const handleConfirmStatusChange = async () => {
     if (!app || !selectedNewStatus) return
+    if (!user?.uid || role !== 'professor' || app.professorId !== user.uid) return
 
     setIsUpdating(true)
+    setActionError(null)
+
+    const nowIso = new Date().toISOString()
     const newNote = statusNote.trim() || `Status updated to ${STATUS_LABELS[selectedNewStatus]}`
     const updatedHistory = [
       ...app.statusHistory,
       {
         status: selectedNewStatus,
-        changedAt: new Date().toISOString(),
+        changedAt: nowIso,
         note: newNote,
       },
     ]
 
-    const updatedApp: Application = {
-      ...app,
-      status: selectedNewStatus,
-      statusHistory: updatedHistory,
-      updatedAt: new Date().toISOString(),
+    try {
+      await updateDoc(doc(db, 'applications', app.id), {
+        status: selectedNewStatus,
+        statusHistory: updatedHistory,
+        updatedAt: nowIso,
+      })
+
+      const updatedApp: Application = {
+        ...app,
+        status: selectedNewStatus,
+        statusHistory: updatedHistory,
+        updatedAt: nowIso,
+      }
+
+      setApp(updatedApp)
+      setShowNoteModal(false)
+      setSuccessToast(`Application marked as "${STATUS_LABELS[selectedNewStatus]}"`)
+      setTimeout(() => setSuccessToast(null), 3500)
+    } catch {
+      setActionError('Failed to update application status in Firestore. Please try again.')
+    } finally {
+      setIsUpdating(false)
     }
-
-    setApp(updatedApp)
-
-    // Save to localStorage
-    const savedAppsStr = localStorage.getItem('rm_demo_applications')
-    let allApps: Application[] = savedAppsStr ? JSON.parse(savedAppsStr) : [...DEMO_PROFESSOR_APPLICATIONS]
-    allApps = allApps.map(a => a.id === updatedApp.id ? updatedApp : a)
-    localStorage.setItem('rm_demo_applications', JSON.stringify(allApps))
-
-    setShowNoteModal(false)
-    setIsUpdating(false)
-    setSuccessToast(`Application marked as "${STATUS_LABELS[selectedNewStatus]}"`)
-    setTimeout(() => setSuccessToast(null), 3500)
   }
 
   const isProf = role === 'professor'
+  const canManageStatus = Boolean(isProf && user?.uid && app && app.professorId === user.uid)
+  const dashboardPath = isProf ? '/dashboard/professor' : '/dashboard/student'
 
-  // Restrict access for unverified faculty
-  if (isProf && profVerificationStatus !== 'verified') {
+  if (loading) {
+    return (
+      <div className="min-h-screen pt-28 pb-20 px-4 text-center">
+        <div className="animate-spin w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full mx-auto mb-4" />
+        <p className="text-sm text-slate-500">Loading candidate application dossier...</p>
+      </div>
+    )
+  }
+
+  if (accessDenied || (app && !isAuthorizedForApplication(app))) {
     return (
       <div className="min-h-screen bg-slate-50/70 pt-24 pb-20 px-4 sm:px-6">
         <div className="max-w-xl mx-auto bg-white rounded-3xl border border-slate-200/80 p-8 sm:p-10 text-center shadow-xs space-y-5">
-          <div className="w-16 h-16 rounded-2xl bg-amber-50 border border-amber-200 flex items-center justify-center mx-auto text-amber-600">
+          <div className="w-16 h-16 rounded-2xl bg-rose-50 border border-rose-200 flex items-center justify-center mx-auto text-rose-600">
             <ShieldAlert size={32} />
           </div>
           <div>
-            <span className="inline-block px-3 py-1 rounded-full text-xs font-semibold bg-amber-100/80 text-amber-800 border border-amber-200 uppercase tracking-wider mb-2">
-              Verification Required
+            <span className="inline-block px-3 py-1 rounded-full text-xs font-semibold bg-rose-100/80 text-rose-800 border border-rose-200 uppercase tracking-wider mb-2">
+              Access Restricted
             </span>
             <h2 className="text-xl sm:text-2xl font-bold font-display text-slate-900 tracking-tight">
-              Application Dossier Review Restricted
+              Unauthorized Application Access
             </h2>
           </div>
           <p className="text-slate-600 text-xs sm:text-sm leading-relaxed max-w-md mx-auto">
-            Your faculty institutional affiliation is currently{' '}
-            <strong className="text-amber-800 capitalize font-semibold">{profVerificationStatus.replace('_', ' ')}</strong>.
-            To protect applicant privacy and academic confidentiality, only verified faculty may inspect candidate dossiers, transcripts, and statement letters.
+            You do not have permission to view this application dossier. Professors may only access applications submitted to their own positions, and students may only access their own applications.
           </p>
           <div className="pt-3 flex flex-col sm:flex-row items-center justify-center gap-3">
-            <Button variant="secondary" onClick={() => navigate('/dashboard/professor')} className="text-xs">
-              Return to Professor Dashboard
-            </Button>
-            <Button variant="primary" onClick={() => navigate('/profile/professor/edit')} className="text-xs bg-blue-600 text-white">
-              Edit Lab Profile
+            <Button variant="secondary" onClick={() => navigate(dashboardPath)} className="text-xs">
+              Return to Dashboard
             </Button>
           </div>
         </div>
@@ -226,11 +253,52 @@ export default function ApplicationDetail() {
     )
   }
 
-  if (!app) {
+  if (loadError) {
     return (
-      <div className="min-h-screen pt-28 pb-20 px-4 text-center">
-        <div className="animate-spin w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full mx-auto mb-4" />
-        <p className="text-sm text-slate-500">Loading candidate application dossier...</p>
+      <div className="min-h-screen bg-slate-50/70 pt-24 pb-20 px-4 sm:px-6">
+        <div className="max-w-xl mx-auto bg-white rounded-3xl border border-slate-200/80 p-8 sm:p-10 text-center shadow-xs space-y-5">
+          <div className="w-16 h-16 rounded-2xl bg-amber-50 border border-amber-200 flex items-center justify-center mx-auto text-amber-600">
+            <AlertCircle size={32} />
+          </div>
+          <div>
+            <h2 className="text-xl sm:text-2xl font-bold font-display text-slate-900 tracking-tight">
+              Unable to Load Application
+            </h2>
+            <p className="text-slate-600 text-xs sm:text-sm leading-relaxed max-w-md mx-auto mt-2">
+              We encountered an error while loading this application. Please check your connection or try again later.
+            </p>
+          </div>
+          <div className="pt-3 flex justify-center">
+            <Button variant="secondary" onClick={() => navigate(dashboardPath)} className="text-xs">
+              Return to Dashboard
+            </Button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  if (notFound || !app) {
+    return (
+      <div className="min-h-screen bg-slate-50/70 pt-24 pb-20 px-4 sm:px-6">
+        <div className="max-w-xl mx-auto bg-white rounded-3xl border border-slate-200/80 p-8 sm:p-10 text-center shadow-xs space-y-5">
+          <div className="w-16 h-16 rounded-2xl bg-slate-100 border border-slate-200 flex items-center justify-center mx-auto text-slate-500">
+            <AlertCircle size={32} />
+          </div>
+          <div>
+            <h2 className="text-xl sm:text-2xl font-bold font-display text-slate-900 tracking-tight">
+              Application Not Found
+            </h2>
+            <p className="text-slate-600 text-xs sm:text-sm leading-relaxed max-w-md mx-auto mt-2">
+              The requested application could not be found or is no longer available.
+            </p>
+          </div>
+          <div className="pt-3 flex justify-center">
+            <Button variant="secondary" onClick={() => navigate(dashboardPath)} className="text-xs">
+              Return to Dashboard
+            </Button>
+          </div>
+        </div>
       </div>
     )
   }
@@ -242,7 +310,7 @@ export default function ApplicationDetail() {
         {/* Back button & Toast */}
         <div className="flex items-center justify-between">
           <button
-            onClick={() => navigate(isProf ? '/dashboard/professor' : '/dashboard/student')}
+            onClick={() => navigate(dashboardPath)}
             className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-slate-900 transition-colors py-1 px-2.5 rounded-lg hover:bg-slate-200/60"
           >
             <ArrowLeft size={14} />
@@ -256,6 +324,13 @@ export default function ApplicationDetail() {
             </div>
           )}
         </div>
+
+        {actionError && (
+          <div className="p-4 rounded-xl bg-rose-50 border border-rose-200 flex items-center gap-2.5 text-xs text-rose-700">
+            <AlertCircle size={16} className="shrink-0" />
+            <span>{actionError}</span>
+          </div>
+        )}
 
         {/* Header Hero Card */}
         <div className="bg-white rounded-2xl border border-slate-200/80 p-6 sm:p-8 shadow-xs">
@@ -358,7 +433,7 @@ export default function ApplicationDetail() {
           </div>
 
           {/* Professor Quick Status Management Bar */}
-          {isProf && (
+          {canManageStatus && (
             <div className="mt-6 p-4 rounded-xl bg-slate-50 border border-slate-200 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
               <div className="flex items-center gap-2">
                 <FileCheck size={16} className="text-blue-600" />
@@ -445,7 +520,7 @@ export default function ApplicationDetail() {
                   <GraduationCap size={18} className="text-blue-600" />
                   Applicant Academic Profile
                 </h3>
-                {candidateProfile?.gpa && (
+                {candidateProfile?.gpa !== undefined && (
                   <span className="text-xs font-bold text-blue-700 bg-blue-50 border border-blue-200 px-2.5 py-1 rounded-full">
                     GPA: {candidateProfile.gpa} / {candidateProfile.gpaScale || 4.0}
                   </span>
@@ -457,20 +532,20 @@ export default function ApplicationDetail() {
                 <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-100">
                   <span className="text-slate-400 block mb-0.5">Institution & Major</span>
                   <p className="font-semibold text-slate-900 text-sm">
-                    {candidateProfile?.university || app.university}
+                    {candidateProfile?.university || app.university || 'Not specified'}
                   </p>
                   <p className="text-slate-600 mt-0.5">
-                    {candidateProfile?.major || 'Computer Science'} • {candidateProfile?.degree || 'Bachelor'}
+                    {[candidateProfile?.major, candidateProfile?.degree].filter(Boolean).join(' • ') || 'Academic program not specified'}
                   </p>
                 </div>
 
                 <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-100">
                   <span className="text-slate-400 block mb-0.5">Graduation Timeline</span>
                   <p className="font-semibold text-slate-900 text-sm">
-                    {candidateProfile?.expectedGraduation ? `Graduating ${candidateProfile.expectedGraduation}` : 'Completed'}
+                    {candidateProfile?.expectedGraduation ? `Graduating ${candidateProfile.expectedGraduation}` : 'Not specified'}
                   </p>
                   <p className="text-slate-600 mt-0.5">
-                    {candidateProfile?.currentSemester || 'Senior Undergraduate'}
+                    {candidateProfile?.currentSemester || 'Semester not specified'}
                   </p>
                 </div>
               </div>
@@ -548,25 +623,29 @@ export default function ApplicationDetail() {
 
               <div className="space-y-3">
                 {/* CV Card */}
-                <div className="flex items-center justify-between p-3.5 rounded-xl bg-slate-50 border border-slate-200/80 hover:bg-slate-100/70 transition-colors">
-                  <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-xl bg-blue-100 text-blue-700 flex items-center justify-center font-bold text-xs">
-                      PDF
+                {app.cvUrl ? (
+                  <div className="flex items-center justify-between p-3.5 rounded-xl bg-slate-50 border border-slate-200/80 hover:bg-slate-100/70 transition-colors">
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-xl bg-blue-100 text-blue-700 flex items-center justify-center font-bold text-xs">
+                        PDF
+                      </div>
+                      <div>
+                        <p className="text-sm font-semibold text-slate-900">Curriculum Vitae (CV)</p>
+                        <p className="text-xs text-slate-500">Applicant academic credentials</p>
+                      </div>
                     </div>
-                    <div>
-                      <p className="text-sm font-semibold text-slate-900">Curriculum Vitae (CV)</p>
-                      <p className="text-xs text-slate-500">Applicant verified academic credentials</p>
-                    </div>
+                    <a
+                      href={app.cvUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 text-xs font-semibold text-blue-600 hover:text-blue-700 bg-white border border-slate-200 px-3 py-1.5 rounded-lg shadow-2xs hover:bg-slate-50 transition-colors"
+                    >
+                      View CV <ExternalLink size={12} />
+                    </a>
                   </div>
-                  <a
-                    href={app.cvUrl || '#'}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-1 text-xs font-semibold text-blue-600 hover:text-blue-700 bg-white border border-slate-200 px-3 py-1.5 rounded-lg shadow-2xs hover:bg-slate-50 transition-colors"
-                  >
-                    View CV <ExternalLink size={12} />
-                  </a>
-                </div>
+                ) : (
+                  <p className="text-xs text-slate-500">No CV URL attached to this application.</p>
+                )}
 
                 {/* Transcript Card */}
                 {app.transcriptUrl && (
@@ -577,7 +656,7 @@ export default function ApplicationDetail() {
                       </div>
                       <div>
                         <p className="text-sm font-semibold text-slate-900">Official Academic Transcript</p>
-                        <p className="text-xs text-slate-500">Verified university course grades & credits</p>
+                        <p className="text-xs text-slate-500">University course grades & credits</p>
                       </div>
                     </div>
                     <a
@@ -642,7 +721,7 @@ export default function ApplicationDetail() {
                       score: app.matchScore,
                       breakdown: app.matchBreakdown,
                       explanation: app.matchExplanation,
-                      matchedKeywords: ['Medical Vision', 'Deep Learning', 'PyTorch']
+                      matchedKeywords: []
                     }}
                   />
                 </div>
@@ -684,7 +763,7 @@ export default function ApplicationDetail() {
       </div>
 
       {/* Status Note Dialog Modal */}
-      {showNoteModal && selectedNewStatus && (
+      {canManageStatus && showNoteModal && selectedNewStatus && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-xs">
           <div className="bg-white rounded-2xl border border-slate-200 shadow-xl max-w-md w-full p-6 space-y-4 animate-scaleUp">
             <div className="flex items-center justify-between pb-3 border-b border-slate-100">
@@ -715,9 +794,9 @@ export default function ApplicationDetail() {
                   selectedNewStatus === 'interview'
                     ? 'e.g., Scheduled technical discussion for next Tuesday via Zoom.'
                     : selectedNewStatus === 'shortlisted'
-                    ? 'e.g., Impressive MICCAI paper, shortlisted for top 3 candidates.'
+                    ? 'e.g., Shortlisted for top candidates.'
                     : selectedNewStatus === 'accepted'
-                    ? 'e.g., Recommended for fully funded departmental scholarship.'
+                    ? 'e.g., Recommended for departmental scholarship.'
                     : 'e.g., Evaluation note...'
                 }
                 rows={3}

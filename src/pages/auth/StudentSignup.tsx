@@ -11,7 +11,7 @@ import { Input, Select, Textarea } from '@/components/common/Input'
 import { TagInput } from '@/components/common/TagInput'
 import { Button } from '@/components/common/Button'
 import { BrandLogo } from '@/components/common/BrandLogo'
-import { RESEARCH_AREAS, COUNTRIES } from '@/utils/helpers'
+import { RESEARCH_AREAS, COUNTRIES, calculateProfileCompleteness } from '@/utils/helpers'
 
 // ── Validation schema ─────────────────────────────────────────────────────────
 
@@ -95,94 +95,55 @@ export default function StudentSignup() {
       const user = await signUp(accountData.email, accountData.password, accountData.fullName, 'student')
 
       const languageScores = []
-      if (language.ielts) languageScores.push({ id: 'ielts', type: 'IELTS', score: language.ielts })
-      if (language.toefl) languageScores.push({ id: 'toefl', type: 'TOEFL', score: language.toefl })
-      if (language.topik) languageScores.push({ id: 'topik', type: 'TOPIK', score: language.topik })
-      if (language.other && language.otherLabel) languageScores.push({ id: 'other', type: 'Other', score: language.other, label: language.otherLabel })
+      if (language.ielts) languageScores.push({ id: 'ielts', type: 'IELTS' as const, score: language.ielts })
+      if (language.toefl) languageScores.push({ id: 'toefl', type: 'TOEFL' as const, score: language.toefl })
+      if (language.topik) languageScores.push({ id: 'topik', type: 'TOPIK' as const, score: language.topik })
+      if (language.other && language.otherLabel) languageScores.push({ id: 'other', type: 'Other' as const, score: language.other, label: language.otherLabel })
 
-      const newStudentProfile = {
+      const parsedGpa = parseFloat(academic.gpa)
+      const parsedGpaScale = parseFloat(academic.gpaScale)
+      const baseProfile = {
         uid: user.uid,
-        fullName: accountData.fullName,
-        username: accountData.username,
-        email: accountData.email,
+        fullName: accountData.fullName.trim(),
+        username: accountData.username.trim(),
+        email: accountData.email.trim(),
         country: accountData.country,
-        university: academic.university || 'Seoul National University',
-        department: academic.department || 'Computer Science',
-        major: academic.major || 'Computer Science',
-        degree: academic.degree || 'Bachelor',
-        currentSemester: academic.currentSemester || '1st Semester',
-        expectedGraduation: academic.expectedGraduation || '2028-02',
-        gpa: parseFloat(academic.gpa) || 3.8,
-        gpaScale: parseFloat(academic.gpaScale) || 4.0,
-        researchInterests: research.researchInterests || ['Artificial Intelligence'],
-        researchAreas: research.researchAreas || ['Artificial Intelligence'],
-        bio: research.bio || '',
+        university: academic.university.trim(),
+        department: academic.department.trim(),
+        major: academic.major.trim(),
+        degree: (academic.degree || 'Master') as 'Bachelor' | 'Master' | 'PhD',
+        currentSemester: academic.currentSemester.trim(),
+        expectedGraduation: academic.expectedGraduation,
+        gpa: Number.isFinite(parsedGpa) ? parsedGpa : 0,
+        gpaScale: Number.isFinite(parsedGpaScale) ? parsedGpaScale : 4.0,
+        researchInterests: research.researchInterests,
+        researchAreas: research.researchAreas,
+        bio: research.bio.trim(),
         researchExperience: [],
         projects: [],
         publications: [],
-        programmingLanguages: skills.programmingLanguages || ['Python'],
-        frameworks: skills.frameworks || ['PyTorch'],
-        technicalSkills: skills.technicalSkills || ['Deep Learning'],
-        researchTools: skills.researchTools || ['Git'],
+        programmingLanguages: skills.programmingLanguages,
+        frameworks: skills.frameworks,
+        technicalSkills: skills.technicalSkills,
+        researchTools: skills.researchTools,
         languageScores,
-        verificationStatus: 'pending' as const,
         accountStatus: 'active' as const,
-        profileCompleteness: 75,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
       }
 
-      // 1. Save profile to localStorage
-      localStorage.setItem('rm_demo_student_profile', JSON.stringify(newStudentProfile))
-
-      // 2. Queue verification request in rm_demo_verifications
-      const newVerificationReq = {
-        id: `req-${Date.now()}`,
-        userId: user.uid,
-        userName: accountData.fullName,
-        userEmail: accountData.email,
-        userRole: 'student' as const,
-        university: academic.university || 'Seoul National University',
-        department: academic.department || 'Computer Science',
-        academicTitleOrDegree: `${academic.degree || 'Bachelor'} in ${academic.major || 'Computer Science'}`,
-        docType: 'Official Academic Transcript & Student Enrollment Letter',
-        docUrl: 'https://example.com/student_transcript.pdf',
-        status: 'pending' as const,
-        accountStatus: 'active' as const,
-        submittedAt: new Date().toISOString(),
+      const newStudentProfile = {
+        ...baseProfile,
+        profileCompleteness: calculateProfileCompleteness({
+          ...baseProfile,
+          languageScores,
+          cvUrl: '',
+        }),
       }
 
-      const existingVerifications = localStorage.getItem('rm_demo_verifications')
-      const verificationsList = existingVerifications ? JSON.parse(existingVerifications) : []
-      localStorage.setItem('rm_demo_verifications', JSON.stringify([newVerificationReq, ...verificationsList]))
-
-      // 3. Add to rm_demo_system_users
-      const newSystemUser = {
-        uid: user.uid,
-        displayName: accountData.fullName,
-        email: accountData.email,
-        role: 'student' as const,
-        university: academic.university || 'Seoul National University',
-        department: academic.department || 'Computer Science',
-        academicTitleOrDegree: `${academic.degree || 'Bachelor'} in ${academic.major || 'Computer Science'}`,
-        verificationStatus: 'pending' as const,
-        accountStatus: 'active' as const,
-        createdAt: new Date().toISOString().slice(0, 10),
-        applicationsCount: 0,
-      }
-      const existingUsers = localStorage.getItem('rm_demo_system_users')
-      const usersList = existingUsers ? JSON.parse(existingUsers) : []
-      localStorage.setItem('rm_demo_system_users', JSON.stringify([newSystemUser, ...usersList]))
-
-      try {
-        await setDoc(doc(db, 'students', user.uid), {
-          ...newStudentProfile,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        })
-      } catch {
-        // demo mode Firestore fallback
-      }
+      await setDoc(doc(db, 'students', user.uid), {
+        ...newStudentProfile,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
 
       navigate('/dashboard/student')
     } catch (err: unknown) {

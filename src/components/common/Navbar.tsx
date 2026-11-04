@@ -39,8 +39,6 @@ export function Navbar() {
   const dashboardPath =
     role === 'professor'
       ? '/dashboard/professor'
-      : role === 'admin'
-      ? '/admin'
       : '/dashboard/student'
 
   return (
