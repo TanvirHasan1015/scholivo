@@ -1,4 +1,5 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import { Agentation } from 'agentation';
 import { AuthProvider } from '@/context/AuthContext'
 import { Navbar } from '@/components/common/Navbar'
 import { Footer } from '@/components/common/Footer'
@@ -16,6 +17,7 @@ import NotFound from '@/pages/NotFound'
 // Protected Pages
 import StudentDashboard from '@/pages/student/StudentDashboard'
 import StudentProfile from '@/pages/student/StudentProfile'
+import StudentApplications from '@/pages/student/StudentApplications'
 import SavedProfessors from '@/pages/student/SavedProfessors'
 import Apply from '@/pages/application/Apply'
 import ApplicationDetail from '@/pages/application/ApplicationDetail'
@@ -46,6 +48,7 @@ export default function App() {
               <Route element={<ProtectedRoute allowedRoles={['student']} />}>
                 <Route path="/dashboard/student" element={<StudentDashboard />} />
                 <Route path="/profile/student" element={<StudentProfile />} />
+                <Route path="/applications" element={<StudentApplications />} />
                 <Route path="/saved" element={<SavedProfessors />} />
                 <Route path="/apply/:positionId" element={<Apply />} />
               </Route>
@@ -75,6 +78,7 @@ export default function App() {
 
           <Footer />
         </div>
+        {import.meta.env.DEV && <Agentation />}
       </AuthProvider>
     </BrowserRouter>
   )

@@ -1,14 +1,13 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { collection, getDocs, query, where, limit } from 'firebase/firestore'
+import { collection, doc, getDoc, getDocs, setDoc, query, where, limit } from 'firebase/firestore'
 import { 
-  MapPin, Globe, BookOpen, Users, ExternalLink, Heart, HeartOff, 
-  ChevronDown, ChevronUp, Calendar, DollarSign, GraduationCap, Mail,
-  Sparkles, CheckCircle2, ArrowLeft, ArrowUpRight, Award, ShieldCheck,
+  MapPin, Globe, ExternalLink, Heart, 
+  Calendar, DollarSign, GraduationCap, Mail,
+  Sparkles, ArrowLeft, ArrowUpRight,
   Building, Briefcase
 } from 'lucide-react'
-import { db, isDemoMode } from '@/lib/firebase'
-import { DEMO_PROFESSORS, DEMO_STUDENT_PROFILE, DEMO_SAVED_PROFESSORS, type SavedProfessorItem } from '@/lib/demoData'
+import { db } from '@/lib/firebase'
 import { useAuth } from '@/context/AuthContext'
 import type { ProfessorProfile, StudentProfile } from '@/types/user.types'
 import type { Position } from '@/types/position.types'
@@ -28,108 +27,164 @@ export default function ProfessorProfilePage() {
   const { user, role } = useAuth()
 
   const [professor, setProfessor] = useState<(ProfessorProfile & { positions: Position[] }) | null>(null)
-  const [studentProfile, setStudentProfile] = useState<StudentProfile | null>(DEMO_STUDENT_PROFILE)
-  const [matchResult, setMatchResult] = useState<MatchResult | null>(null)
+  const [studentProfile, setStudentProfile] = useState<StudentProfile | null>(null)
   const [loading, setLoading] = useState(true)
   const [activeTab, setActiveTab] = useState<Tab>('overview')
-  const [isSaved, setIsSaved] = useState(false)
 
-  // Sync saved status from localStorage
-  useEffect(() => {
+  const isSaved = useMemo(() => {
+    if (!professor || !studentProfile) return false
+    const ids = Array.isArray(studentProfile.savedProfessorIds) ? studentProfile.savedProfessorIds : []
+    return ids.includes(professor.uid)
+  }, [professor, studentProfile])
+
+  const toggleSave = async () => {
     if (!professor) return
-    const raw = localStorage.getItem('rm_demo_saved_professors')
-    const list: SavedProfessorItem[] = raw ? JSON.parse(raw) : DEMO_SAVED_PROFESSORS
-    setIsSaved(list.some((p) => p.uid === professor.uid || p.username === professor.username))
-  }, [professor])
-
-  const toggleSave = () => {
-    if (!professor) return
-    const raw = localStorage.getItem('rm_demo_saved_professors')
-    let list: SavedProfessorItem[] = raw ? JSON.parse(raw) : [...DEMO_SAVED_PROFESSORS]
-
-    if (isSaved) {
-      list = list.filter((p) => p.uid !== professor.uid && p.username !== professor.username)
-      setIsSaved(false)
-    } else {
-      const newItem: SavedProfessorItem = {
-        uid: professor.uid,
-        username: professor.username,
-        fullName: professor.fullName,
-        academicTitle: professor.academicTitle,
-        university: professor.university,
-        country: professor.country,
-        photoURL: professor.photoURL,
-        researchAreas: professor.researchAreas,
-        matchScore: matchResult?.score || 85,
-        openPositionsCount: professor.positions.length,
-        isRecruiting: professor.isRecruiting,
-      }
-      list.push(newItem)
-      setIsSaved(true)
+    if (!user || role !== 'student') {
+      navigate('/login')
+      return
     }
-    localStorage.setItem('rm_demo_saved_professors', JSON.stringify(list))
+    const currentIds = Array.isArray(studentProfile?.savedProfessorIds)
+      ? studentProfile.savedProfessorIds
+      : []
+    const nextIds = currentIds.includes(professor.uid)
+      ? currentIds.filter((id) => id !== professor.uid)
+      : [...currentIds, professor.uid]
+
+    setStudentProfile((prev) => (prev ? { ...prev, savedProfessorIds: nextIds } : prev))
+
+    try {
+      await setDoc(
+        doc(db, 'students', user.uid),
+        { savedProfessorIds: nextIds, updatedAt: new Date().toISOString() },
+        { merge: true }
+      )
+    } catch (err) {
+      console.error('Failed to update savedProfessorIds in Firestore:', err)
+    }
   }
 
-  // Load professor
+  // Load professor and open positions from Firestore
   useEffect(() => {
+    let isMounted = true
+
     const load = async () => {
-      setLoading(true)
-      if (isDemoMode) {
-        const found = DEMO_PROFESSORS.find((p) => p.username === username)
-        setProfessor(found || null)
-        setLoading(false)
+      if (!username) {
+        if (isMounted) {
+          setProfessor(null)
+          setLoading(false)
+        }
         return
       }
 
       try {
+        let profData: ProfessorProfile | null = null
+        let profUid = ''
+
         const snap = await getDocs(
           query(collection(db, 'professors'), where('username', '==', username), limit(1))
         )
+
         if (!snap.empty) {
-          const prof = snap.docs[0].data() as ProfessorProfile
-          const posSnap = await getDocs(
-            query(collection(db, 'positions'), where('professorId', '==', prof.uid), where('isOpen', '==', true))
-          )
-          const positions = posSnap.docs.map((d) => ({ id: d.id, ...d.data() } as Position))
-          setProfessor({ ...prof, positions })
+          profData = snap.docs[0].data() as ProfessorProfile
+          profUid = profData.uid || snap.docs[0].id
         } else {
-          const found = DEMO_PROFESSORS.find((p) => p.username === username)
-          setProfessor(found || null)
+          const byIdSnap = await getDoc(doc(db, 'professors', username))
+          if (byIdSnap.exists()) {
+            profData = byIdSnap.data() as ProfessorProfile
+            profUid = profData.uid || byIdSnap.id
+          }
+        }
+
+        if (!isMounted) return
+
+        if (profData && profUid) {
+          const posSnap = await getDocs(
+            query(collection(db, 'positions'), where('professorId', '==', profUid), where('isOpen', '==', true))
+          )
+          const positions = posSnap.docs.map((d) => {
+            const p = d.data() as Position
+            return {
+              ...p,
+              id: d.id,
+              researchTopics: Array.isArray(p.researchTopics) ? p.researchTopics : [],
+              requiredSkills: Array.isArray(p.requiredSkills) ? p.requiredSkills : [],
+              preferredSkills: Array.isArray(p.preferredSkills) ? p.preferredSkills : [],
+            }
+          })
+          setProfessor({
+            ...profData,
+            uid: profUid,
+            researchAreas: Array.isArray(profData.researchAreas) ? profData.researchAreas : [],
+            researchInterests: Array.isArray(profData.researchInterests) ? profData.researchInterests : [],
+            currentProjects: Array.isArray(profData.currentProjects) ? profData.currentProjects : [],
+            publications: Array.isArray(profData.publications) ? profData.publications : [],
+            labMembers: Array.isArray(profData.labMembers) ? profData.labMembers : [],
+            positions,
+          })
+        } else {
+          setProfessor(null)
         }
       } catch (err) {
-        console.error('Failed to query professor, falling back to demo:', err)
-        const found = DEMO_PROFESSORS.find((p) => p.username === username)
-        setProfessor(found || null)
+        console.error('Failed to query professor from Firestore:', err)
+        if (isMounted) setProfessor(null)
       } finally {
-        setLoading(false)
+        if (isMounted) setLoading(false)
       }
     }
+
     load()
+    return () => {
+      isMounted = false
+    }
   }, [username])
 
   // Load student profile for match calculation
   useEffect(() => {
-    if (isDemoMode) {
-      setStudentProfile(DEMO_STUDENT_PROFILE)
-      return
+    let isMounted = true
+
+    async function loadStudentProfile() {
+      if (!user || role !== 'student') {
+        if (isMounted) setStudentProfile(null)
+        return
+      }
+      try {
+        const snap = await getDoc(doc(db, 'students', user.uid))
+        if (!isMounted) return
+        if (snap.exists()) {
+          const data = snap.data() as StudentProfile
+          setStudentProfile({
+            ...data,
+            uid: data.uid || user.uid,
+            researchInterests: Array.isArray(data.researchInterests) ? data.researchInterests : [],
+            researchAreas: Array.isArray(data.researchAreas) ? data.researchAreas : [],
+            researchExperience: Array.isArray(data.researchExperience) ? data.researchExperience : [],
+            projects: Array.isArray(data.projects) ? data.projects : [],
+            publications: Array.isArray(data.publications) ? data.publications : [],
+            programmingLanguages: Array.isArray(data.programmingLanguages) ? data.programmingLanguages : [],
+            frameworks: Array.isArray(data.frameworks) ? data.frameworks : [],
+            technicalSkills: Array.isArray(data.technicalSkills) ? data.technicalSkills : [],
+            researchTools: Array.isArray(data.researchTools) ? data.researchTools : [],
+            languageScores: Array.isArray(data.languageScores) ? data.languageScores : [],
+          })
+        } else {
+          setStudentProfile(null)
+        }
+      } catch (err) {
+        console.error('Failed to load student profile for match calculation:', err)
+      }
     }
 
-    if (user && role === 'student') {
-      getDocs(query(collection(db, 'students'), where('uid', '==', user.uid), limit(1)))
-        .then((snap) => {
-          if (!snap.empty) setStudentProfile(snap.docs[0].data() as StudentProfile)
-        })
-        .catch(() => {})
+    loadStudentProfile()
+    return () => {
+      isMounted = false
     }
   }, [user, role])
 
-  // Calculate match score
-  useEffect(() => {
-    if (studentProfile && professor?.positions?.length) {
-      const results = professor.positions.map((p) => computeMatch(studentProfile, p))
-      const best = results.reduce((a, b) => (a.score > b.score ? a : b))
-      setMatchResult(best)
-    }
+  // Calculate match score via useMemo
+  const matchResult: MatchResult | null = useMemo(() => {
+    if (!studentProfile || !professor?.positions?.length) return null
+    const results = professor.positions.map((p) => computeMatch(studentProfile, p))
+    return results.reduce((a, b) => (a.score > b.score ? a : b))
   }, [studentProfile, professor])
 
   if (loading) {

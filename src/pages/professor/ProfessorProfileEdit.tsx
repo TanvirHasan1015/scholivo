@@ -1,102 +1,191 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { doc, getDoc, updateDoc } from 'firebase/firestore'
+import { doc, getDoc, setDoc } from 'firebase/firestore'
 import { 
-  User, GraduationCap, BookOpen, Globe, Save, Check, Award, 
-  ArrowLeft, Plus, Trash2, ExternalLink, Sparkles, AlertCircle, 
-  Building, MapPin, Users, Eye
+  GraduationCap, BookOpen, Globe, Save, Check, 
+  ArrowLeft, Plus, Trash2, AlertCircle, 
+  Building, Users, Eye
 } from 'lucide-react'
-import { db, isDemoMode } from '@/lib/firebase'
+import { db } from '@/lib/firebase'
 import { useAuth } from '@/context/AuthContext'
-import type { ProfessorProfile, ResearchProject, Publication, LabMember, RecruitingStatus } from '@/types/user.types'
-import { DEMO_PROFESSORS } from '@/lib/demoData'
+import type { ProfessorProfile, ResearchProject, RecruitingStatus } from '@/types/user.types'
 import { Button } from '@/components/common/Button'
 import { TagInput } from '@/components/common/TagInput'
 import { Avatar } from '@/components/common/Avatar'
-import { RESEARCH_AREAS, COUNTRIES } from '@/utils/helpers'
+import { COUNTRIES } from '@/utils/helpers'
+
+function createEmptyProfessorProfile(uid = '', email = '', displayName = '', photoURL?: string): ProfessorProfile {
+  const now = new Date().toISOString()
+  return {
+    uid,
+    fullName: displayName,
+    username: email ? email.split('@')[0].toLowerCase().replace(/[^a-z0-9]/g, '') : '',
+    email,
+    academicTitle: 'Associate Professor',
+    country: 'South Korea',
+    photoURL,
+    university: '',
+    department: '',
+    faculty: '',
+    universityProfileUrl: '',
+    googleScholarUrl: '',
+    orcid: '',
+    personalWebpageUrl: '',
+    biography: '',
+    researchAreas: [],
+    researchInterests: [],
+    currentProjects: [],
+    publications: [],
+    labName: '',
+    labDescription: '',
+    labWebsiteUrl: '',
+    labMembers: [],
+    verificationStatus: 'pending',
+    verificationDocuments: [],
+    accountStatus: 'active',
+    isRecruiting: true,
+    recruitingStatus: 'actively_recruiting',
+    createdAt: now,
+    updatedAt: now,
+  }
+}
+
+function normalizeProfessorProfile(
+  raw: Partial<ProfessorProfile>,
+  uid: string,
+  email: string,
+  displayName: string,
+  photoURL?: string
+): ProfessorProfile {
+  const base = createEmptyProfessorProfile(uid, email, displayName, photoURL)
+  return {
+    ...base,
+    ...raw,
+    uid: raw.uid || uid,
+    email: raw.email || email,
+    fullName: raw.fullName ?? displayName,
+    researchAreas: Array.isArray(raw.researchAreas) ? raw.researchAreas : [],
+    researchInterests: Array.isArray(raw.researchInterests) ? raw.researchInterests : [],
+    currentProjects: Array.isArray(raw.currentProjects) ? raw.currentProjects : [],
+    publications: Array.isArray(raw.publications) ? raw.publications : [],
+    verificationDocuments: Array.isArray(raw.verificationDocuments) ? raw.verificationDocuments : [],
+    labMembers: Array.isArray(raw.labMembers) ? raw.labMembers : [],
+    verificationStatus: raw.verificationStatus || 'pending',
+    recruitingStatus: raw.recruitingStatus || 'actively_recruiting',
+    isRecruiting:
+      typeof raw.isRecruiting === 'boolean'
+        ? raw.isRecruiting
+        : (raw.recruitingStatus || 'actively_recruiting') === 'actively_recruiting',
+  }
+}
 
 export default function ProfessorProfileEdit() {
   const { user } = useAuth()
   const navigate = useNavigate()
 
-  // Default to Prof. Minji Kim (first demo professor)
-  const defaultProf = DEMO_PROFESSORS[0]
-
-  const [profile, setProfile] = useState<ProfessorProfile>(() => {
-    const local = localStorage.getItem('rm_demo_professor_profile')
-    if (local) {
-      try {
-        return JSON.parse(local)
-      } catch {
-        // fallback
-      }
-    }
-    return defaultProf
-  })
-
+  const [profile, setProfile] = useState<ProfessorProfile>(() =>
+    createEmptyProfessorProfile(user?.uid || '', user?.email || '', user?.displayName || '', user?.photoURL || undefined)
+  )
+  const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [saveSuccess, setSaveSuccess] = useState(false)
+  const [errorMsg, setErrorMsg] = useState<string | null>(null)
 
   useEffect(() => {
-    if (isDemoMode) {
-      const local = localStorage.getItem('rm_demo_professor_profile')
-      if (local) {
-        try {
-          setProfile(JSON.parse(local))
-        } catch {
-          setProfile(defaultProf)
-        }
+    let isMounted = true
+
+    async function loadData() {
+      if (!user) {
+        if (isMounted) setLoading(false)
+        return
       }
-      return
+      try {
+        const snap = await getDoc(doc(db, 'professors', user.uid))
+        if (!isMounted) return
+        if (snap.exists()) {
+          setProfile(
+            normalizeProfessorProfile(
+              snap.data() as Partial<ProfessorProfile>,
+              user.uid,
+              user.email || '',
+              user.displayName || '',
+              user.photoURL || undefined
+            )
+          )
+        } else {
+          setProfile(
+            createEmptyProfessorProfile(
+              user.uid,
+              user.email || '',
+              user.displayName || '',
+              user.photoURL || undefined
+            )
+          )
+        }
+        setErrorMsg(null)
+      } catch (err) {
+        console.error('Error loading professor profile from Firestore:', err)
+        if (isMounted) {
+          setErrorMsg('Failed to load your faculty profile from the server. Please refresh and try again.')
+        }
+      } finally {
+        if (isMounted) setLoading(false)
+      }
     }
 
-    if (!user) return
-    async function loadData() {
-      try {
-        const snap = await getDoc(doc(db, 'professors', user?.uid || 'demo-1'))
-        if (snap.exists()) {
-          setProfile({ ...defaultProf, ...(snap.data() as ProfessorProfile) })
-        }
-      } catch (err) {
-        console.warn('Error loading professor profile:', err)
-      }
-    }
     loadData()
+    return () => {
+      isMounted = false
+    }
   }, [user])
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (!user) return
+
     setSaving(true)
+    setErrorMsg(null)
 
-    const updated = {
+    const now = new Date().toISOString()
+    const updated: ProfessorProfile = {
       ...profile,
-      updatedAt: new Date().toISOString(),
+      uid: user.uid,
+      email: profile.email || user.email || '',
+      updatedAt: now,
     }
-    setProfile(updated)
-    localStorage.setItem('rm_demo_professor_profile', JSON.stringify(updated))
 
-    if (!isDemoMode && user) {
-      try {
-        await updateDoc(doc(db, 'professors', user.uid), updated)
-      } catch (err) {
-        console.warn('Firestore update error:', err)
+    try {
+      const firestorePayload = Object.fromEntries(
+        Object.entries(updated).filter(([, v]) => v !== undefined)
+      )
+      await setDoc(doc(db, 'professors', user.uid), firestorePayload, { merge: true })
+      if (updated.fullName) {
+        await setDoc(
+          doc(db, 'users', user.uid),
+          { displayName: updated.fullName, updatedAt: now },
+          { merge: true }
+        )
       }
+      setProfile(updated)
+      setSaveSuccess(true)
+      setTimeout(() => setSaveSuccess(false), 4000)
+    } catch (err) {
+      console.error('Firestore professor profile update error:', err)
+      setErrorMsg('Failed to save your faculty profile changes. Please try again.')
+    } finally {
+      setSaving(false)
     }
-
-    setSaving(false)
-    setSaveSuccess(true)
-    setTimeout(() => setSaveSuccess(false), 4000)
   }
 
   // Add Project
   const addProject = () => {
     const newProj: ResearchProject = {
       id: `proj-${Date.now()}`,
-      title: 'New Funded Investigation',
-      description: 'Exploration of neural architectures for biomedical and real-world perception.',
-      fundingSource: 'National Research Foundation',
+      title: '',
+      description: '',
+      fundingSource: '',
       isOngoing: true,
-      startDate: '2026-01',
+      startDate: new Date().toISOString().slice(0, 7),
     }
     setProfile({
       ...profile,
@@ -111,26 +200,15 @@ export default function ProfessorProfileEdit() {
     })
   }
 
-  // Add Publication
-  const addPublication = () => {
-    const newPub: Publication = {
-      id: `pub-${Date.now()}`,
-      title: 'Self-Supervised Visual Representation Dynamics',
-      journal: 'IEEE TPAMI',
-      year: 2026,
-      authors: [profile.fullName, 'Research Assistant'],
-    }
-    setProfile({
-      ...profile,
-      publications: [...(profile.publications || []), newPub],
-    })
-  }
-
-  const removePublication = (id: string) => {
-    setProfile({
-      ...profile,
-      publications: (profile.publications || []).filter((p) => p.id !== id),
-    })
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-50/70 pt-8 pb-20 px-4 sm:px-6 lg:px-8 flex items-center justify-center">
+        <div className="text-center space-y-2">
+          <div className="w-8 h-8 rounded-full border-2 border-blue-600 border-t-transparent animate-spin mx-auto" />
+          <p className="text-sm text-slate-500 font-medium">Loading your faculty profile…</p>
+        </div>
+      </div>
+    )
   }
 
   return (
@@ -152,9 +230,6 @@ export default function ProfessorProfileEdit() {
                 <h1 className="text-2xl sm:text-3xl font-bold font-display text-slate-900 tracking-tight">
                   Faculty Profile & Lab Settings
                 </h1>
-                <span className="text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200">
-                  Demo Mode
-                </span>
               </div>
               <p className="text-xs sm:text-sm text-slate-500 mt-0.5">
                 Update your academic appointments, ongoing grants, publications, and recruitment status
@@ -166,7 +241,7 @@ export default function ProfessorProfileEdit() {
             <Button
               variant="outline"
               size="sm"
-              onClick={() => navigate(`/professor/${profile.username || 'profkim'}`)}
+              onClick={() => navigate(`/professor/${profile.username || user?.uid || ''}`)}
               className="flex items-center gap-1.5 text-xs font-semibold"
               id="view-public-profile-btn"
             >
@@ -194,22 +269,35 @@ export default function ProfessorProfileEdit() {
           </div>
         </div>
 
+        {errorMsg && (
+          <div className="bg-rose-50 border border-rose-200 rounded-2xl p-4 text-xs font-medium text-rose-700 flex items-center gap-2.5">
+            <AlertCircle size={16} className="text-rose-600 shrink-0" />
+            <span>{errorMsg}</span>
+          </div>
+        )}
+
         {/* Profile Card Summary Banner */}
         <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-2xs flex flex-col sm:flex-row items-center sm:items-start gap-6">
-          <Avatar src={profile.photoURL} name={profile.fullName} size="xl" className="ring-4 ring-slate-100" />
+          <Avatar src={profile.photoURL} name={profile.fullName || 'Faculty'} size="xl" className="ring-4 ring-slate-100" />
           <div className="flex-1 text-center sm:text-left space-y-1.5">
             <div className="flex flex-wrap items-center justify-center sm:justify-start gap-2">
               <h2 className="text-xl sm:text-2xl font-bold text-slate-900 font-display">
-                {profile.fullName}
+                {profile.fullName || 'Faculty Member'}
               </h2>
-              <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
-                Verified Faculty
-              </span>
+              {profile.verificationStatus === 'verified' ? (
+                <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
+                  Verified Faculty
+                </span>
+              ) : (
+                <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200 capitalize">
+                  {profile.verificationStatus === 'pending' ? 'Pending Verification' : profile.verificationStatus.replace('_', ' ')}
+                </span>
+              )}
             </div>
             <p className="text-sm font-semibold text-blue-600">
-              {profile.academicTitle} • {profile.department}
+              {profile.academicTitle || 'Faculty'} • {profile.department || 'Department not set'}
             </p>
-            <p className="text-xs text-slate-500">{profile.university}, {profile.country}</p>
+            <p className="text-xs text-slate-500">{profile.university || 'University not set'}, {profile.country}</p>
             <p className="text-xs text-slate-400">{profile.email}</p>
           </div>
         </div>
@@ -584,7 +672,7 @@ export default function ProfessorProfileEdit() {
           <div className="flex flex-col sm:flex-row items-center justify-between gap-4 pt-4">
             <div className="flex items-center gap-2 text-xs text-slate-500">
               <AlertCircle size={14} className="text-blue-600" />
-              <span>In demo mode, changes persist to your local browser storage.</span>
+              <span>Changes are saved directly to your Scholivo faculty profile.</span>
             </div>
 
             <Button

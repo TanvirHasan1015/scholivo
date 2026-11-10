@@ -1,12 +1,20 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { collection, doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore'
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  runTransaction,
+  query,
+  where,
+  serverTimestamp,
+} from 'firebase/firestore'
 import {
   ArrowLeft, Send, Sparkles, FileText, CheckCircle2,
-  Calendar, DollarSign, Building, AlertCircle, ShieldAlert,
-  GraduationCap, ExternalLink, Lock
+  Building, AlertCircle, ShieldAlert, GraduationCap
 } from 'lucide-react'
-import { db, isDemoMode } from '@/lib/firebase'
+import { db } from '@/lib/firebase'
 import { useAuth } from '@/context/AuthContext'
 import type { Position } from '@/types/position.types'
 import type { StudentProfile, AffiliationVerificationStatus } from '@/types/user.types'
@@ -15,193 +23,328 @@ import { Button } from '@/components/common/Button'
 import { computeMatch } from '@/lib/matching'
 import { MatchScoreBadge, MatchBreakdownPanel } from '@/components/matching/MatchScore'
 import { FUNDING_LABELS } from '@/utils/helpers'
-import { DEMO_PROFESSORS, DEMO_STUDENT_PROFILE, DEMO_PROFESSOR_APPLICATIONS } from '@/lib/demoData'
 
-// Fallback position for demo
-const FALLBACK_POSITION: Position = {
-  id: 'p1',
-  professorId: 'demo-1',
-  professorName: 'Prof. Minji Kim',
-  professorTitle: 'Associate Professor',
-  university: 'KAIST',
-  department: 'School of Computing',
-  country: 'South Korea',
-  title: 'PhD Position — Computer Vision & Medical AI',
-  degreeType: 'PhD',
-  description: 'Looking for motivated PhD students to work on 3D medical image segmentation and diffusion models for pathology synthesis.',
-  researchArea: 'Computer Vision',
-  researchTopics: ['Computer Vision', 'Deep Learning', 'Medical AI', 'Diffusion Models'],
-  requiredSkills: ['Python', 'PyTorch', 'Computer Vision'],
-  preferredSkills: ['Medical Imaging', 'CUDA', '3D Vision'],
-  minimumGPA: 3.5,
-  gpaScale: 4.0,
-  languageRequirements: [{ type: 'IELTS', minimumScore: '7.0' }],
-  otherRequirements: 'Strong mathematical background and publication in CVPR/ICCV/MICCAI preferred.',
-  fundingType: 'fully_funded',
-  fundingDetails: 'Full tuition coverage + monthly living stipend of 2,200,000 KRW',
-  stipend: '2,200,000 KRW/mo',
-  applicationDeadline: '2026-11-30',
-  startDate: 'Spring 2027',
-  isOpen: true,
-  createdAt: '2026-09-01T00:00:00Z',
-  updatedAt: '2026-09-01T00:00:00Z',
+function createEmptyStudentProfile(uid = '', email = '', displayName = '', photoURL?: string): StudentProfile {
+  const now = new Date().toISOString()
+  return {
+    uid,
+    fullName: displayName,
+    username: email ? email.split('@')[0].toLowerCase().replace(/[^a-z0-9]/g, '') : '',
+    email,
+    country: '',
+    photoURL,
+    university: '',
+    department: '',
+    major: '',
+    degree: 'Master',
+    currentSemester: '',
+    expectedGraduation: '',
+    gpa: 0,
+    gpaScale: 4.0,
+    researchInterests: [],
+    researchAreas: [],
+    researchExperience: [],
+    projects: [],
+    publications: [],
+    programmingLanguages: [],
+    frameworks: [],
+    technicalSkills: [],
+    researchTools: [],
+    languageScores: [],
+    verificationStatus: 'pending',
+    accountStatus: 'active',
+    profileCompleteness: 0,
+    createdAt: now,
+    updatedAt: now,
+  }
 }
 
 export default function Apply() {
   const { positionId } = useParams<{ positionId: string }>()
-  const { user } = useAuth()
+  const { user, role, loading: authLoading } = useAuth()
   const navigate = useNavigate()
 
-  const [position, setPosition] = useState<Position>(FALLBACK_POSITION)
+  const [position, setPosition] = useState<Position | null>(null)
+  const [studentProfile, setStudentProfile] = useState<StudentProfile>(() =>
+    createEmptyStudentProfile(user?.uid || '', user?.email || '', user?.displayName || '', user?.photoURL || undefined)
+  )
+  const [verificationStatus, setVerificationStatus] = useState<AffiliationVerificationStatus>('pending')
+  const [existingApplication, setExistingApplication] = useState<Application | null>(null)
+
   const [statement, setStatement] = useState('')
-  const [cvUrl, setCvUrl] = useState('https://example.com/alex_rivera_cv.pdf')
-  const [transcriptUrl, setTranscriptUrl] = useState('https://example.com/alex_rivera_transcript.pdf')
+  const [cvUrl, setCvUrl] = useState('')
+  const [transcriptUrl, setTranscriptUrl] = useState('')
+  const [initialLoading, setInitialLoading] = useState(true)
   const [loading, setLoading] = useState(false)
   const [submitted, setSubmitted] = useState(false)
-
-  // Current student profile for matching
-  const [studentProfile, setStudentProfile] = useState<StudentProfile>(() => {
-    const saved = localStorage.getItem('rm_demo_student_profile')
-    if (saved) {
-      try {
-        return JSON.parse(saved)
-      } catch {
-        // fallback
-      }
-    }
-    return DEMO_STUDENT_PROFILE
-  })
-
-  // Affiliation verification status check
-  const [verificationStatus, setVerificationStatus] = useState<AffiliationVerificationStatus>(() => {
-    // 1. Check rm_demo_verifications
-    const savedVerifications = localStorage.getItem('rm_demo_verifications')
-    if (savedVerifications) {
-      try {
-        const list = JSON.parse(savedVerifications)
-        const myRecord = list.find((item: any) =>
-          (user && (item.userId === user.uid || (item.applicantEmail && user.email && item.applicantEmail.toLowerCase() === user.email.toLowerCase()))) ||
-          (!user && item.userId === 'demo-student')
-        )
-        if (myRecord) return myRecord.status
-      } catch {
-        // fallback
-      }
-    }
-
-    // 2. Check student profile
-    const savedStudent = localStorage.getItem('rm_demo_student_profile')
-    if (savedStudent) {
-      try {
-        const parsed = JSON.parse(savedStudent)
-        if (parsed.verificationStatus) return parsed.verificationStatus
-      } catch {
-        // fallback
-      }
-    }
-
-    return 'verified'
-  })
-
-  // Compute live match score
-  const matchResult = computeMatch(studentProfile, position)
+  const [errorMsg, setErrorMsg] = useState<string | null>(null)
+  const isSubmittingRef = useRef(false)
 
   useEffect(() => {
-    if (!positionId) return
+    if (authLoading) return
+    let isMounted = true
 
-    // 1. Check in DEMO_PROFESSORS positions
-    for (const prof of DEMO_PROFESSORS) {
-      const found = prof.positions.find((p) => p.id === positionId)
-      if (found) {
-        setPosition(found)
+    async function loadApplyData() {
+      if (!positionId || !user) {
+        if (isMounted) setInitialLoading(false)
         return
       }
-    }
 
-    // 2. Check in localStorage rm_demo_positions
-    const savedPos = localStorage.getItem('rm_demo_positions')
-    if (savedPos) {
-      try {
-        const parsed: Position[] = JSON.parse(savedPos)
-        const found = parsed.find((p) => p.id === positionId)
-        if (found) {
-          setPosition(found)
-          return
-        }
-      } catch {
-        // pass
+      if (isMounted) {
+        setInitialLoading(true)
+        setErrorMsg(null)
       }
-    }
 
-    // 3. Fallback Firestore fetch
-    async function fetchPos() {
       try {
-        const snap = await getDoc(doc(db, 'positions', positionId!))
-        if (snap.exists()) {
-          setPosition({ id: snap.id, ...snap.data() } as Position)
+        const deterministicAppId = `app-${user.uid}-${positionId}`
+        const [posSnap, studentSnap, deterministicAppSnap, existingAppSnap] = await Promise.all([
+          getDoc(doc(db, 'positions', positionId)),
+          getDoc(doc(db, 'students', user.uid)),
+          getDoc(doc(db, 'applications', deterministicAppId)),
+          getDocs(
+            query(
+              collection(db, 'applications'),
+              where('studentId', '==', user.uid),
+              where('positionId', '==', positionId)
+            )
+          ),
+        ])
+
+        if (!isMounted) return
+
+        if (posSnap.exists()) {
+          const p = posSnap.data() as Position
+          setPosition({
+            ...p,
+            id: posSnap.id,
+            researchTopics: Array.isArray(p.researchTopics) ? p.researchTopics : [],
+            requiredSkills: Array.isArray(p.requiredSkills) ? p.requiredSkills : [],
+            preferredSkills: Array.isArray(p.preferredSkills) ? p.preferredSkills : [],
+          })
+        } else {
+          setPosition(null)
         }
+
+        if (studentSnap.exists()) {
+          const sData = studentSnap.data() as Partial<StudentProfile>
+          const base = createEmptyStudentProfile(
+            user.uid,
+            user.email || '',
+            user.displayName || '',
+            user.photoURL || undefined
+          )
+          const normalized: StudentProfile = {
+            ...base,
+            ...sData,
+            uid: sData.uid || user.uid,
+            researchInterests: Array.isArray(sData.researchInterests) ? sData.researchInterests : [],
+            researchAreas: Array.isArray(sData.researchAreas) ? sData.researchAreas : [],
+            researchExperience: Array.isArray(sData.researchExperience) ? sData.researchExperience : [],
+            projects: Array.isArray(sData.projects) ? sData.projects : [],
+            publications: Array.isArray(sData.publications) ? sData.publications : [],
+            programmingLanguages: Array.isArray(sData.programmingLanguages) ? sData.programmingLanguages : [],
+            frameworks: Array.isArray(sData.frameworks) ? sData.frameworks : [],
+            technicalSkills: Array.isArray(sData.technicalSkills) ? sData.technicalSkills : [],
+            researchTools: Array.isArray(sData.researchTools) ? sData.researchTools : [],
+            languageScores: Array.isArray(sData.languageScores) ? sData.languageScores : [],
+          }
+          setStudentProfile(normalized)
+          setVerificationStatus(normalized.verificationStatus || 'pending')
+          setCvUrl(normalized.cvUrl || '')
+          setTranscriptUrl(normalized.transcriptUrl || '')
+        } else {
+          setVerificationStatus('pending')
+        }
+
+        if (deterministicAppSnap.exists()) {
+          setExistingApplication({
+            ...(deterministicAppSnap.data() as Application),
+            id: deterministicAppSnap.id,
+          })
+        } else if (!existingAppSnap.empty) {
+          const firstDoc = existingAppSnap.docs[0]
+          setExistingApplication({
+            ...(firstDoc.data() as Application),
+            id: firstDoc.id,
+          })
+        } else {
+          setExistingApplication(null)
+        }
+
+        setErrorMsg(null)
       } catch (err) {
-        console.warn('Using fallback position:', err)
+        console.error('Failed to load application data from Firestore:', err)
+        if (isMounted) {
+          setErrorMsg('Failed to load opportunity details. Please check your connection and try again.')
+        }
+      } finally {
+        if (isMounted) setInitialLoading(false)
       }
     }
-    fetchPos()
-  }, [positionId])
+
+    loadApplyData()
+    return () => {
+      isMounted = false
+    }
+  }, [positionId, user, authLoading])
+
+  // Compute live match score using the existing matching algorithm
+  const matchResult = useMemo(() => {
+    if (!position) return null
+    return computeMatch(studentProfile, position)
+  }, [studentProfile, position])
+
+  const isVerified = verificationStatus === 'verified'
+  const isAccountActive = (studentProfile.accountStatus || 'active') === 'active'
+  const isPositionOpen = Boolean(position?.isOpen)
+  const canSubmit =
+    Boolean(user) &&
+    role === 'student' &&
+    isAccountActive &&
+    Boolean(position) &&
+    isPositionOpen &&
+    isVerified &&
+    !existingApplication &&
+    Boolean(statement.trim())
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!statement.trim() || verificationStatus !== 'verified') return
+    if (isSubmittingRef.current) return
+    if (!user || role !== 'student' || !position || !matchResult || !canSubmit) return
 
+    isSubmittingRef.current = true
     setLoading(true)
-    const applicationId = `app-${Date.now()}`
-
-    const newApp: Application = {
-      id: applicationId,
-      studentId: user?.uid || 'demo-student',
-      studentName: user?.displayName || studentProfile.fullName || 'Alex Rivera',
-      studentPhotoURL: user?.photoURL || studentProfile.photoURL,
-      professorId: position.professorId,
-      positionId: position.id,
-      positionTitle: position.title,
-      professorName: position.professorName,
-      university: position.university,
-      matchScore: matchResult.score,
-      matchBreakdown: matchResult.breakdown,
-      matchExplanation: matchResult.explanation,
-      cvUrl: cvUrl || 'https://example.com/alex_rivera_cv.pdf',
-      transcriptUrl: transcriptUrl || 'https://example.com/alex_rivera_transcript.pdf',
-      applicationStatement: statement,
-      status: 'submitted',
-      statusHistory: [
-        {
-          status: 'submitted',
-          changedAt: new Date().toISOString(),
-          note: 'Application submitted online by verified student',
-        },
-      ],
-      submittedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    }
-
-    // Save to localStorage rm_demo_applications for immediate synchronization with professor
-    const savedAppsStr = localStorage.getItem('rm_demo_applications')
-    let allApps: Application[] = savedAppsStr ? JSON.parse(savedAppsStr) : [...DEMO_PROFESSOR_APPLICATIONS]
-    allApps = [newApp, ...allApps]
-    localStorage.setItem('rm_demo_applications', JSON.stringify(allApps))
+    setErrorMsg(null)
 
     try {
-      await setDoc(doc(db, 'applications', applicationId), {
-        ...newApp,
-        createdAt: serverTimestamp(),
-      })
-    } catch (err) {
-      console.warn('Saved in demo storage:', err)
-    }
+      // 1. Check query for any existing application for this (studentId, positionId) pair
+      const dupSnap = await getDocs(
+        query(
+          collection(db, 'applications'),
+          where('studentId', '==', user.uid),
+          where('positionId', '==', position.id)
+        )
+      )
+      if (!dupSnap.empty) {
+        const dupDoc = dupSnap.docs[0]
+        setExistingApplication({
+          ...(dupDoc.data() as Application),
+          id: dupDoc.id,
+        })
+        setErrorMsg('You have already submitted an application for this position.')
+        return
+      }
 
-    setLoading(false)
-    setSubmitted(true)
+      const now = new Date().toISOString()
+      const applicationId = `app-${user.uid}-${position.id}`
+      const resolvedPhotoURL = studentProfile.photoURL || user.photoURL || ''
+      const resolvedTranscriptUrl = transcriptUrl.trim()
+
+      const newApp: Application = {
+        id: applicationId,
+        studentId: user.uid,
+        studentName: studentProfile.fullName || user.displayName || 'Student Applicant',
+        ...(resolvedPhotoURL ? { studentPhotoURL: resolvedPhotoURL } : {}),
+        professorId: position.professorId,
+        positionId: position.id,
+        positionTitle: position.title,
+        professorName: position.professorName,
+        university: position.university,
+        matchScore: matchResult.score,
+        matchBreakdown: matchResult.breakdown,
+        matchExplanation: matchResult.explanation,
+        cvUrl: cvUrl.trim(),
+        ...(resolvedTranscriptUrl ? { transcriptUrl: resolvedTranscriptUrl } : {}),
+        applicationStatement: statement.trim(),
+        status: 'submitted',
+        statusHistory: [
+          {
+            status: 'submitted',
+            changedAt: now,
+            note: 'Application submitted online by verified student',
+          },
+        ],
+        submittedAt: now,
+        updatedAt: now,
+      }
+
+      // 2. Atomic Firestore transaction on deterministic application ID and position document
+      // Prevents simultaneous duplicate submissions and guarantees existing documents are never overwritten.
+      const appRef = doc(db, 'applications', applicationId)
+      const posRef = doc(db, 'positions', position.id)
+
+      let existingFromTx: Application | null = null
+
+      await runTransaction(db, async (transaction) => {
+        const [existingDocSnap, latestPosSnap] = await Promise.all([
+          transaction.get(appRef),
+          transaction.get(posRef),
+        ])
+
+        if (existingDocSnap.exists()) {
+          existingFromTx = {
+            ...(existingDocSnap.data() as Application),
+            id: existingDocSnap.id,
+          }
+          return
+        }
+
+        if (!latestPosSnap.exists() || !latestPosSnap.data()?.isOpen) {
+          throw new Error('POSITION_CLOSED')
+        }
+
+        transaction.set(appRef, {
+          ...newApp,
+          createdAt: serverTimestamp(),
+        })
+      })
+
+      if (existingFromTx) {
+        setExistingApplication(existingFromTx)
+        setErrorMsg('You have already submitted an application for this position.')
+        return
+      }
+
+      setSubmitted(true)
+    } catch (err) {
+      if (err instanceof Error && err.message === 'POSITION_CLOSED') {
+        setPosition((prev) => (prev ? { ...prev, isOpen: false } : prev))
+        setErrorMsg('This research opportunity has been closed and is no longer accepting applications.')
+      } else {
+        console.error('Failed to submit application to Firestore:', err)
+        setErrorMsg('Failed to submit your application. Please check your connection and try again.')
+      }
+    } finally {
+      isSubmittingRef.current = false
+      setLoading(false)
+    }
   }
 
-  const isVerified = verificationStatus === 'verified'
+  if (authLoading || initialLoading) {
+    return (
+      <div className="min-h-screen bg-slate-50/70 pt-24 pb-20 px-4 flex items-center justify-center">
+        <div className="text-center space-y-2">
+          <div className="w-8 h-8 rounded-full border-2 border-blue-600 border-t-transparent animate-spin mx-auto" />
+          <p className="text-sm text-slate-500 font-medium">Loading research opportunity details…</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (!position || !matchResult) {
+    return (
+      <div className="min-h-screen bg-slate-50/70 pt-24 pb-20 px-4 flex items-center justify-center">
+        <div className="bg-white rounded-3xl border border-slate-200/80 p-10 text-center shadow-2xs max-w-md space-y-4">
+          <GraduationCap size={40} className="mx-auto text-slate-400" />
+          <h1 className="text-xl font-bold font-display text-slate-900">Position Not Found</h1>
+          <p className="text-sm text-slate-500">
+            The research opportunity you are trying to apply for does not exist or is no longer available.
+          </p>
+          <Button onClick={() => navigate('/search')}>Browse Faculty Directory</Button>
+        </div>
+      </div>
+    )
+  }
 
   if (submitted) {
     return (
@@ -276,6 +419,60 @@ export default function Apply() {
           <ArrowLeft size={14} />
           Back to Search / Openings
         </button>
+
+        {errorMsg && (
+          <div className="bg-rose-50 border border-rose-200 rounded-2xl p-4 text-xs font-medium text-rose-700 flex items-center gap-2.5">
+            <AlertCircle size={16} className="text-rose-600 shrink-0" />
+            <span>{errorMsg}</span>
+          </div>
+        )}
+
+        {/* Duplicate Application Alert if student already applied */}
+        {existingApplication && (
+          <div className="bg-blue-50 border border-blue-200 rounded-2xl p-5 shadow-xs flex items-start gap-4" id="duplicate-application-alert">
+            <CheckCircle2 size={22} className="text-blue-600 shrink-0 mt-0.5" />
+            <div className="space-y-1.5 flex-1">
+              <h3 className="text-sm font-bold text-blue-900">
+                Application Already Submitted
+              </h3>
+              <p className="text-xs text-blue-800 leading-relaxed">
+                You have already submitted an application for <strong>{position.title}</strong>. Duplicate applications for the same position are not permitted.
+              </p>
+              <div className="pt-1 flex items-center gap-3">
+                <Button
+                  size="sm"
+                  onClick={() => navigate(`/applications/${existingApplication.id}`)}
+                  className="text-xs bg-blue-600 hover:bg-blue-700 text-white"
+                >
+                  View Submitted Application
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => navigate('/applications')}
+                  className="text-xs"
+                >
+                  All My Applications
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Position Closed Alert if !isPositionOpen */}
+        {!isPositionOpen && (
+          <div className="bg-slate-100 border border-slate-300 rounded-2xl p-5 shadow-xs flex items-start gap-4">
+            <AlertCircle size={22} className="text-slate-600 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <h3 className="text-sm font-bold text-slate-900">
+                Recruitment Closed
+              </h3>
+              <p className="text-xs text-slate-600 leading-relaxed">
+                This research opportunity is not currently accepting new student applications.
+              </p>
+            </div>
+          </div>
+        )}
 
         {/* Verification Barrier Alert if NOT verified */}
         {!isVerified && (
@@ -372,9 +569,13 @@ export default function Apply() {
                 <textarea
                   value={statement}
                   onChange={(e) => setStatement(e.target.value)}
-                  disabled={!isVerified}
+                  disabled={!isVerified || Boolean(existingApplication) || !isPositionOpen}
                   placeholder={
-                    isVerified
+                    existingApplication
+                      ? 'You have already submitted an application for this position.'
+                      : !isPositionOpen
+                      ? 'Recruitment is closed for this position.'
+                      : isVerified
                       ? 'Describe your academic background, thesis work, and why you wish to join this group...'
                       : 'Affiliation verification required before submitting applications.'
                   }
@@ -384,59 +585,67 @@ export default function Apply() {
                 />
               </div>
 
-              {/* Verified Documents Attached */}
+              {/* Verified Documents & Links */}
               <div className="space-y-3 pt-2">
                 <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                  Attached Verified Documents
+                  Application Documents
                 </h3>
 
-                <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200/80 flex items-center justify-between text-xs">
-                  <div className="flex items-center gap-2.5">
-                    <div className="w-8 h-8 rounded-lg bg-blue-100 text-blue-700 flex items-center justify-center font-bold text-[10px]">
-                      PDF
-                    </div>
-                    <div>
-                      <p className="font-semibold text-slate-900">Academic Curriculum Vitae (CV)</p>
-                      <p className="text-[11px] text-slate-500">{studentProfile.fullName}_CV.pdf</p>
-                    </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      Curriculum Vitae (CV) URL
+                    </label>
+                    <input
+                      type="url"
+                      value={cvUrl}
+                      onChange={(e) => setCvUrl(e.target.value)}
+                      disabled={!isVerified || Boolean(existingApplication) || !isPositionOpen}
+                      placeholder="https://example.com/your-cv.pdf"
+                      className="w-full text-xs rounded-xl border border-slate-200 px-3 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-600/30 focus:border-blue-600 disabled:bg-slate-100 disabled:text-slate-400"
+                      id="apply-cv-url"
+                    />
                   </div>
-                  <span className="text-[11px] font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-0.5 rounded-full">
-                    Attached
-                  </span>
-                </div>
 
-                <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200/80 flex items-center justify-between text-xs">
-                  <div className="flex items-center gap-2.5">
-                    <div className="w-8 h-8 rounded-lg bg-emerald-100 text-emerald-700 flex items-center justify-center font-bold text-[10px]">
-                      PDF
-                    </div>
-                    <div>
-                      <p className="font-semibold text-slate-900">Official University Transcript</p>
-                      <p className="text-[11px] text-slate-500">GPA: {studentProfile.gpa} / {studentProfile.gpaScale || 4.0}</p>
-                    </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      Academic Transcript URL (GPA: {studentProfile.gpa} / {studentProfile.gpaScale || 4.0})
+                    </label>
+                    <input
+                      type="url"
+                      value={transcriptUrl}
+                      onChange={(e) => setTranscriptUrl(e.target.value)}
+                      disabled={!isVerified || Boolean(existingApplication) || !isPositionOpen}
+                      placeholder="https://example.com/your-transcript.pdf"
+                      className="w-full text-xs rounded-xl border border-slate-200 px-3 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-600/30 focus:border-blue-600 disabled:bg-slate-100 disabled:text-slate-400"
+                      id="apply-transcript-url"
+                    />
                   </div>
-                  <span className="text-[11px] font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-0.5 rounded-full">
-                    Attached
-                  </span>
                 </div>
               </div>
 
               {/* Submit CTA */}
               <div className="pt-4 border-t border-slate-100 flex items-center justify-between">
                 <span className="text-xs text-slate-400">
-                  {isVerified ? 'Ready for faculty review upon submission' : 'Verification required to submit'}
+                  {existingApplication
+                    ? 'Application already submitted'
+                    : !isPositionOpen
+                    ? 'Recruitment closed'
+                    : isVerified
+                    ? 'Ready for faculty review upon submission'
+                    : 'Verification required to submit'}
                 </span>
 
                 <Button
                   type="submit"
                   size="md"
-                  disabled={!isVerified || loading || !statement.trim()}
+                  disabled={!canSubmit || loading}
                   loading={loading}
                   className="text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50"
                   id="submit-application-btn"
                 >
                   <Send size={14} className="mr-1.5" />
-                  Submit Formal Application
+                  {existingApplication ? 'Already Applied' : 'Submit Formal Application'}
                 </Button>
               </div>
             </form>

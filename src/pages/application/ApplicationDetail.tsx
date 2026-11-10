@@ -1,20 +1,21 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { doc, getDoc } from 'firebase/firestore'
+import { doc, getDoc, updateDoc } from 'firebase/firestore'
 import {
   ArrowLeft, CheckCircle2, Clock, FileText, ExternalLink,
-  MessageSquare, Sparkles, Building, User, Calendar, GraduationCap,
-  Award, Globe, Check, AlertCircle, X, ChevronRight, FileCheck, ShieldAlert
+  MessageSquare, Sparkles, Building, Calendar, GraduationCap,
+  Award, Globe, Check, AlertCircle, X, FileCheck, ShieldAlert
 } from 'lucide-react'
-import { db, isDemoMode } from '@/lib/firebase'
+import { db } from '@/lib/firebase'
 import { useAuth } from '@/context/AuthContext'
 import type { Application, ApplicationStatus } from '@/types/application.types'
-import type { StudentProfile } from '@/types/user.types'
+import type { StudentProfile, ProfessorProfile } from '@/types/user.types'
+import type { Position } from '@/types/position.types'
+import { computeMatch } from '@/lib/matching'
 import { Button } from '@/components/common/Button'
 import { Avatar } from '@/components/common/Avatar'
 import { MatchScoreBadge, MatchBreakdownPanel } from '@/components/matching/MatchScore'
 import { STATUS_LABELS, formatDate } from '@/utils/helpers'
-import { DEMO_PROFESSOR_APPLICATIONS, DEMO_APPLICANT_PROFILES, DEMO_APPLICATIONS } from '@/lib/demoData'
 
 const ALL_STATUSES: ApplicationStatus[] = [
   'submitted',
@@ -35,162 +36,208 @@ const STATUS_PILL_STYLES: Record<string, string> = {
 
 export default function ApplicationDetail() {
   const { applicationId } = useParams<{ applicationId: string }>()
-  const { user, role } = useAuth()
+  const { user, role, loading: authLoading } = useAuth()
   const navigate = useNavigate()
 
   const [app, setApp] = useState<Application | null>(null)
-  const [candidateProfile, setCandidateProfile] = useState<Partial<StudentProfile> | null>(null)
+  const [candidateProfile, setCandidateProfile] = useState<StudentProfile | null>(null)
+  const [position, setPosition] = useState<Position | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [notFound, setNotFound] = useState(false)
+  const [unauthorized, setUnauthorized] = useState(false)
   const [isUpdating, setIsUpdating] = useState(false)
   const [statusNote, setStatusNote] = useState('')
   const [selectedNewStatus, setSelectedNewStatus] = useState<ApplicationStatus | null>(null)
   const [showNoteModal, setShowNoteModal] = useState(false)
   const [successToast, setSuccessToast] = useState<string | null>(null)
+  const [updateError, setUpdateError] = useState<string | null>(null)
+  const isUpdatingRef = useRef(false)
 
-  // Faculty verification status
-  const [profVerificationStatus, setProfVerificationStatus] = useState<string>(() => {
-    if (role === 'professor') {
-      const savedVerifications = localStorage.getItem('rm_demo_verifications')
-      if (savedVerifications) {
-        try {
-          const list = JSON.parse(savedVerifications)
-          const myRecord = list.find((item: any) =>
-            (user && (item.userId === user.uid || (item.applicantEmail && user.email && item.applicantEmail.toLowerCase() === user.email.toLowerCase()))) ||
-            (!user && item.userId === 'demo-1')
-          )
-          if (myRecord) return myRecord.status
-        } catch {}
-      }
-      const savedProf = localStorage.getItem('rm_demo_professor_profile')
-      if (savedProf) {
-        try {
-          const p = JSON.parse(savedProf)
-          if (p.verificationStatus) return p.verificationStatus
-        } catch {}
-      }
-    }
-    return 'verified'
-  })
+  // Faculty verification status (defaults to pending until confirmed from Firestore)
+  const [profVerificationStatus, setProfVerificationStatus] = useState<string>('pending')
 
-  // 1. Load Application
   useEffect(() => {
-    if (!applicationId) return
+    if (authLoading) return
+    let isMounted = true
 
-    // Priority A: Check localStorage
-    const savedApps = localStorage.getItem('rm_demo_applications')
-    if (savedApps) {
+    async function loadApplicationData() {
+      if (!applicationId || !user) {
+        if (isMounted) setLoading(false)
+        return
+      }
+
+      if (isMounted) {
+        setLoading(true)
+        setNotFound(false)
+        setUnauthorized(false)
+        setApp(null)
+        setCandidateProfile(null)
+        setPosition(null)
+      }
+
       try {
-        const parsed: Application[] = JSON.parse(savedApps)
-        const found = parsed.find(
-          (a) =>
-            a.id === applicationId ||
-            (applicationId === 'app1' && a.id === 'app-101') ||
-            (applicationId === 'app-101' && a.id === 'app1')
-        )
-        if (found) {
-          setApp(found)
-          resolveCandidateProfile(found.studentId)
+        let currentProfStatus = 'pending'
+        if (role === 'professor') {
+          const profSnap = await getDoc(doc(db, 'professors', user.uid))
+          if (!isMounted) return
+          if (profSnap.exists()) {
+            const profData = profSnap.data() as ProfessorProfile
+            currentProfStatus = profData.verificationStatus || 'pending'
+          }
+          setProfVerificationStatus(currentProfStatus)
+          if (currentProfStatus !== 'verified') {
+            return
+          }
+        }
+
+        const snap = await getDoc(doc(db, 'applications', applicationId))
+        if (!isMounted) return
+
+        if (!snap.exists()) {
+          setNotFound(true)
           return
         }
-      } catch (e) {
-        console.warn('Error reading rm_demo_applications', e)
-      }
-    }
 
-    // Priority B: Check static demo applications
-    const demoFound =
-      DEMO_PROFESSOR_APPLICATIONS.find(
-        (a) => a.id === applicationId || (applicationId === 'app1' && a.id === 'app-101')
-      ) || DEMO_APPLICATIONS.find((a) => a.id === applicationId)
-    if (demoFound) {
-      setApp(demoFound)
-      resolveCandidateProfile(demoFound.studentId)
-      return
-    }
+        const data = { ...(snap.data() as Application), id: snap.id }
 
-    // Priority C: Firebase Firestore fallback
-    async function fetchFromFirebase() {
-      try {
-        const snap = await getDoc(doc(db, 'applications', applicationId!))
-        if (snap.exists()) {
-          const data = { id: snap.id, ...snap.data() } as Application
-          setApp(data)
-          resolveCandidateProfile(data.studentId)
-        } else {
-          // Default fallback to first demo application
-          setApp(DEMO_PROFESSOR_APPLICATIONS[0])
-          resolveCandidateProfile(DEMO_PROFESSOR_APPLICATIONS[0].studentId)
+        // Enforce positive ownership allowlist
+        const isOwner =
+          (role === 'student' && data.studentId === user.uid) ||
+          (role === 'professor' && data.professorId === user.uid) ||
+          role === 'admin'
+
+        if (!isOwner) {
+          setUnauthorized(true)
+          return
         }
-      } catch {
-        setApp(DEMO_PROFESSOR_APPLICATIONS[0])
-        resolveCandidateProfile(DEMO_PROFESSOR_APPLICATIONS[0].studentId)
+
+        setApp(data)
+
+        const [studentSnap, positionSnap] = await Promise.all([
+          data.studentId ? getDoc(doc(db, 'students', data.studentId)) : Promise.resolve(null),
+          data.positionId ? getDoc(doc(db, 'positions', data.positionId)) : Promise.resolve(null),
+        ])
+
+        if (!isMounted) return
+
+        if (studentSnap && studentSnap.exists()) {
+          const studentData = studentSnap.data() as StudentProfile
+          setCandidateProfile({
+            ...studentData,
+            uid: studentData.uid || studentSnap.id,
+            researchInterests: Array.isArray(studentData.researchInterests) ? studentData.researchInterests : [],
+            researchAreas: Array.isArray(studentData.researchAreas) ? studentData.researchAreas : [],
+            researchExperience: Array.isArray(studentData.researchExperience) ? studentData.researchExperience : [],
+            projects: Array.isArray(studentData.projects) ? studentData.projects : [],
+            publications: Array.isArray(studentData.publications) ? studentData.publications : [],
+            programmingLanguages: Array.isArray(studentData.programmingLanguages) ? studentData.programmingLanguages : [],
+            frameworks: Array.isArray(studentData.frameworks) ? studentData.frameworks : [],
+            technicalSkills: Array.isArray(studentData.technicalSkills) ? studentData.technicalSkills : [],
+            researchTools: Array.isArray(studentData.researchTools) ? studentData.researchTools : [],
+            languageScores: Array.isArray(studentData.languageScores) ? studentData.languageScores : [],
+          })
+        }
+
+        if (positionSnap && positionSnap.exists()) {
+          const posData = positionSnap.data() as Position
+          setPosition({
+            ...posData,
+            id: positionSnap.id,
+            requiredSkills: Array.isArray(posData.requiredSkills) ? posData.requiredSkills : [],
+            preferredSkills: Array.isArray(posData.preferredSkills) ? posData.preferredSkills : [],
+          })
+        }
+      } catch (err) {
+        console.error('Error loading application detail from Firestore:', err)
+        if (isMounted) setNotFound(true)
+      } finally {
+        if (isMounted) setLoading(false)
       }
     }
 
-    fetchFromFirebase()
-  }, [applicationId])
-
-  const resolveCandidateProfile = (studentId?: string) => {
-    if (!studentId) return
-
-    // Check localStorage student profile if same user
-    const localStudent = localStorage.getItem('rm_demo_student_profile')
-    if (localStudent && (studentId === 'demo-student' || studentId === 'student-1')) {
-      try {
-        setCandidateProfile(JSON.parse(localStudent))
-        return
-      } catch (e) {
-        // pass
-      }
+    loadApplicationData()
+    return () => {
+      isMounted = false
     }
+  }, [applicationId, user, role, authLoading])
 
-    if (DEMO_APPLICANT_PROFILES[studentId]) {
-      setCandidateProfile(DEMO_APPLICANT_PROFILES[studentId])
+  const matchedKeywords = useMemo(() => {
+    if (candidateProfile && position) {
+      return computeMatch(candidateProfile, position).matchedKeywords
     }
-  }
+    return []
+  }, [candidateProfile, position])
 
-  // 2. Status Update Handler
   const handleInitiateStatusChange = (newStatus: ApplicationStatus) => {
+    if (app && app.status === newStatus) return
     setSelectedNewStatus(newStatus)
     setStatusNote('')
+    setUpdateError(null)
     setShowNoteModal(true)
   }
 
-  const handleConfirmStatusChange = () => {
-    if (!app || !selectedNewStatus) return
+  const handleConfirmStatusChange = async () => {
+    if (isUpdatingRef.current) return
+    if (!app || !selectedNewStatus || !user) return
+    if (app.status === selectedNewStatus) {
+      setShowNoteModal(false)
+      return
+    }
+    if (role !== 'professor' || profVerificationStatus !== 'verified' || app.professorId !== user.uid) {
+      setUpdateError('Only verified faculty who own this position may update candidate application status.')
+      return
+    }
 
+    isUpdatingRef.current = true
     setIsUpdating(true)
+    setUpdateError(null)
+
+    const now = new Date().toISOString()
     const newNote = statusNote.trim() || `Status updated to ${STATUS_LABELS[selectedNewStatus]}`
     const updatedHistory = [
-      ...app.statusHistory,
+      ...(app.statusHistory || []),
       {
         status: selectedNewStatus,
-        changedAt: new Date().toISOString(),
+        changedAt: now,
         note: newNote,
       },
     ]
 
-    const updatedApp: Application = {
-      ...app,
-      status: selectedNewStatus,
-      statusHistory: updatedHistory,
-      updatedAt: new Date().toISOString(),
+    try {
+      await updateDoc(doc(db, 'applications', app.id), {
+        status: selectedNewStatus,
+        statusHistory: updatedHistory,
+        updatedAt: now,
+      })
+
+      setApp({
+        ...app,
+        status: selectedNewStatus,
+        statusHistory: updatedHistory,
+        updatedAt: now,
+      })
+      setShowNoteModal(false)
+      setSuccessToast(`Application marked as "${STATUS_LABELS[selectedNewStatus]}"`)
+      setTimeout(() => setSuccessToast(null), 3500)
+    } catch (err) {
+      console.error('Failed to update application status in Firestore:', err)
+      setUpdateError('Failed to save application status update. Please try again.')
+    } finally {
+      isUpdatingRef.current = false
+      setIsUpdating(false)
     }
-
-    setApp(updatedApp)
-
-    // Save to localStorage
-    const savedAppsStr = localStorage.getItem('rm_demo_applications')
-    let allApps: Application[] = savedAppsStr ? JSON.parse(savedAppsStr) : [...DEMO_PROFESSOR_APPLICATIONS]
-    allApps = allApps.map(a => a.id === updatedApp.id ? updatedApp : a)
-    localStorage.setItem('rm_demo_applications', JSON.stringify(allApps))
-
-    setShowNoteModal(false)
-    setIsUpdating(false)
-    setSuccessToast(`Application marked as "${STATUS_LABELS[selectedNewStatus]}"`)
-    setTimeout(() => setSuccessToast(null), 3500)
   }
 
   const isProf = role === 'professor'
+
+  if (authLoading || loading) {
+    return (
+      <div className="min-h-screen pt-28 pb-20 px-4 text-center">
+        <div className="animate-spin w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full mx-auto mb-4" />
+        <p className="text-sm text-slate-500">Loading candidate application dossier...</p>
+      </div>
+    )
+  }
 
   // Restrict access for unverified faculty
   if (isProf && profVerificationStatus !== 'verified') {
@@ -226,11 +273,48 @@ export default function ApplicationDetail() {
     )
   }
 
-  if (!app) {
+  if (unauthorized) {
     return (
-      <div className="min-h-screen pt-28 pb-20 px-4 text-center">
-        <div className="animate-spin w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full mx-auto mb-4" />
-        <p className="text-sm text-slate-500">Loading candidate application dossier...</p>
+      <div className="min-h-screen bg-slate-50/70 pt-24 pb-20 px-4 sm:px-6">
+        <div className="max-w-xl mx-auto bg-white rounded-3xl border border-slate-200/80 p-8 sm:p-10 text-center shadow-xs space-y-5">
+          <div className="w-16 h-16 rounded-2xl bg-rose-50 border border-rose-200 flex items-center justify-center mx-auto text-rose-600">
+            <ShieldAlert size={32} />
+          </div>
+          <h2 className="text-xl sm:text-2xl font-bold font-display text-slate-900 tracking-tight">
+            Access Restricted
+          </h2>
+          <p className="text-slate-600 text-xs sm:text-sm leading-relaxed max-w-md mx-auto">
+            You do not have permission to view this application dossier. Only the submitting student and the professor who owns this position may view it.
+          </p>
+          <div className="pt-3 flex items-center justify-center">
+            <Button variant="secondary" onClick={() => navigate(isProf ? '/dashboard/professor' : '/applications')} className="text-xs">
+              Return to {isProf ? 'Professor Dashboard' : 'My Applications'}
+            </Button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  if (notFound || !app) {
+    return (
+      <div className="min-h-screen bg-slate-50/70 pt-24 pb-20 px-4 sm:px-6">
+        <div className="max-w-xl mx-auto bg-white rounded-3xl border border-slate-200/80 p-8 sm:p-10 text-center shadow-xs space-y-5">
+          <div className="w-16 h-16 rounded-2xl bg-slate-100 border border-slate-200 flex items-center justify-center mx-auto text-slate-500">
+            <AlertCircle size={32} />
+          </div>
+          <h2 className="text-xl sm:text-2xl font-bold font-display text-slate-900 tracking-tight">
+            Application Not Found
+          </h2>
+          <p className="text-slate-600 text-xs sm:text-sm leading-relaxed max-w-md mx-auto">
+            The requested application dossier could not be found in the database.
+          </p>
+          <div className="pt-3 flex items-center justify-center">
+            <Button variant="secondary" onClick={() => navigate(isProf ? '/dashboard/professor' : '/applications')} className="text-xs">
+              Return to {isProf ? 'Professor Dashboard' : 'My Applications'}
+            </Button>
+          </div>
+        </div>
       </div>
     )
   }
@@ -242,11 +326,11 @@ export default function ApplicationDetail() {
         {/* Back button & Toast */}
         <div className="flex items-center justify-between">
           <button
-            onClick={() => navigate(isProf ? '/dashboard/professor' : '/dashboard/student')}
+            onClick={() => navigate(isProf ? '/dashboard/professor' : '/applications')}
             className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-slate-900 transition-colors py-1 px-2.5 rounded-lg hover:bg-slate-200/60"
           >
             <ArrowLeft size={14} />
-            Back to {isProf ? 'Professor Dashboard' : 'Student Dashboard'}
+            Back to {isProf ? 'Professor Dashboard' : 'My Applications'}
           </button>
 
           {successToast && (
@@ -303,7 +387,7 @@ export default function ApplicationDetail() {
                 className="border-slate-200 text-slate-700 hover:bg-slate-50 text-xs font-medium"
               >
                 <MessageSquare size={14} className="mr-1.5 text-blue-600" />
-                Message Student
+                {isProf ? 'Message Student' : 'Message Lab'}
               </Button>
             </div>
           </div>
@@ -460,17 +544,17 @@ export default function ApplicationDetail() {
                     {candidateProfile?.university || app.university}
                   </p>
                   <p className="text-slate-600 mt-0.5">
-                    {candidateProfile?.major || 'Computer Science'} • {candidateProfile?.degree || 'Bachelor'}
+                    {candidateProfile?.major || 'Not specified'} • {candidateProfile?.degree || 'Not specified'}
                   </p>
                 </div>
 
                 <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-100">
                   <span className="text-slate-400 block mb-0.5">Graduation Timeline</span>
                   <p className="font-semibold text-slate-900 text-sm">
-                    {candidateProfile?.expectedGraduation ? `Graduating ${candidateProfile.expectedGraduation}` : 'Completed'}
+                    {candidateProfile?.expectedGraduation ? `Graduating ${candidateProfile.expectedGraduation}` : 'Not specified'}
                   </p>
                   <p className="text-slate-600 mt-0.5">
-                    {candidateProfile?.currentSemester || 'Senior Undergraduate'}
+                    {candidateProfile?.currentSemester || 'Not specified'}
                   </p>
                 </div>
               </div>
@@ -642,7 +726,7 @@ export default function ApplicationDetail() {
                       score: app.matchScore,
                       breakdown: app.matchBreakdown,
                       explanation: app.matchExplanation,
-                      matchedKeywords: ['Medical Vision', 'Deep Learning', 'PyTorch']
+                      matchedKeywords,
                     }}
                   />
                 </div>
@@ -656,7 +740,7 @@ export default function ApplicationDetail() {
               </h4>
 
               <div className="space-y-4 relative before:absolute before:top-2 before:bottom-2 before:left-2.5 before:w-0.5 before:bg-slate-200">
-                {app.statusHistory.map((item, i) => (
+                {(app.statusHistory || []).map((item, i) => (
                   <div key={i} className="flex items-start gap-3 relative pl-6">
                     <div className="absolute left-1.5 top-1 -translate-x-1/2 w-2.5 h-2.5 rounded-full bg-blue-600 ring-4 ring-white" />
                     <div className="text-xs space-y-0.5">
@@ -703,6 +787,13 @@ export default function ApplicationDetail() {
             <p className="text-xs text-slate-600">
               You are updating {app.studentName}'s application for <strong>{app.positionTitle}</strong>. You may optionally add an evaluation note for your lab records.
             </p>
+
+            {updateError && (
+              <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs flex items-center gap-2">
+                <AlertCircle size={14} className="shrink-0" />
+                <span>{updateError}</span>
+              </div>
+            )}
 
             <div className="space-y-1.5">
               <label className="text-xs font-semibold text-slate-700">

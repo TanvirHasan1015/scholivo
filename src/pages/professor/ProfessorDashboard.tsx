@@ -1,30 +1,26 @@
 import { useState, useEffect, useMemo } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { collection, getDocs, query, where } from 'firebase/firestore'
+import { collection, doc, getDoc, getDocs, updateDoc, query, where } from 'firebase/firestore'
 import {
   Users, Briefcase, Plus, CheckCircle2, Clock,
-  MessageSquare, Eye, Calendar, Sparkles, Building,
+  Sparkles, Building,
   GraduationCap, ArrowUpRight, ChevronRight, Filter,
-  Settings, Award, ShieldCheck, Check, AlertCircle, FileText,
+  Settings, Award, ShieldCheck, AlertCircle, FileText,
   X, ExternalLink, BookOpen, Code
 } from 'lucide-react'
-import { db, isDemoMode } from '@/lib/firebase'
+import { db } from '@/lib/firebase'
 import { useAuth } from '@/context/AuthContext'
 import type { Position } from '@/types/position.types'
 import type { Application, ApplicationStatus } from '@/types/application.types'
-import type { StudentProfile } from '@/types/user.types'
+import type { ProfessorProfile, StudentProfile } from '@/types/user.types'
 import type { MatchResult } from '@/types/match.types'
-import {
-  DEMO_PROFESSORS,
-  DEMO_PROFESSOR_APPLICATIONS,
-  DEMO_VERIFIED_STUDENTS,
-  type ProfessorWithPositions
-} from '@/lib/demoData'
 import { computeMatch } from '@/lib/matching'
 import { Button } from '@/components/common/Button'
 import { Avatar } from '@/components/common/Avatar'
 import { MatchChip, MatchBreakdownPanel } from '@/components/matching/MatchScore'
-import { STATUS_LABELS, FUNDING_LABELS, formatRelativeDate } from '@/utils/helpers'
+import { STATUS_LABELS, formatRelativeDate } from '@/utils/helpers'
+
+type ProfessorWithPositions = ProfessorProfile & { positions: Position[] }
 
 const STATUS_PILL_STYLES: Record<string, string> = {
   submitted: 'bg-blue-50 text-blue-700 border-blue-200',
@@ -32,7 +28,7 @@ const STATUS_PILL_STYLES: Record<string, string> = {
   shortlisted: 'bg-emerald-50 text-emerald-700 border-emerald-200',
   interview: 'bg-purple-50 text-purple-700 border-purple-200',
   accepted: 'bg-teal-50 text-teal-700 border-teal-200',
-  rejected: 'bg-rose-50 text-rose-700 border-rose-200',
+  rejected: 'bg-rose-700/10 text-rose-700 border-rose-200',
 }
 
 export interface CandidateMatch {
@@ -40,161 +36,70 @@ export interface CandidateMatch {
   matchResult: MatchResult
 }
 
-// Built-in second active position for demo professor to ensure multi-position switching is testable
-const DEFAULT_SECOND_POSITION: Position = {
-  id: 'p2',
-  professorId: 'demo-1',
-  professorName: 'Prof. Minji Kim',
-  professorTitle: 'Associate Professor',
-  university: 'KAIST',
-  department: 'School of Computing',
-  country: 'South Korea',
-  title: "Master's Position — 3D Vision & Autonomous Driving",
-  degreeType: 'Master',
-  description: 'Research opening for Master students in 3D perception, LiDAR point cloud processing, and autonomous driving.',
-  researchArea: 'Computer Vision',
-  researchTopics: ['3D Vision', 'Autonomous Driving', 'SLAM', 'Point Cloud', 'Deep Learning'],
-  requiredSkills: ['Python', 'C++', 'PyTorch', 'Computer Vision'],
-  preferredSkills: ['CUDA', 'ROS', 'Point Cloud Processing'],
-  minimumGPA: 3.5,
-  gpaScale: 4.0,
-  languageRequirements: [{ type: 'IELTS', minimumScore: '6.5' }],
-  otherRequirements: 'Strong background in 3D geometry and perception systems.',
-  fundingType: 'fully_funded',
-  stipend: 'KRW 1,300,000/month',
-  applicationDeadline: '2026-12-15',
-  startDate: 'Spring 2027',
-  isOpen: true,
-  createdAt: '2026-02-01',
-  updatedAt: '2026-03-01',
-}
-
-function resolveStudentVerificationStatus(student: StudentProfile): {
-  verificationStatus: string
-  accountStatus: string
-} {
-  let vStatus = student.verificationStatus || 'unverified'
-  let aStatus = student.accountStatus || 'active'
-
-  // 1. Check rm_demo_system_users (Admin updates in demo mode)
-  const sysUsersStr = localStorage.getItem('rm_demo_system_users')
-  if (sysUsersStr) {
-    try {
-      const sysUsers = JSON.parse(sysUsersStr)
-      const found = sysUsers.find(
-        (u: any) =>
-          u.uid === student.uid ||
-          (u.email && student.email && u.email.toLowerCase() === student.email.toLowerCase())
-      )
-      if (found) {
-        if (found.verificationStatus) vStatus = found.verificationStatus
-        if (found.accountStatus) aStatus = found.accountStatus
-        return { verificationStatus: vStatus, accountStatus: aStatus }
-      }
-    } catch { }
+function createInitialProfessorProfile(uid = '', email = '', displayName = '', photoURL?: string): ProfessorWithPositions {
+  const now = new Date().toISOString()
+  return {
+    uid,
+    fullName: displayName || 'Faculty Member',
+    username: email ? email.split('@')[0].toLowerCase().replace(/[^a-z0-9]/g, '') : '',
+    email,
+    academicTitle: 'Associate Professor',
+    country: 'South Korea',
+    photoURL,
+    university: '',
+    department: '',
+    faculty: '',
+    biography: '',
+    researchAreas: [],
+    researchInterests: [],
+    currentProjects: [],
+    publications: [],
+    verificationStatus: 'pending',
+    verificationDocuments: [],
+    accountStatus: 'active',
+    isRecruiting: true,
+    recruitingStatus: 'actively_recruiting',
+    createdAt: now,
+    updatedAt: now,
+    positions: [],
   }
-
-  // 2. Check rm_demo_verifications (Verification requests updated by admin)
-  const verifsStr = localStorage.getItem('rm_demo_verifications')
-  if (verifsStr) {
-    try {
-      const verifs = JSON.parse(verifsStr)
-      const found = verifs.find(
-        (v: any) =>
-          v.userId === student.uid ||
-          (v.userEmail && student.email && v.userEmail.toLowerCase() === student.email.toLowerCase())
-      )
-      if (found) {
-        if (found.status) vStatus = found.status
-        if (found.accountStatus) aStatus = found.accountStatus
-        return { verificationStatus: vStatus, accountStatus: aStatus }
-      }
-    } catch { }
-  }
-
-  return { verificationStatus: vStatus, accountStatus: aStatus }
 }
 
 export default function ProfessorDashboard() {
   const { user } = useAuth()
   const navigate = useNavigate()
 
-  // Default demo professor: Prof. Minji Kim
-  const defaultProf = DEMO_PROFESSORS[0]
-  const defaultPositions = defaultProf.positions.some((p) => p.id === 'p2')
-    ? defaultProf.positions
-    : [...defaultProf.positions, DEFAULT_SECOND_POSITION]
-
-  const [profile, setProfile] = useState<ProfessorWithPositions>(() => {
-    const local = localStorage.getItem('rm_demo_professor_profile')
-    if (local) {
-      try {
-        return JSON.parse(local)
-      } catch {
-        // fallback
-      }
-    }
-    return defaultProf
-  })
-
-  const [positions, setPositions] = useState<Position[]>(() => {
-    const local = localStorage.getItem('rm_demo_positions')
-    if (local) {
-      try {
-        const parsed: Position[] = JSON.parse(local)
-        if (parsed.length > 0) return parsed
-      } catch {
-        // fallback
-      }
-    }
-    return defaultPositions
-  })
-
-  const [applications, setApplications] = useState<Application[]>(() => {
-    const local = localStorage.getItem('rm_demo_applications')
-    if (local) {
-      try {
-        return JSON.parse(local)
-      } catch {
-        // fallback
-      }
-    }
-    return DEMO_PROFESSOR_APPLICATIONS
-  })
+  const [profile, setProfile] = useState<ProfessorWithPositions>(() =>
+    createInitialProfessorProfile(user?.uid || '', user?.email || '', user?.displayName || '', user?.photoURL || undefined)
+  )
+  const [positions, setPositions] = useState<Position[]>([])
+  const [applications, setApplications] = useState<Application[]>([])
+  const [verifiedStudents, setVerifiedStudents] = useState<StudentProfile[]>([])
+  const [loading, setLoading] = useState(true)
 
   const [selectedStatusFilter, setSelectedStatusFilter] = useState<string>('all')
-  const [isRecruiting, setIsRecruiting] = useState<boolean>(() => {
-    const local = localStorage.getItem('rm_demo_is_recruiting')
-    return local !== null ? local === 'true' : true
-  })
+  const [isRecruiting, setIsRecruiting] = useState<boolean>(true)
 
   // Ensure only positions owned by the logged-in professor are selectable
-  const currentProfessorId = user?.uid || profile?.uid || defaultProf.uid
+  const currentProfessorId = user?.uid || profile?.uid || ''
   const ownedPositions = useMemo(() => {
+    if (!currentProfessorId) return []
     return positions.filter(
       (p) => Boolean(p.professorId) && p.professorId === currentProfessorId
     )
   }, [positions, currentProfessorId])
 
-  // Opportunity selection state (defaults to professor's first active position)
-  const [selectedPositionId, setSelectedPositionId] = useState<string>(() => {
-    const active = ownedPositions.filter((p) => p.isOpen)
-    return active[0]?.id || ownedPositions[0]?.id || ''
-  })
-
-  useEffect(() => {
-    if (ownedPositions.length > 0) {
-      if (!selectedPositionId || !ownedPositions.some((p) => p.id === selectedPositionId)) {
-        const active = ownedPositions.filter((p) => p.isOpen)
-        setSelectedPositionId(active[0]?.id || ownedPositions[0]?.id || '')
-      }
-    } else {
-      setSelectedPositionId('')
-    }
-  }, [ownedPositions, selectedPositionId])
+  // Opportunity selection state (derived fallback to professor's first active position)
+  const [selectedPositionId, setSelectedPositionId] = useState<string>('')
 
   const selectedPosition = useMemo(() => {
-    return ownedPositions.find((p) => p.id === selectedPositionId) || ownedPositions[0] || null
+    if (ownedPositions.length === 0) return null
+    if (selectedPositionId) {
+      const explicit = ownedPositions.find((p) => p.id === selectedPositionId)
+      if (explicit) return explicit
+    }
+    const active = ownedPositions.filter((p) => p.isOpen)
+    return active[0] || ownedPositions[0] || null
   }, [ownedPositions, selectedPositionId])
 
   // Opportunity-specific applicants (strictly isolated to selected position)
@@ -208,29 +113,25 @@ export default function ProfessorDashboard() {
     return positionApplications.filter((a) => a.status === selectedStatusFilter)
   }, [selectedStatusFilter, positionApplications])
 
-  // Opportunity-specific recommended non-applicants (recalculated whenever selectedPosition or applications change)
+  // Opportunity-specific recommended non-applicants (recalculated whenever selectedPosition, applications, or verifiedStudents change)
   const recommendedCandidates: CandidateMatch[] = useMemo(() => {
     if (!selectedPosition) return []
 
-    // Existing applicants for this position
     const appliedStudentIds = new Set(
       applications
         .filter((a) => a.positionId === selectedPosition.id)
         .map((a) => a.studentId)
     )
 
-    // Filter candidate pool from DEMO_VERIFIED_STUDENTS
-    const eligible = DEMO_VERIFIED_STUDENTS.filter((student) => {
+    const eligible = verifiedStudents.filter((student) => {
       if (!student || !student.uid) return false
-      // Candidate must not have applied to this specific opportunity
       if (appliedStudentIds.has(student.uid)) return false
-
-      // Check live verification status and active account status
-      const { verificationStatus, accountStatus } = resolveStudentVerificationStatus(student)
-      return verificationStatus === 'verified' && accountStatus === 'active'
+      return (
+        student.verificationStatus === 'verified' &&
+        (student.accountStatus || 'active') === 'active'
+      )
     })
 
-    // Calculate computeMatch and sort descending by score
     const scored: CandidateMatch[] = eligible.map((student) => ({
       student,
       matchResult: computeMatch(student, selectedPosition),
@@ -238,35 +139,27 @@ export default function ProfessorDashboard() {
 
     scored.sort((a, b) => b.matchResult.score - a.matchResult.score)
     return scored
-  }, [selectedPosition, applications])
+  }, [selectedPosition, applications, verifiedStudents])
 
   // Candidate Profile & Match Analysis Modal State
   const [selectedCandidateId, setSelectedCandidateId] = useState<string | null>(null)
+
+  const handleSelectPosition = (positionId: string) => {
+    setSelectedPositionId(positionId)
+    setSelectedCandidateId(null)
+  }
 
   // Only resolve modal candidate if they are currently present in recommendedCandidates
   const activeCandidateMatch = useMemo(() => {
     if (!selectedCandidateId || !selectedPosition) return null
     const found = recommendedCandidates.find((c) => c.student.uid === selectedCandidateId)
     if (!found) return null
-    // Recompute match dynamically against currently selected position to ensure fresh data
     const freshMatchResult = computeMatch(found.student, selectedPosition)
     return {
       student: found.student,
       matchResult: freshMatchResult,
     }
   }, [selectedCandidateId, selectedPosition, recommendedCandidates])
-
-  // Automatically close modal if candidate is no longer recommended
-  useEffect(() => {
-    if (selectedCandidateId && !activeCandidateMatch) {
-      setSelectedCandidateId(null)
-    }
-  }, [selectedCandidateId, activeCandidateMatch])
-
-  // Reset modal selection when opportunity switches
-  useEffect(() => {
-    setSelectedCandidateId(null)
-  }, [selectedPositionId])
 
   // Handle Escape key and body scroll lock for modal
   useEffect(() => {
@@ -289,91 +182,160 @@ export default function ProfessorDashboard() {
   }, [activeCandidateMatch])
 
   useEffect(() => {
-    if (isDemoMode) {
-      // Sync from local storage
-      const localProf = localStorage.getItem('rm_demo_professor_profile')
-      if (localProf) {
-        try { setProfile(JSON.parse(localProf)) } catch { }
-      }
-      const localPos = localStorage.getItem('rm_demo_positions')
-      if (localPos) {
-        try { setPositions(JSON.parse(localPos)) } catch { }
-      }
-      const localApps = localStorage.getItem('rm_demo_applications')
-      if (localApps) {
-        try { setApplications(JSON.parse(localApps)) } catch { }
-      }
-      const savedVerifications = localStorage.getItem('rm_demo_verifications')
-      if (savedVerifications) {
-        try {
-          const list = JSON.parse(savedVerifications)
-          const myRecord = list.find((item: any) =>
-            (user && (item.userId === user.uid || (item.applicantEmail && user.email && item.applicantEmail.toLowerCase() === user.email.toLowerCase()))) ||
-            (!user && item.userId === 'demo-1')
-          )
-          if (myRecord) {
-            setProfile((prev) => ({ ...prev, verificationStatus: myRecord.status }))
-          }
-        } catch { }
-      }
-      return
-    }
+    let isMounted = true
 
-    if (!user) return
     async function loadData() {
+      if (!user) {
+        if (isMounted) setLoading(false)
+        return
+      }
+
       try {
-        const posQ = query(collection(db, 'positions'), where('professorId', '==', user?.uid))
-        const posSnap = await getDocs(posQ)
-        if (!posSnap.empty) {
-          const list: Position[] = []
-          posSnap.forEach((d) => list.push({ id: d.id, ...d.data() } as Position))
-          setPositions(list)
+        const [profSnap, posSnap, appSnap, studentsSnap] = await Promise.all([
+          getDoc(doc(db, 'professors', user.uid)),
+          getDocs(query(collection(db, 'positions'), where('professorId', '==', user.uid))),
+          getDocs(query(collection(db, 'applications'), where('professorId', '==', user.uid))),
+          getDocs(query(collection(db, 'students'), where('verificationStatus', '==', 'verified'))),
+        ])
+
+        if (!isMounted) return
+
+        const posList: Position[] = posSnap.docs.map(
+          (d) => ({ ...(d.data() as Position), id: d.id })
+        )
+        setPositions(posList)
+
+        if (profSnap.exists()) {
+          const profData = profSnap.data() as ProfessorProfile
+          const mergedProf: ProfessorWithPositions = {
+            ...createInitialProfessorProfile(
+              user.uid,
+              user.email || '',
+              user.displayName || '',
+              user.photoURL || undefined
+            ),
+            ...profData,
+            uid: profData.uid || user.uid,
+            researchAreas: Array.isArray(profData.researchAreas) ? profData.researchAreas : [],
+            researchInterests: Array.isArray(profData.researchInterests) ? profData.researchInterests : [],
+            currentProjects: Array.isArray(profData.currentProjects) ? profData.currentProjects : [],
+            publications: Array.isArray(profData.publications) ? profData.publications : [],
+            verificationStatus: profData.verificationStatus || 'pending',
+            positions: posList,
+          }
+          setProfile(mergedProf)
+          setIsRecruiting(
+            typeof profData.isRecruiting === 'boolean'
+              ? profData.isRecruiting
+              : (profData.recruitingStatus || 'actively_recruiting') === 'actively_recruiting'
+          )
+        } else {
+          setProfile((prev) => ({ ...prev, positions: posList }))
         }
 
-        const appQ = query(collection(db, 'applications'), where('professorId', '==', user?.uid))
-        const appSnap = await getDocs(appQ)
-        if (!appSnap.empty) {
-          const list: Application[] = []
-          appSnap.forEach((d) => list.push({ id: d.id, ...d.data() } as Application))
-          setApplications(list)
-        }
+        const appList: Application[] = appSnap.docs.map(
+          (d) => ({ ...(d.data() as Application), id: d.id })
+        )
+        setApplications(appList)
+
+        const studentList: StudentProfile[] = studentsSnap.docs.map((d) => {
+          const data = d.data() as StudentProfile
+          return {
+            ...data,
+            uid: data.uid || d.id,
+            researchInterests: Array.isArray(data.researchInterests) ? data.researchInterests : [],
+            researchAreas: Array.isArray(data.researchAreas) ? data.researchAreas : [],
+            researchExperience: Array.isArray(data.researchExperience) ? data.researchExperience : [],
+            projects: Array.isArray(data.projects) ? data.projects : [],
+            publications: Array.isArray(data.publications) ? data.publications : [],
+            programmingLanguages: Array.isArray(data.programmingLanguages) ? data.programmingLanguages : [],
+            frameworks: Array.isArray(data.frameworks) ? data.frameworks : [],
+            technicalSkills: Array.isArray(data.technicalSkills) ? data.technicalSkills : [],
+            researchTools: Array.isArray(data.researchTools) ? data.researchTools : [],
+            languageScores: Array.isArray(data.languageScores) ? data.languageScores : [],
+          }
+        })
+        setVerifiedStudents(studentList)
       } catch (err) {
-        console.error('Error fetching professor data:', err)
+        console.error('Error fetching professor dashboard data from Firestore:', err)
+      } finally {
+        if (isMounted) setLoading(false)
       }
     }
+
     loadData()
+    return () => {
+      isMounted = false
+    }
   }, [user])
 
-  const toggleRecruiting = () => {
+  const toggleRecruiting = async () => {
+    if (!user) return
     const next = !isRecruiting
+    const nextRecruitingStatus = next ? 'actively_recruiting' : 'not_recruiting'
+    const now = new Date().toISOString()
+
     setIsRecruiting(next)
-    localStorage.setItem('rm_demo_is_recruiting', String(next))
-    const updatedProf = { ...profile, isRecruiting: next }
-    setProfile(updatedProf)
-    localStorage.setItem('rm_demo_professor_profile', JSON.stringify(updatedProf))
+    setProfile((prev) => ({
+      ...prev,
+      isRecruiting: next,
+      recruitingStatus: nextRecruitingStatus,
+      updatedAt: now,
+    }))
+
+    try {
+      await updateDoc(doc(db, 'professors', user.uid), {
+        isRecruiting: next,
+        recruitingStatus: nextRecruitingStatus,
+        updatedAt: now,
+      })
+    } catch (err) {
+      console.error('Failed to update recruiting status in Firestore:', err)
+    }
   }
 
-  const handleStatusChange = (appId: string, newStatus: ApplicationStatus) => {
-    if ((profile.verificationStatus || 'verified') !== 'verified') {
+  const handleStatusChange = async (appId: string, newStatus: ApplicationStatus) => {
+    if (!user) return
+    if ((profile.verificationStatus || 'pending') !== 'verified') {
       alert('Faculty verification required to change candidate application stages.')
       return
     }
-    const updated = applications.map((app) => {
-      if (app.id === appId) {
-        return {
-          ...app,
-          status: newStatus,
-          statusHistory: [
-            ...app.statusHistory,
-            { status: newStatus, changedAt: new Date().toISOString(), note: `Updated to ${STATUS_LABELS[newStatus]}` },
-          ],
-          updatedAt: new Date().toISOString(),
-        }
-      }
-      return app
-    })
-    setApplications(updated)
-    localStorage.setItem('rm_demo_applications', JSON.stringify(updated))
+
+    const targetApp = applications.find((a) => a.id === appId)
+    if (!targetApp || targetApp.professorId !== user.uid || targetApp.status === newStatus) return
+
+    const previousApp = targetApp
+    const now = new Date().toISOString()
+    const nextHistory = [
+      ...(targetApp.statusHistory || []),
+      { status: newStatus, changedAt: now, note: `Updated to ${STATUS_LABELS[newStatus]}` },
+    ]
+
+    setApplications((prev) =>
+      prev.map((app) =>
+        app.id === appId
+          ? {
+              ...app,
+              status: newStatus,
+              statusHistory: nextHistory,
+              updatedAt: now,
+            }
+          : app
+      )
+    )
+
+    try {
+      await updateDoc(doc(db, 'applications', appId), {
+        status: newStatus,
+        statusHistory: nextHistory,
+        updatedAt: now,
+      })
+    } catch (err) {
+      console.error('Failed to update application status in Firestore:', err)
+      setApplications((prev) =>
+        prev.map((app) => (app.id === appId ? previousApp : app))
+      )
+    }
   }
 
   const stats = {
@@ -394,6 +356,19 @@ export default function ProfessorDashboard() {
     { id: 'accepted', label: 'Offered / Accepted', count: positionApplications.filter((a) => a.status === 'accepted').length },
   ]
 
+  const isVerifiedProfessor = (profile.verificationStatus || 'pending') === 'verified'
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-50/70 pt-8 pb-20 px-4 sm:px-6 lg:px-8 flex items-center justify-center">
+        <div className="text-center space-y-2">
+          <div className="w-8 h-8 rounded-full border-2 border-blue-600 border-t-transparent animate-spin mx-auto" />
+          <p className="text-sm text-slate-500 font-medium">Loading your faculty dashboard…</p>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="min-h-screen bg-slate-50/70 pt-8 pb-20 px-4 sm:px-6 lg:px-8">
       <div className="max-w-7xl mx-auto space-y-8">
@@ -404,14 +379,14 @@ export default function ProfessorDashboard() {
             <div className="flex items-center gap-2">
               <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-blue-50 border border-blue-200 text-blue-700 text-xs font-semibold">
                 <Sparkles size={13} className="text-blue-600" />
-                <span>Faculty Research Portal (Demonstration Mode)</span>
+                <span>Faculty Research Portal</span>
               </div>
-              <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold border ${(profile.verificationStatus || 'verified') === 'verified'
+              <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold border ${isVerifiedProfessor
                   ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
                   : 'bg-amber-50 text-amber-700 border-amber-200'
                 }`}>
-                <ShieldCheck size={13} className={(profile.verificationStatus || 'verified') === 'verified' ? 'text-emerald-600' : 'text-amber-600'} />
-                <span>{(profile.verificationStatus || 'verified') === 'verified' ? 'Verified Lab' : `Affiliation: ${profile.verificationStatus}`}</span>
+                <ShieldCheck size={13} className={isVerifiedProfessor ? 'text-emerald-600' : 'text-amber-600'} />
+                <span>{isVerifiedProfessor ? 'Verified Lab' : `Affiliation: ${profile.verificationStatus || 'pending'}`}</span>
               </span>
             </div>
 
@@ -538,7 +513,7 @@ export default function ProfessorDashboard() {
                 {ownedPositions.length > 0 && (
                   <Button
                     variant="secondary"
-                    onClick={() => setSelectedPositionId(ownedPositions[0].id)}
+                    onClick={() => handleSelectPosition(ownedPositions[0].id)}
                     className="text-xs font-semibold"
                     id="select-first-opportunity-btn"
                   >
@@ -582,7 +557,7 @@ export default function ProfessorDashboard() {
                         <select
                           id="position-switcher-select"
                           value={selectedPosition.id}
-                          onChange={(e) => setSelectedPositionId(e.target.value)}
+                          onChange={(e) => handleSelectPosition(e.target.value)}
                           className="bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-900 focus:border-blue-600 focus:bg-white outline-none cursor-pointer shadow-2xs transition-all max-w-[220px] truncate"
                         >
                           {ownedPositions.map((pos) => (
@@ -640,7 +615,7 @@ export default function ProfessorDashboard() {
                   </div>
 
                   {/* Pending Faculty Verification Alert */}
-                  {(profile.verificationStatus || 'verified') !== 'verified' && (
+                  {!isVerifiedProfessor && (
                     <div className="p-4 rounded-2xl bg-amber-50/90 border border-amber-200 text-amber-900 text-xs flex items-start gap-3 mb-6">
                       <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
                       <div>
@@ -725,8 +700,8 @@ export default function ProfessorDashboard() {
                               <select
                                 value={app.status}
                                 onChange={(e) => handleStatusChange(app.id, e.target.value as ApplicationStatus)}
-                                disabled={(profile.verificationStatus || 'verified') !== 'verified'}
-                                title={(profile.verificationStatus || 'verified') !== 'verified' ? 'Faculty verification required to change stage' : undefined}
+                                disabled={!isVerifiedProfessor}
+                                title={!isVerifiedProfessor ? 'Faculty verification required to change stage' : undefined}
                                 className="bg-white border border-slate-200 rounded-lg px-2.5 py-1 text-xs font-semibold text-slate-800 focus:border-blue-600 outline-none cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-slate-100"
                                 id={`change-status-${app.id}`}
                               >
@@ -930,7 +905,7 @@ export default function ProfessorDashboard() {
                   return (
                     <div
                       key={pos.id}
-                      onClick={() => setSelectedPositionId(pos.id)}
+                      onClick={() => handleSelectPosition(pos.id)}
                       className={`p-3.5 rounded-2xl border transition-all cursor-pointer group ${isSelected
                           ? 'border-blue-500 bg-blue-50/40 shadow-xs ring-1 ring-blue-500/20'
                           : 'border-slate-200/80 hover:border-blue-300 hover:bg-slate-50/60'
@@ -1021,7 +996,7 @@ export default function ProfessorDashboard() {
                   variant="ghost"
                   size="sm"
                   fullWidth
-                  onClick={() => navigate(`/professor/${profile.username || 'profkim'}`)}
+                  onClick={() => navigate(`/professor/${profile.username || user?.uid || ''}`)}
                   className="text-xs font-semibold text-blue-600 hover:text-blue-700"
                   id="dashboard-view-public-btn"
                 >

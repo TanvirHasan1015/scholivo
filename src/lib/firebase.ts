@@ -1,5 +1,5 @@
 import { getApp, getApps, initializeApp } from 'firebase/app'
-import { getAuth } from 'firebase/auth'
+import { getAuth, GoogleAuthProvider } from 'firebase/auth'
 import { getFirestore } from 'firebase/firestore'
 import { getStorage } from 'firebase/storage'
 
@@ -20,6 +20,9 @@ const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp()
 export const auth = getAuth(app)
 export const db = getFirestore(app)
 export const storage = getStorage(app)
+
+export const googleProvider = new GoogleAuthProvider()
+googleProvider.setCustomParameters({ prompt: 'select_account' })
 
 export const isDemoMode = !import.meta.env.VITE_FIREBASE_API_KEY || import.meta.env.VITE_FIREBASE_API_KEY === 'demo-api-key'
 

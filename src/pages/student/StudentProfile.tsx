@@ -1,108 +1,197 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { doc, getDoc, updateDoc } from 'firebase/firestore'
+import { doc, getDoc, setDoc } from 'firebase/firestore'
 import { 
-  User, GraduationCap, BookOpen, Cpu, Globe, 
+  GraduationCap, BookOpen, Cpu, 
   Save, Check, Award, FileText, ArrowLeft, Plus, Trash2,
-  ExternalLink, Sparkles, AlertCircle
+  ExternalLink, AlertCircle
 } from 'lucide-react'
-import { db, isDemoMode } from '@/lib/firebase'
+import { db } from '@/lib/firebase'
 import { useAuth } from '@/context/AuthContext'
-import type { StudentProfile, ResearchExperience, Project, Publication, LanguageScore } from '@/types/user.types'
-import { DEMO_STUDENT_PROFILE } from '@/lib/demoData'
+import type { StudentProfile, ResearchExperience } from '@/types/user.types'
 import { Button } from '@/components/common/Button'
 import { TagInput } from '@/components/common/TagInput'
 import { Avatar } from '@/components/common/Avatar'
 
 import { calculateProfileCompleteness } from '@/utils/helpers'
 
+function createEmptyStudentProfile(uid = '', email = '', displayName = '', photoURL?: string): StudentProfile {
+  const now = new Date().toISOString()
+  const base: StudentProfile = {
+    uid,
+    fullName: displayName,
+    username: email ? email.split('@')[0].toLowerCase().replace(/[^a-z0-9]/g, '') : '',
+    email,
+    country: '',
+    photoURL,
+    university: '',
+    department: '',
+    major: '',
+    degree: 'Master',
+    currentSemester: '',
+    expectedGraduation: '',
+    gpa: 0,
+    gpaScale: 4.0,
+    researchInterests: [],
+    researchAreas: [],
+    researchExperience: [],
+    projects: [],
+    publications: [],
+    programmingLanguages: [],
+    frameworks: [],
+    technicalSkills: [],
+    researchTools: [],
+    languageScores: [],
+    cvUrl: '',
+    transcriptUrl: '',
+    portfolioUrl: '',
+    verificationStatus: 'pending',
+    accountStatus: 'active',
+    profileCompleteness: 0,
+    bio: '',
+    createdAt: now,
+    updatedAt: now,
+  }
+  return {
+    ...base,
+    profileCompleteness: calculateProfileCompleteness(base),
+  }
+}
+
+function normalizeStudentProfile(raw: Partial<StudentProfile>, uid: string, email: string, displayName: string, photoURL?: string): StudentProfile {
+  const base = createEmptyStudentProfile(uid, email, displayName, photoURL)
+  const merged: StudentProfile = {
+    ...base,
+    ...raw,
+    uid: raw.uid || uid,
+    email: raw.email || email,
+    fullName: raw.fullName ?? displayName,
+    researchInterests: Array.isArray(raw.researchInterests) ? raw.researchInterests : [],
+    researchAreas: Array.isArray(raw.researchAreas) ? raw.researchAreas : [],
+    researchExperience: Array.isArray(raw.researchExperience) ? raw.researchExperience : [],
+    projects: Array.isArray(raw.projects) ? raw.projects : [],
+    publications: Array.isArray(raw.publications) ? raw.publications : [],
+    programmingLanguages: Array.isArray(raw.programmingLanguages) ? raw.programmingLanguages : [],
+    frameworks: Array.isArray(raw.frameworks) ? raw.frameworks : [],
+    technicalSkills: Array.isArray(raw.technicalSkills) ? raw.technicalSkills : [],
+    researchTools: Array.isArray(raw.researchTools) ? raw.researchTools : [],
+    languageScores: Array.isArray(raw.languageScores) ? raw.languageScores : [],
+  }
+  return {
+    ...merged,
+    profileCompleteness: calculateProfileCompleteness(merged),
+  }
+}
+
 export default function StudentProfilePage() {
   const { user } = useAuth()
   const navigate = useNavigate()
-  const [profile, setProfile] = useState<StudentProfile>(() => {
-    // Check localStorage for persisted demo changes
-    const local = localStorage.getItem('rm_demo_student_profile')
-    if (local) {
-      try {
-        const parsed = JSON.parse(local)
-        return { ...parsed, profileCompleteness: calculateProfileCompleteness(parsed) }
-      } catch {
-        // fallback
-      }
-    }
-    return { ...DEMO_STUDENT_PROFILE, profileCompleteness: calculateProfileCompleteness(DEMO_STUDENT_PROFILE) }
-  })
+  const [profile, setProfile] = useState<StudentProfile>(() =>
+    createEmptyStudentProfile(user?.uid || '', user?.email || '', user?.displayName || '', user?.photoURL || undefined)
+  )
+  const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [saveSuccess, setSaveSuccess] = useState(false)
+  const [errorMsg, setErrorMsg] = useState<string | null>(null)
 
   useEffect(() => {
+    let isMounted = true
+
     async function loadProfile() {
-      if (isDemoMode) {
-        const local = localStorage.getItem('rm_demo_student_profile')
-        if (local) {
-          try {
-            const parsed = JSON.parse(local)
-            setProfile({ ...parsed, profileCompleteness: calculateProfileCompleteness(parsed) })
-          } catch {
-            setProfile(DEMO_STUDENT_PROFILE)
-          }
-        }
+      if (!user) {
+        if (isMounted) setLoading(false)
         return
       }
-
-      if (!user) return
       try {
         const snap = await getDoc(doc(db, 'students', user.uid))
+        if (!isMounted) return
         if (snap.exists()) {
-          const remote = snap.data() as StudentProfile
-          setProfile({ ...DEMO_STUDENT_PROFILE, ...remote, profileCompleteness: calculateProfileCompleteness(remote) })
+          const remote = snap.data() as Partial<StudentProfile>
+          setProfile(
+            normalizeStudentProfile(
+              remote,
+              user.uid,
+              user.email || '',
+              user.displayName || '',
+              user.photoURL || undefined
+            )
+          )
+        } else {
+          setProfile(
+            createEmptyStudentProfile(
+              user.uid,
+              user.email || '',
+              user.displayName || '',
+              user.photoURL || undefined
+            )
+          )
         }
+        setErrorMsg(null)
       } catch (err) {
-        console.warn('Using default demo profile:', err)
+        console.error('Failed to load student profile from Firestore:', err)
+        if (isMounted) {
+          setErrorMsg('Failed to load your profile from the server. Please check your connection and refresh.')
+        }
+      } finally {
+        if (isMounted) setLoading(false)
       }
     }
+
     loadProfile()
+    return () => {
+      isMounted = false
+    }
   }, [user])
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (!user) return
+
     setSaving(true)
+    setErrorMsg(null)
 
-    const updatedProfile = {
+    const now = new Date().toISOString()
+    const updatedProfile: StudentProfile = {
       ...profile,
+      uid: user.uid,
+      email: profile.email || user.email || '',
       profileCompleteness: calculateProfileCompleteness(profile),
-      updatedAt: new Date().toISOString(),
+      updatedAt: now,
     }
-    setProfile(updatedProfile)
 
-    // Save to localStorage for demo persistence
-    localStorage.setItem('rm_demo_student_profile', JSON.stringify(updatedProfile))
-
-    if (!isDemoMode && user) {
-      try {
-        await updateDoc(doc(db, 'students', user.uid), {
-          ...updatedProfile,
-        })
-      } catch (err) {
-        console.warn('Firestore update failed in demo:', err)
+    try {
+      const firestorePayload = Object.fromEntries(
+        Object.entries(updatedProfile).filter(([, v]) => v !== undefined)
+      )
+      await setDoc(doc(db, 'students', user.uid), firestorePayload, { merge: true })
+      if (updatedProfile.fullName) {
+        await setDoc(
+          doc(db, 'users', user.uid),
+          { displayName: updatedProfile.fullName, updatedAt: now },
+          { merge: true }
+        )
       }
+      setProfile(updatedProfile)
+      setSaveSuccess(true)
+      setTimeout(() => setSaveSuccess(false), 4000)
+    } catch (err) {
+      console.error('Firestore student profile update failed:', err)
+      setErrorMsg('Failed to save your profile changes. Please try again.')
+    } finally {
+      setSaving(false)
     }
-
-    setSaving(false)
-    setSaveSuccess(true)
-    setTimeout(() => setSaveSuccess(false), 4000)
   }
 
   // Helper to add research experience item
   const addExperience = () => {
     const newExp: ResearchExperience = {
       id: `exp-${Date.now()}`,
-      title: 'Undergraduate Researcher',
-      organization: 'University AI Lab',
+      title: '',
+      organization: '',
       role: 'Research Assistant',
-      startDate: '2025-01',
+      startDate: new Date().toISOString().slice(0, 7),
       isCurrent: true,
-      description: 'Conducting empirical experiments on transformer training dynamics.',
+      description: '',
     }
     setProfile({
       ...profile,
@@ -117,26 +206,15 @@ export default function StudentProfilePage() {
     })
   }
 
-  // Helper to add project
-  const addProject = () => {
-    const newProj: Project = {
-      id: `proj-${Date.now()}`,
-      title: 'Neural Vision System',
-      description: 'Deep neural network for semantic segmentation of clinical images.',
-      url: 'https://github.com/example/project',
-      technologies: ['PyTorch', 'Python'],
-    }
-    setProfile({
-      ...profile,
-      projects: [...profile.projects, newProj],
-    })
-  }
-
-  const removeProject = (id: string) => {
-    setProfile({
-      ...profile,
-      projects: profile.projects.filter((p) => p.id !== id),
-    })
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-50/70 pt-8 pb-20 px-4 sm:px-6 lg:px-8 flex items-center justify-center">
+        <div className="text-center space-y-2">
+          <div className="w-8 h-8 rounded-full border-2 border-blue-600 border-t-transparent animate-spin mx-auto" />
+          <p className="text-sm text-slate-500 font-medium">Loading your academic profile…</p>
+        </div>
+      </div>
+    )
   }
 
   return (
@@ -167,7 +245,7 @@ export default function StudentProfilePage() {
             {saveSuccess && (
               <span className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-50 border border-emerald-200 text-xs font-semibold text-emerald-700 animate-fade-in">
                 <Check size={14} className="text-emerald-600" />
-                <span>Profile Saved (Demo Local)</span>
+                <span>Profile Saved</span>
               </span>
             )}
             <Button
@@ -183,23 +261,27 @@ export default function StudentProfilePage() {
           </div>
         </div>
 
+        {errorMsg && (
+          <div className="bg-rose-50 border border-rose-200 rounded-2xl p-4 text-xs font-medium text-rose-700 flex items-center gap-2.5">
+            <AlertCircle size={16} className="text-rose-600 shrink-0" />
+            <span>{errorMsg}</span>
+          </div>
+        )}
+
         {/* Profile Card Summary Banner */}
         <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-2xs flex flex-col sm:flex-row items-center sm:items-start gap-6">
-          <Avatar src={profile.photoURL} name={profile.fullName} size="xl" />
+          <Avatar src={profile.photoURL} name={profile.fullName || 'Student'} size="xl" />
           <div className="flex-1 text-center sm:text-left space-y-1.5">
             <div className="flex flex-wrap items-center justify-center sm:justify-start gap-2">
               <h2 className="text-xl sm:text-2xl font-bold text-slate-900 font-display">
-                {profile.fullName}
+                {profile.fullName || 'Student Researcher'}
               </h2>
               <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
                 {profile.degree} Candidate
               </span>
-              <span className="text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200">
-                Demonstration Profile
-              </span>
             </div>
             <p className="text-sm font-medium text-slate-600">
-              {profile.major} • <span className="text-blue-600 font-semibold">{profile.university}</span>
+              {profile.major || 'Major not set'} • <span className="text-blue-600 font-semibold">{profile.university || 'University not set'}</span>
             </p>
             <p className="text-xs text-slate-400">{profile.email}</p>
 
@@ -504,7 +586,7 @@ export default function StudentProfilePage() {
               <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wide">
                 Conference & Journal Papers
               </label>
-              {profile.publications.map((pub, idx) => (
+              {profile.publications.map((pub) => (
                 <div key={pub.id} className="p-3.5 rounded-xl bg-slate-50/70 border border-slate-200/80 flex items-start justify-between gap-3">
                   <div>
                     <p className="text-xs font-bold text-slate-900">{pub.title}</p>
@@ -526,7 +608,7 @@ export default function StudentProfilePage() {
                   Language & Exam Scores
                 </label>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  {profile.languageScores.map((score, sIdx) => (
+                  {profile.languageScores.map((score) => (
                     <div key={score.id} className="p-3 rounded-xl bg-slate-50/70 border border-slate-200/80 flex items-center justify-between">
                       <span className="text-xs font-bold text-slate-800">{score.type}</span>
                       <span className="text-xs font-semibold text-blue-700 bg-blue-50 px-2 py-0.5 rounded-md border border-blue-200">
@@ -600,7 +682,7 @@ export default function StudentProfilePage() {
           <div className="flex flex-col sm:flex-row items-center justify-between gap-4 pt-4">
             <div className="flex items-center gap-2 text-xs text-slate-500">
               <AlertCircle size={14} className="text-blue-600" />
-              <span>In demo mode, changes are saved to your local session browser state.</span>
+              <span>Changes are saved directly to your Scholivo account.</span>
             </div>
 
             <Button

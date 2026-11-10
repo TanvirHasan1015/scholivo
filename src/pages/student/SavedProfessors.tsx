@@ -1,29 +1,155 @@
 import { useState, useEffect } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
-import { Heart, MapPin, Building, ArrowLeft, ExternalLink, BookmarkCheck, Search, ArrowUpRight, GraduationCap } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
+import { collection, doc, getDoc, getDocs, setDoc, query, where } from 'firebase/firestore'
+import { Heart, MapPin, Building, ArrowLeft, BookmarkCheck, Search, ArrowUpRight } from 'lucide-react'
+import { db } from '@/lib/firebase'
+import { useAuth } from '@/context/AuthContext'
+import type { StudentProfile, ProfessorProfile } from '@/types/user.types'
+import type { Position } from '@/types/position.types'
+import { computeMatch } from '@/lib/matching'
 import { Button } from '@/components/common/Button'
 import { Avatar } from '@/components/common/Avatar'
 import { MatchChip } from '@/components/matching/MatchScore'
-import { DEMO_SAVED_PROFESSORS, type SavedProfessorItem } from '@/lib/demoData'
+
+interface SavedProfessorItem {
+  uid: string
+  username: string
+  fullName: string
+  academicTitle: string
+  university: string
+  country: string
+  photoURL?: string
+  researchAreas: string[]
+  matchScore: number
+  openPositionsCount: number
+  isRecruiting: boolean
+}
 
 export default function SavedProfessors() {
+  const { user } = useAuth()
   const navigate = useNavigate()
-  const [saved, setSaved] = useState<SavedProfessorItem[]>(() => {
-    const local = localStorage.getItem('rm_demo_saved_professors')
-    if (local) {
+  const [saved, setSaved] = useState<SavedProfessorItem[]>([])
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    let isMounted = true
+
+    async function loadSavedProfessors() {
+      if (!user) {
+        if (isMounted) {
+          setSaved([])
+          setLoading(false)
+        }
+        return
+      }
+
       try {
-        return JSON.parse(local)
-      } catch {
-        // fallback
+        const snap = await getDoc(doc(db, 'students', user.uid))
+        if (!isMounted) return
+        if (!snap.exists()) {
+          setSaved([])
+          return
+        }
+
+        const studentData = snap.data() as StudentProfile
+        const savedIds = Array.isArray(studentData.savedProfessorIds)
+          ? studentData.savedProfessorIds
+          : []
+
+        if (savedIds.length === 0) {
+          setSaved([])
+          return
+        }
+
+        const normalizedStudent: StudentProfile = {
+          ...studentData,
+          uid: studentData.uid || user.uid,
+          researchInterests: Array.isArray(studentData.researchInterests) ? studentData.researchInterests : [],
+          researchAreas: Array.isArray(studentData.researchAreas) ? studentData.researchAreas : [],
+          researchExperience: Array.isArray(studentData.researchExperience) ? studentData.researchExperience : [],
+          projects: Array.isArray(studentData.projects) ? studentData.projects : [],
+          publications: Array.isArray(studentData.publications) ? studentData.publications : [],
+          programmingLanguages: Array.isArray(studentData.programmingLanguages) ? studentData.programmingLanguages : [],
+          frameworks: Array.isArray(studentData.frameworks) ? studentData.frameworks : [],
+          technicalSkills: Array.isArray(studentData.technicalSkills) ? studentData.technicalSkills : [],
+          researchTools: Array.isArray(studentData.researchTools) ? studentData.researchTools : [],
+          languageScores: Array.isArray(studentData.languageScores) ? studentData.languageScores : [],
+        }
+
+        const resolved: SavedProfessorItem[] = []
+        for (const profId of savedIds) {
+          const profSnap = await getDoc(doc(db, 'professors', profId))
+          if (!profSnap.exists()) continue
+          const prof = profSnap.data() as ProfessorProfile
+          const profUid = prof.uid || profSnap.id
+
+          const posSnap = await getDocs(
+            query(collection(db, 'positions'), where('professorId', '==', profUid), where('isOpen', '==', true))
+          )
+          const positions = posSnap.docs.map((d) => ({ ...(d.data() as Position), id: d.id }))
+          const bestScore = positions.length
+            ? Math.max(...positions.map((pos) => computeMatch(normalizedStudent, pos).score))
+            : 0
+
+          resolved.push({
+            uid: profUid,
+            username: prof.username || profUid,
+            fullName: prof.fullName,
+            academicTitle: prof.academicTitle,
+            university: prof.university,
+            country: prof.country,
+            photoURL: prof.photoURL,
+            researchAreas: Array.isArray(prof.researchAreas) ? prof.researchAreas : [],
+            matchScore: bestScore,
+            openPositionsCount: positions.length,
+            isRecruiting: Boolean(prof.isRecruiting),
+          })
+        }
+
+        if (isMounted) {
+          setSaved(resolved)
+        }
+      } catch (err) {
+        console.error('Failed to load saved professors from Firestore:', err)
+        if (isMounted) setSaved([])
+      } finally {
+        if (isMounted) setLoading(false)
       }
     }
-    return DEMO_SAVED_PROFESSORS
-  })
 
-  const handleRemove = (uid: string) => {
-    const updated = saved.filter((p) => p.uid !== uid)
-    setSaved(updated)
-    localStorage.setItem('rm_demo_saved_professors', JSON.stringify(updated))
+    loadSavedProfessors()
+    return () => {
+      isMounted = false
+    }
+  }, [user])
+
+  const handleRemove = async (uid: string) => {
+    const nextList = saved.filter((p) => p.uid !== uid)
+    setSaved(nextList)
+    if (!user) return
+    try {
+      await setDoc(
+        doc(db, 'students', user.uid),
+        {
+          savedProfessorIds: nextList.map((p) => p.uid),
+          updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      )
+    } catch (err) {
+      console.error('Failed to remove saved professor in Firestore:', err)
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-50/70 pt-8 pb-20 px-4 sm:px-6 lg:px-8 flex items-center justify-center">
+        <div className="text-center space-y-2">
+          <div className="w-8 h-8 rounded-full border-2 border-blue-600 border-t-transparent animate-spin mx-auto" />
+          <p className="text-sm text-slate-500 font-medium">Loading saved faculty…</p>
+        </div>
+      </div>
+    )
   }
 
   return (

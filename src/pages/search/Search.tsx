@@ -1,16 +1,20 @@
 import { useState, useEffect } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
-import { collection, getDocs, query, where, limit } from 'firebase/firestore'
+import { collection, doc, getDoc, getDocs, query, where, limit } from 'firebase/firestore'
 import { 
-  Search, Filter, MapPin, GraduationCap, X, SlidersHorizontal, 
-  ChevronDown, BookOpen, Sparkles, Building, ArrowUpRight
+  Search, MapPin, GraduationCap, X, SlidersHorizontal, 
+  Sparkles, ArrowUpRight
 } from 'lucide-react'
-import { db, isDemoMode } from '@/lib/firebase'
-import { DEMO_PROFESSORS, DEMO_STUDENT_PROFILE, type ProfessorWithPositions } from '@/lib/demoData'
+import { db } from '@/lib/firebase'
 import { useAuth } from '@/context/AuthContext'
 import type { ProfessorProfile, StudentProfile } from '@/types/user.types'
 import type { Position } from '@/types/position.types'
 import { computeMatch } from '@/lib/matching'
+
+type ProfessorWithPositions = ProfessorProfile & {
+  positions: Position[]
+  matchScore?: number
+}
 import { Avatar } from '@/components/common/Avatar'
 import { Button } from '@/components/common/Button'
 import { MatchChip } from '@/components/matching/MatchScore'
@@ -27,7 +31,7 @@ export default function SearchPage() {
 
   const [q, setQ] = useState(searchParams.get('q') || '')
   const [professors, setProfessors] = useState<ProfessorWithPositions[]>([])
-  const [studentProfile, setStudentProfile] = useState<StudentProfile | null>(DEMO_STUDENT_PROFILE)
+  const [studentProfile, setStudentProfile] = useState<StudentProfile | null>(null)
   const [loading, setLoading] = useState(true)
   const [showFilters, setShowFilters] = useState(false)
 
@@ -48,30 +52,51 @@ export default function SearchPage() {
 
   // Load student profile for matching
   useEffect(() => {
-    if (isDemoMode) {
-      setStudentProfile(DEMO_STUDENT_PROFILE)
-      return
+    let isMounted = true
+
+    async function loadStudentProfile() {
+      if (!user || role !== 'student') {
+        if (isMounted) setStudentProfile(null)
+        return
+      }
+      try {
+        const snap = await getDoc(doc(db, 'students', user.uid))
+        if (!isMounted) return
+        if (snap.exists()) {
+          const data = snap.data() as StudentProfile
+          setStudentProfile({
+            ...data,
+            uid: data.uid || user.uid,
+            researchInterests: Array.isArray(data.researchInterests) ? data.researchInterests : [],
+            researchAreas: Array.isArray(data.researchAreas) ? data.researchAreas : [],
+            researchExperience: Array.isArray(data.researchExperience) ? data.researchExperience : [],
+            projects: Array.isArray(data.projects) ? data.projects : [],
+            publications: Array.isArray(data.publications) ? data.publications : [],
+            programmingLanguages: Array.isArray(data.programmingLanguages) ? data.programmingLanguages : [],
+            frameworks: Array.isArray(data.frameworks) ? data.frameworks : [],
+            technicalSkills: Array.isArray(data.technicalSkills) ? data.technicalSkills : [],
+            researchTools: Array.isArray(data.researchTools) ? data.researchTools : [],
+            languageScores: Array.isArray(data.languageScores) ? data.languageScores : [],
+          })
+        } else {
+          setStudentProfile(null)
+        }
+      } catch (err) {
+        console.error('Failed to load student profile for matching:', err)
+      }
     }
 
-    if (user && role === 'student') {
-      getDocs(query(collection(db, 'students'), where('uid', '==', user.uid), limit(1)))
-        .then((snap) => {
-          if (!snap.empty) setStudentProfile(snap.docs[0].data() as StudentProfile)
-        })
-        .catch(() => {})
+    loadStudentProfile()
+    return () => {
+      isMounted = false
     }
   }, [user, role])
 
-  // Load professors
+  // Load verified professors and their open positions from Firestore
   useEffect(() => {
-    const load = async () => {
-      setLoading(true)
-      if (isDemoMode) {
-        setProfessors(DEMO_PROFESSORS)
-        setLoading(false)
-        return
-      }
+    let isMounted = true
 
+    const load = async () => {
       try {
         const snap = await getDocs(
           query(collection(db, 'professors'), where('verificationStatus', '==', 'verified'), limit(50))
@@ -81,27 +106,50 @@ export default function SearchPage() {
 
         for (const docSnap of snap.docs) {
           const prof = docSnap.data() as ProfessorProfile
+          const profUid = prof.uid || docSnap.id
 
-          // Load positions for this professor
           const posSnap = await getDocs(
-            query(collection(db, 'positions'), where('professorId', '==', prof.uid), where('isOpen', '==', true))
+            query(collection(db, 'positions'), where('professorId', '==', profUid), where('isOpen', '==', true))
           )
-          const positions = posSnap.docs.map((d) => ({ id: d.id, ...d.data() } as Position))
+          const positions = posSnap.docs.map((d) => {
+            const p = d.data() as Position
+            return {
+              ...p,
+              id: d.id,
+              researchTopics: Array.isArray(p.researchTopics) ? p.researchTopics : [],
+              requiredSkills: Array.isArray(p.requiredSkills) ? p.requiredSkills : [],
+              preferredSkills: Array.isArray(p.preferredSkills) ? p.preferredSkills : [],
+            }
+          })
 
-          results.push({ ...prof, positions })
+          results.push({
+            ...prof,
+            uid: profUid,
+            researchAreas: Array.isArray(prof.researchAreas) ? prof.researchAreas : [],
+            researchInterests: Array.isArray(prof.researchInterests) ? prof.researchInterests : [],
+            positions,
+          })
         }
 
-        const data = results.length > 0 ? results : DEMO_PROFESSORS
-        setProfessors(data)
+        if (isMounted) {
+          setProfessors(results)
+        }
       } catch (err) {
-        console.error('Failed to load professors, falling back to demo:', err)
-        setProfessors(DEMO_PROFESSORS)
+        console.error('Failed to load professors from Firestore:', err)
+        if (isMounted) {
+          setProfessors([])
+        }
       } finally {
-        setLoading(false)
+        if (isMounted) {
+          setLoading(false)
+        }
       }
     }
 
     load()
+    return () => {
+      isMounted = false
+    }
   }, [])
 
   // Compute match scores when student profile loads
@@ -376,7 +424,7 @@ export default function SearchPage() {
           {studentProfile && (
             <p className="text-xs text-blue-700 font-medium flex items-center gap-1.5 bg-blue-50 px-3 py-1 rounded-full border border-blue-200">
               <span className="w-2 h-2 rounded-full bg-blue-600 animate-pulse" />
-              <span>Match scores computed for Alex Rivera</span>
+              <span>Match scores computed for {studentProfile.fullName || 'your profile'}</span>
             </p>
           )}
         </div>
@@ -428,7 +476,7 @@ export default function SearchPage() {
               <ProfessorCard
                 key={prof.uid}
                 professor={prof}
-                onClick={() => navigate(`/professor/${prof.username}`)}
+                onClick={() => navigate(`/professor/${prof.username || prof.uid}`)}
               />
             ))}
           </div>

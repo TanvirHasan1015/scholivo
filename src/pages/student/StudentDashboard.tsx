@@ -1,26 +1,40 @@
 import { useState, useEffect } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { collection, getDocs, query, where, limit } from 'firebase/firestore'
+import { collection, doc, getDoc, getDocs, query, where, limit } from 'firebase/firestore'
 import { 
-  User, BookOpen, Search, Heart, FileText, Bell, TrendingUp, 
-  ChevronRight, Star, GraduationCap, Award, CheckCircle2, ArrowUpRight,
-  Sparkles, Clock, Compass, ShieldCheck, MapPin
+  User, BookOpen, Search, Heart, FileText, TrendingUp, 
+  ChevronRight, Star, GraduationCap, CheckCircle2, ArrowUpRight,
+  Sparkles, ShieldCheck, MapPin
 } from 'lucide-react'
-import { db, isDemoMode } from '@/lib/firebase'
+import { db } from '@/lib/firebase'
 import { useAuth } from '@/context/AuthContext'
-import type { StudentProfile } from '@/types/user.types'
+import type { StudentProfile, ProfessorProfile } from '@/types/user.types'
+import type { Position } from '@/types/position.types'
 import type { Application } from '@/types/application.types'
-import { 
-  DEMO_STUDENT_PROFILE, 
-  DEMO_APPLICATIONS, 
-  DEMO_SAVED_PROFESSORS, 
-  DEMO_PROFESSORS, 
-  type SavedProfessorItem 
-} from '@/lib/demoData'
 import { Button } from '@/components/common/Button'
 import { Avatar } from '@/components/common/Avatar'
 import { MatchChip } from '@/components/matching/MatchScore'
-import { STATUS_LABELS } from '@/utils/helpers'
+import { STATUS_LABELS, calculateProfileCompleteness } from '@/utils/helpers'
+import { computeMatch } from '@/lib/matching'
+
+type ProfessorWithPositions = ProfessorProfile & {
+  positions: Position[]
+  matchScore?: number
+}
+
+interface SavedProfessorItem {
+  uid: string
+  username: string
+  fullName: string
+  academicTitle: string
+  university: string
+  country: string
+  photoURL?: string
+  researchAreas: string[]
+  matchScore: number
+  openPositionsCount: number
+  isRecruiting: boolean
+}
 
 const STATUS_BADGE_STYLES: Record<string, string> = {
   submitted: 'bg-blue-50 text-blue-700 border-blue-200',
@@ -31,121 +45,206 @@ const STATUS_BADGE_STYLES: Record<string, string> = {
   rejected: 'bg-rose-50 text-rose-700 border-rose-200',
 }
 
-import { computeMatch } from '@/lib/matching'
-import { calculateProfileCompleteness } from '@/utils/helpers'
+function createInitialStudentProfile(uid = '', email = '', displayName = '', photoURL?: string): StudentProfile {
+  const now = new Date().toISOString()
+  const base: StudentProfile = {
+    uid,
+    fullName: displayName,
+    username: email ? email.split('@')[0].toLowerCase().replace(/[^a-z0-9]/g, '') : '',
+    email,
+    country: '',
+    photoURL,
+    university: '',
+    department: '',
+    major: '',
+    degree: 'Master',
+    currentSemester: '',
+    expectedGraduation: '',
+    gpa: 0,
+    gpaScale: 4.0,
+    researchInterests: [],
+    researchAreas: [],
+    researchExperience: [],
+    projects: [],
+    publications: [],
+    programmingLanguages: [],
+    frameworks: [],
+    technicalSkills: [],
+    researchTools: [],
+    languageScores: [],
+    verificationStatus: 'pending',
+    accountStatus: 'active',
+    profileCompleteness: 0,
+    createdAt: now,
+    updatedAt: now,
+  }
+  return {
+    ...base,
+    profileCompleteness: calculateProfileCompleteness(base),
+  }
+}
 
 export default function StudentDashboard() {
   const { user } = useAuth()
   const navigate = useNavigate()
-  const [profile, setProfile] = useState<StudentProfile>(() => {
-    const local = localStorage.getItem('rm_demo_student_profile')
-    if (local) {
-      try {
-        const p = JSON.parse(local)
-        return { ...p, profileCompleteness: calculateProfileCompleteness(p) }
-      } catch {
-        // fallback
-      }
-    }
-    return { ...DEMO_STUDENT_PROFILE, profileCompleteness: calculateProfileCompleteness(DEMO_STUDENT_PROFILE) }
-  })
-  const loadSyncedApplications = (): Application[] => {
-    let apps = [...DEMO_APPLICATIONS]
-    const savedAppsStr = localStorage.getItem('rm_demo_applications')
-    if (savedAppsStr) {
-      try {
-        const profApps: Application[] = JSON.parse(savedAppsStr)
-        apps = apps.map((studentApp) => {
-          const match = profApps.find(
-            (pa) =>
-              pa.id === studentApp.id ||
-              (studentApp.id === 'app1' && pa.id === 'app-101') ||
-              pa.positionId === studentApp.positionId
-          )
-          if (match) {
-            return {
-              ...studentApp,
-              status: match.status,
-              statusHistory: match.statusHistory && match.statusHistory.length > 0 ? match.statusHistory : studentApp.statusHistory,
-              updatedAt: match.updatedAt || studentApp.updatedAt,
-            }
-          }
-          return studentApp
-        })
-      } catch {
-        // fallback to default apps
-      }
-    }
-    return apps
-  }
-
-  const [applications, setApplications] = useState<Application[]>(loadSyncedApplications)
-  const [savedProfessors, setSavedProfessors] = useState<SavedProfessorItem[]>(() => {
-    const localSaved = localStorage.getItem('rm_demo_saved_professors')
-    if (localSaved) {
-      try {
-        return JSON.parse(localSaved)
-      } catch {
-        // fallback
-      }
-    }
-    return DEMO_SAVED_PROFESSORS
-  })
+  const [profile, setProfile] = useState<StudentProfile>(() =>
+    createInitialStudentProfile(user?.uid || '', user?.email || '', user?.displayName || '', user?.photoURL || undefined)
+  )
+  const [applications, setApplications] = useState<Application[]>([])
+  const [recommendedProfessors, setRecommendedProfessors] = useState<ProfessorWithPositions[]>([])
+  const [savedProfessors, setSavedProfessors] = useState<SavedProfessorItem[]>([])
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    if (isDemoMode) {
-      const local = localStorage.getItem('rm_demo_student_profile')
-      const p = local ? JSON.parse(local) : { ...DEMO_STUDENT_PROFILE }
-      const savedVerifications = localStorage.getItem('rm_demo_verifications')
-      if (savedVerifications) {
-        try {
-          const list = JSON.parse(savedVerifications)
-          const myRecord = list.find((item: any) =>
-            (user && (item.userId === user.uid || (item.applicantEmail && user.email && item.applicantEmail.toLowerCase() === user.email.toLowerCase()))) ||
-            (!user && item.userId === 'demo-student')
-          )
-          if (myRecord) {
-            p.verificationStatus = myRecord.status
-          }
-        } catch {}
-      }
-      setProfile({ ...p, profileCompleteness: calculateProfileCompleteness(p) })
-      setApplications(loadSyncedApplications())
+    let isMounted = true
 
-      const localSaved = localStorage.getItem('rm_demo_saved_professors')
-      if (localSaved) {
-        try {
-          setSavedProfessors(JSON.parse(localSaved))
-        } catch {
-          setSavedProfessors(DEMO_SAVED_PROFESSORS)
-        }
-      } else {
-        setSavedProfessors(DEMO_SAVED_PROFESSORS)
+    async function loadDashboardData() {
+      if (!user) {
+        if (isMounted) setLoading(false)
+        return
       }
-      setLoading(false)
-      return
+
+      try {
+        const [studentSnap, appsSnap, profsSnap] = await Promise.all([
+          getDoc(doc(db, 'students', user.uid)),
+          getDocs(query(collection(db, 'applications'), where('studentId', '==', user.uid))),
+          getDocs(query(collection(db, 'professors'), where('verificationStatus', '==', 'verified'), limit(12))),
+        ])
+
+        if (!isMounted) return
+
+        let loadedProfile = createInitialStudentProfile(
+          user.uid,
+          user.email || '',
+          user.displayName || '',
+          user.photoURL || undefined
+        )
+        if (studentSnap.exists()) {
+          const data = studentSnap.data() as Partial<StudentProfile>
+          const merged: StudentProfile = {
+            ...loadedProfile,
+            ...data,
+            researchInterests: Array.isArray(data.researchInterests) ? data.researchInterests : [],
+            researchAreas: Array.isArray(data.researchAreas) ? data.researchAreas : [],
+            researchExperience: Array.isArray(data.researchExperience) ? data.researchExperience : [],
+            projects: Array.isArray(data.projects) ? data.projects : [],
+            publications: Array.isArray(data.publications) ? data.publications : [],
+            programmingLanguages: Array.isArray(data.programmingLanguages) ? data.programmingLanguages : [],
+            frameworks: Array.isArray(data.frameworks) ? data.frameworks : [],
+            technicalSkills: Array.isArray(data.technicalSkills) ? data.technicalSkills : [],
+            researchTools: Array.isArray(data.researchTools) ? data.researchTools : [],
+            languageScores: Array.isArray(data.languageScores) ? data.languageScores : [],
+            savedProfessorIds: Array.isArray(data.savedProfessorIds) ? data.savedProfessorIds : [],
+          }
+          loadedProfile = {
+            ...merged,
+            profileCompleteness: calculateProfileCompleteness(merged),
+          }
+        }
+        setProfile(loadedProfile)
+
+        const loadedApps: Application[] = appsSnap.docs
+          .map((d) => ({
+            ...(d.data() as Application),
+            id: d.id,
+          }))
+          .sort((a, b) => (b.submittedAt || '').localeCompare(a.submittedAt || ''))
+        setApplications(loadedApps)
+
+        const profResults: ProfessorWithPositions[] = []
+        for (const profDoc of profsSnap.docs) {
+          const profData = profDoc.data() as ProfessorProfile
+          const profUid = profData.uid || profDoc.id
+          const posSnap = await getDocs(
+            query(collection(db, 'positions'), where('professorId', '==', profUid), where('isOpen', '==', true))
+          )
+          const positions = posSnap.docs.map((d) => ({ ...(d.data() as Position), id: d.id }))
+          const bestScore = positions.length
+            ? Math.max(...positions.map((pos) => computeMatch(loadedProfile, pos).score))
+            : undefined
+          profResults.push({
+            ...profData,
+            uid: profUid,
+            researchAreas: Array.isArray(profData.researchAreas) ? profData.researchAreas : [],
+            researchInterests: Array.isArray(profData.researchInterests) ? profData.researchInterests : [],
+            positions,
+            matchScore: bestScore,
+          })
+        }
+
+        profResults.sort((a, b) => (b.matchScore ?? 0) - (a.matchScore ?? 0))
+        if (isMounted) {
+          setRecommendedProfessors(profResults.slice(0, 4))
+        }
+
+        const savedIds = loadedProfile.savedProfessorIds || []
+        if (savedIds.length > 0) {
+          const resolvedSaved: SavedProfessorItem[] = []
+          for (const savedId of savedIds) {
+            const existing = profResults.find((p) => p.uid === savedId)
+            if (existing) {
+              resolvedSaved.push({
+                uid: existing.uid,
+                username: existing.username || existing.uid,
+                fullName: existing.fullName,
+                academicTitle: existing.academicTitle,
+                university: existing.university,
+                country: existing.country,
+                photoURL: existing.photoURL,
+                researchAreas: existing.researchAreas,
+                matchScore: existing.matchScore ?? 0,
+                openPositionsCount: existing.positions.length,
+                isRecruiting: Boolean(existing.isRecruiting),
+              })
+            } else {
+              const sSnap = await getDoc(doc(db, 'professors', savedId))
+              if (sSnap.exists()) {
+                const sData = sSnap.data() as ProfessorProfile
+                const sUid = sData.uid || sSnap.id
+                const sPosSnap = await getDocs(
+                  query(collection(db, 'positions'), where('professorId', '==', sUid), where('isOpen', '==', true))
+                )
+                const sPositions = sPosSnap.docs.map((d) => ({ ...(d.data() as Position), id: d.id }))
+                const sScore = sPositions.length
+                  ? Math.max(...sPositions.map((pos) => computeMatch(loadedProfile, pos).score))
+                  : 0
+                resolvedSaved.push({
+                  uid: sUid,
+                  username: sData.username || sUid,
+                  fullName: sData.fullName,
+                  academicTitle: sData.academicTitle,
+                  university: sData.university,
+                  country: sData.country,
+                  photoURL: sData.photoURL,
+                  researchAreas: Array.isArray(sData.researchAreas) ? sData.researchAreas : [],
+                  matchScore: sScore,
+                  openPositionsCount: sPositions.length,
+                  isRecruiting: Boolean(sData.isRecruiting),
+                })
+              }
+            }
+          }
+          if (isMounted) setSavedProfessors(resolvedSaved)
+        } else if (isMounted) {
+          setSavedProfessors([])
+        }
+      } catch (err) {
+        console.error('Failed to load student dashboard data from Firestore:', err)
+      } finally {
+        if (isMounted) setLoading(false)
+      }
     }
 
-    if (user) {
-      getDocs(query(collection(db, 'students'), where('uid', '==', user.uid), limit(1)))
-        .then((snap) => {
-          if (!snap.empty) {
-            const data = snap.docs[0].data() as StudentProfile
-            setProfile({ ...data, profileCompleteness: calculateProfileCompleteness(data) })
-          }
-          setLoading(false)
-        })
-        .catch(() => setLoading(false))
-    } else {
-      setLoading(false)
+    loadDashboardData()
+    return () => {
+      isMounted = false
     }
   }, [user])
 
-  const completeness = profile?.profileCompleteness ?? 92
+  const completeness = profile?.profileCompleteness ?? 0
 
   const completenessItems = [
-    { label: 'Basic & Contact Information', done: true },
+    { label: 'Basic & Contact Information', done: !!(profile?.fullName && profile?.email) },
     { label: 'Academic Background & GPA', done: !!profile?.university },
     { label: 'Research Interests & Topics', done: (profile?.researchInterests?.length ?? 0) > 0 },
     { label: 'Technical Skills & Frameworks', done: (profile?.programmingLanguages?.length ?? 0) > 0 },
@@ -154,6 +253,23 @@ export default function StudentDashboard() {
   ]
 
   const shortlistedCount = applications.filter((a) => a.status === 'shortlisted').length
+  const verificationStatus = profile?.verificationStatus || 'pending'
+  const firstName = profile?.fullName
+    ? profile.fullName.split(' ')[0]
+    : user?.displayName
+    ? user.displayName.split(' ')[0]
+    : 'Researcher'
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-50/70 pt-8 pb-20 px-4 sm:px-6 lg:px-8 flex items-center justify-center">
+        <div className="text-center space-y-2">
+          <div className="w-8 h-8 rounded-full border-2 border-blue-600 border-t-transparent animate-spin mx-auto" />
+          <p className="text-sm text-slate-500 font-medium">Loading your student dashboard…</p>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="min-h-screen bg-slate-50/70 pt-8 pb-20 px-4 sm:px-6 lg:px-8">
@@ -168,20 +284,20 @@ export default function StudentDashboard() {
                 <span>Student Research Portal</span>
               </div>
               <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold border ${
-                (profile?.verificationStatus || 'verified') === 'verified'
+                verificationStatus === 'verified'
                   ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                  : (profile?.verificationStatus || 'verified') === 'more_info_required'
+                  : verificationStatus === 'more_info_required'
                   ? 'bg-purple-50 text-purple-700 border-purple-200'
-                  : (profile?.verificationStatus || 'verified') === 'rejected'
+                  : verificationStatus === 'rejected'
                   ? 'bg-rose-50 text-rose-700 border-rose-200'
                   : 'bg-amber-50 text-amber-700 border-amber-200'
               }`}>
-                <ShieldCheck size={13} className={(profile?.verificationStatus || 'verified') === 'verified' ? 'text-emerald-600' : 'text-amber-600'} />
-                <span>Affiliation: {profile?.verificationStatus ? (profile.verificationStatus === 'verified' ? 'Verified Student' : profile.verificationStatus.replace('_', ' ')) : 'Verified Student'}</span>
+                <ShieldCheck size={13} className={verificationStatus === 'verified' ? 'text-emerald-600' : 'text-amber-600'} />
+                <span>Affiliation: {verificationStatus === 'verified' ? 'Verified Student' : verificationStatus.replace('_', ' ')}</span>
               </span>
             </div>
             <h1 className="font-display text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight">
-              Welcome back, {user?.displayName ? user.displayName.split(' ')[0] : 'Alex'} 👋
+              Welcome back, {firstName} 👋
             </h1>
             <p className="text-slate-500 text-sm max-w-xl">
               Track your faculty applications, explore AI-matched research opportunities, and manage your academic profile.
@@ -343,55 +459,63 @@ export default function StudentDashboard() {
                 </Button>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                {DEMO_PROFESSORS.slice(0, 4).map((prof) => {
-                  const score = prof.positions?.length && profile
-                    ? Math.max(...prof.positions.map((pos) => computeMatch(profile, pos).score))
-                    : 75
-                  return (
-                    <div
-                      key={prof.uid}
-                      onClick={() => navigate(`/professor/${prof.username}`)}
-                      className="p-4 rounded-2xl border border-slate-200/80 bg-slate-50/40 hover:bg-white hover:border-blue-300 hover:shadow-xs transition-all cursor-pointer flex flex-col justify-between group"
-                      id={`rec-card-${prof.uid}`}
-                    >
-                      <div>
-                        <div className="flex items-start justify-between gap-3 mb-3">
-                          <div className="flex items-center gap-3">
-                            <Avatar src={prof.photoURL} name={prof.fullName} size="md" />
-                            <div className="min-w-0">
-                              <h3 className="text-sm font-bold text-slate-900 truncate group-hover:text-blue-600 transition-colors">
-                                {prof.fullName}
-                              </h3>
-                              <p className="text-xs text-slate-500 truncate flex items-center gap-1 mt-0.5">
-                                <MapPin size={11} className="text-slate-400 shrink-0" />
-                                {prof.university}
-                              </p>
+              {recommendedProfessors.length === 0 ? (
+                <div className="text-center py-8 px-4 bg-slate-50 rounded-2xl border border-dashed border-slate-200">
+                  <Star size={32} className="mx-auto text-slate-400 mb-2 opacity-60" />
+                  <p className="text-sm font-semibold text-slate-800">No recommended professors available yet</p>
+                  <p className="text-xs text-slate-500 mt-1">
+                    Verified faculty opportunities will appear here as professors publish openings.
+                  </p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  {recommendedProfessors.map((prof) => {
+                    const score = prof.matchScore
+                    return (
+                      <div
+                        key={prof.uid}
+                        onClick={() => navigate(`/professor/${prof.username || prof.uid}`)}
+                        className="p-4 rounded-2xl border border-slate-200/80 bg-slate-50/40 hover:bg-white hover:border-blue-300 hover:shadow-xs transition-all cursor-pointer flex flex-col justify-between group"
+                        id={`rec-card-${prof.uid}`}
+                      >
+                        <div>
+                          <div className="flex items-start justify-between gap-3 mb-3">
+                            <div className="flex items-center gap-3">
+                              <Avatar src={prof.photoURL} name={prof.fullName} size="md" />
+                              <div className="min-w-0">
+                                <h3 className="text-sm font-bold text-slate-900 truncate group-hover:text-blue-600 transition-colors">
+                                  {prof.fullName}
+                                </h3>
+                                <p className="text-xs text-slate-500 truncate flex items-center gap-1 mt-0.5">
+                                  <MapPin size={11} className="text-slate-400 shrink-0" />
+                                  {prof.university}
+                                </p>
+                              </div>
                             </div>
+                            {score !== undefined && <MatchChip score={score} />}
                           </div>
-                          <MatchChip score={score} />
+
+                          <div className="flex flex-wrap gap-1.5 my-3">
+                            {prof.researchAreas.slice(0, 2).map((area) => (
+                              <span
+                                key={area}
+                                className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-white border border-slate-200/80 text-slate-600"
+                              >
+                                {area}
+                              </span>
+                            ))}
+                          </div>
                         </div>
 
-                        <div className="flex flex-wrap gap-1.5 my-3">
-                          {prof.researchAreas.slice(0, 2).map((area) => (
-                            <span
-                              key={area}
-                              className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-white border border-slate-200/80 text-slate-600"
-                            >
-                              {area}
-                            </span>
-                          ))}
+                        <div className="pt-3 border-t border-slate-200/60 flex items-center justify-between text-xs text-blue-600 font-semibold group-hover:text-blue-700">
+                          <span>View Lab & Openings</span>
+                          <ArrowUpRight size={14} className="group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
                         </div>
                       </div>
-
-                      <div className="pt-3 border-t border-slate-200/60 flex items-center justify-between text-xs text-blue-600 font-semibold group-hover:text-blue-700">
-                        <span>View Lab & Openings</span>
-                        <ArrowUpRight size={14} className="group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
-                      </div>
-                    </div>
-                  )
-                })}
-              </div>
+                    )
+                  })}
+                </div>
+              )}
             </div>
 
           </div>

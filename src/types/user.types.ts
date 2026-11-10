@@ -97,6 +97,9 @@ export interface StudentProfile {
   transcriptUrl?: string
   portfolioUrl?: string
 
+  // Saved / Bookmarked Professors
+  savedProfessorIds?: string[]
+
   // Affiliation Verification & Account
   verificationStatus?: AffiliationVerificationStatus
   accountStatus?: AccountStatus

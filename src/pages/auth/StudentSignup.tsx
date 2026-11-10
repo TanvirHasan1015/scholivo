@@ -3,15 +3,15 @@ import { Link, useNavigate } from 'react-router-dom'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { BookOpen, User, GraduationCap, FlaskConical, Code, Languages, FileText, ChevronRight, ChevronLeft } from 'lucide-react'
-import { doc, setDoc, serverTimestamp } from 'firebase/firestore'
+import { User, GraduationCap, FlaskConical, Code, Languages, FileText, ChevronRight, ChevronLeft, CheckCircle2 } from 'lucide-react'
+import { doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore'
 import { useAuth } from '@/context/AuthContext'
 import { db } from '@/lib/firebase'
 import { Input, Select, Textarea } from '@/components/common/Input'
 import { TagInput } from '@/components/common/TagInput'
 import { Button } from '@/components/common/Button'
 import { BrandLogo } from '@/components/common/BrandLogo'
-import { RESEARCH_AREAS, COUNTRIES } from '@/utils/helpers'
+import { RESEARCH_AREAS, COUNTRIES, calculateProfileCompleteness } from '@/utils/helpers'
 
 // ── Validation schema ─────────────────────────────────────────────────────────
 
@@ -19,12 +19,9 @@ const accountSchema = z.object({
   fullName: z.string().min(2, 'Please enter your full name'),
   username: z.string().min(3, 'Username must be at least 3 characters').regex(/^[a-z0-9_]+$/, 'Lowercase letters, numbers, underscore only'),
   email: z.string().email('Enter a valid email'),
-  password: z.string().min(8, 'Password must be at least 8 characters'),
-  confirmPassword: z.string(),
+  password: z.string().optional(),
+  confirmPassword: z.string().optional(),
   country: z.string().min(1, 'Please select your country'),
-}).refine((d) => d.password === d.confirmPassword, {
-  message: 'Passwords do not match',
-  path: ['confirmPassword'],
 })
 
 type AccountForm = z.infer<typeof accountSchema>
@@ -47,17 +44,29 @@ const DEGREE_OPTIONS = [
 ]
 
 const COUNTRY_OPTIONS = COUNTRIES.map((c) => ({ value: c, label: c }))
-const AREA_OPTIONS = RESEARCH_AREAS.map((a) => ({ value: a, label: a }))
 
 export default function StudentSignup() {
-  const { signUp } = useAuth()
+  const { user, role, signUp, signInWithGoogle, completeGoogleSignUp } = useAuth()
   const navigate = useNavigate()
   const [currentStep, setCurrentStep] = useState(0)
   const [error, setError] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [isGoogleLoading, setIsGoogleLoading] = useState(false)
+
+  const isGoogleAuth = Boolean(user && !role)
 
   // Account form (validated step 0)
-  const accountForm = useForm<AccountForm>({ resolver: zodResolver(accountSchema) })
+  const accountForm = useForm<AccountForm>({
+    resolver: zodResolver(accountSchema),
+    defaultValues: {
+      fullName: user?.displayName || '',
+      username: '',
+      email: user?.email || '',
+      password: '',
+      confirmPassword: '',
+      country: '',
+    },
+  })
 
   // All extra data stored locally
   const [academic, setAcademic] = useState({
@@ -75,10 +84,66 @@ export default function StudentSignup() {
     ielts: '', toefl: '', topik: '', other: '', otherLabel: '',
   })
 
+  const handleGoogleSignUp = async () => {
+    setError('')
+    setIsGoogleLoading(true)
+    try {
+      const result = await signInWithGoogle()
+
+      if (result.accountStatus === 'existing_complete' && result.role) {
+        if (result.role === 'professor') navigate('/dashboard/professor')
+        else if (result.role === 'admin') navigate('/admin')
+        else navigate('/dashboard/student')
+        return
+      }
+
+      if (result.accountStatus === 'incomplete_onboarding' && result.role === 'professor') {
+        navigate('/signup/professor')
+        return
+      }
+
+      if (result.user.displayName) {
+        accountForm.setValue('fullName', result.user.displayName, { shouldValidate: true })
+      }
+      if (result.user.email) {
+        accountForm.setValue('email', result.user.email, { shouldValidate: true })
+      }
+    } catch (err: unknown) {
+      const code = (err as { code?: string })?.code
+      const message = (err as { message?: string })?.message
+      if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+        setError('Google sign-in was cancelled before completion.')
+      } else if (code === 'auth/popup-blocked') {
+        setError('Sign-in popup was blocked by your browser. Please allow popups and try again.')
+      } else if (code === 'auth/account-exists-with-different-credential') {
+        setError('An account with this email already exists using Email & Password. Please sign in on the Login page to link your Google account.')
+      } else if (code === 'auth/inconsistent-account-records') {
+        setError(message || 'Inconsistent account records found. Please contact support.')
+      } else {
+        setError('Google sign-in failed. Please try again.')
+      }
+    } finally {
+      setIsGoogleLoading(false)
+    }
+  }
+
   const handleNext = async () => {
     if (currentStep === 0) {
-      const valid = await accountForm.trigger()
-      if (!valid) return
+      const baseValid = await accountForm.trigger(['fullName', 'username', 'email', 'country'])
+      if (!baseValid) return
+
+      if (!isGoogleAuth) {
+        const pwd = accountForm.getValues('password') || ''
+        const confirmPwd = accountForm.getValues('confirmPassword') || ''
+        if (pwd.length < 8) {
+          accountForm.setError('password', { message: 'Password must be at least 8 characters' })
+          return
+        }
+        if (pwd !== confirmPwd) {
+          accountForm.setError('confirmPassword', { message: 'Passwords do not match' })
+          return
+        }
+      }
     }
     if (currentStep < STEPS.length - 1) setCurrentStep(currentStep + 1)
   }
@@ -92,105 +157,78 @@ export default function StudentSignup() {
     setIsSubmitting(true)
     try {
       const accountData = accountForm.getValues()
-      const user = await signUp(accountData.email, accountData.password, accountData.fullName, 'student')
+      const activeUser = isGoogleAuth
+        ? await completeGoogleSignUp(accountData.fullName, 'student')
+        : await signUp(accountData.email, accountData.password || '', accountData.fullName, 'student')
+
+      // Never overwrite an existing student profile
+      const existingProfileSnap = await getDoc(doc(db, 'students', activeUser.uid))
+      if (existingProfileSnap.exists()) {
+        navigate('/dashboard/student')
+        return
+      }
 
       const languageScores = []
-      if (language.ielts) languageScores.push({ id: 'ielts', type: 'IELTS', score: language.ielts })
-      if (language.toefl) languageScores.push({ id: 'toefl', type: 'TOEFL', score: language.toefl })
-      if (language.topik) languageScores.push({ id: 'topik', type: 'TOPIK', score: language.topik })
-      if (language.other && language.otherLabel) languageScores.push({ id: 'other', type: 'Other', score: language.other, label: language.otherLabel })
+      if (language.ielts) languageScores.push({ id: 'ielts', type: 'IELTS' as const, score: language.ielts })
+      if (language.toefl) languageScores.push({ id: 'toefl', type: 'TOEFL' as const, score: language.toefl })
+      if (language.topik) languageScores.push({ id: 'topik', type: 'TOPIK' as const, score: language.topik })
+      if (language.other && language.otherLabel) languageScores.push({ id: 'other', type: 'Other' as const, score: language.other, label: language.otherLabel })
 
-      const newStudentProfile = {
-        uid: user.uid,
-        fullName: accountData.fullName,
-        username: accountData.username,
-        email: accountData.email,
+      const draftStudentProfile = {
+        uid: activeUser.uid,
+        fullName: accountData.fullName.trim(),
+        username: accountData.username.trim(),
+        email: activeUser.email || accountData.email.trim(),
+        photoURL: activeUser.photoURL || undefined,
         country: accountData.country,
-        university: academic.university || 'Seoul National University',
-        department: academic.department || 'Computer Science',
-        major: academic.major || 'Computer Science',
-        degree: academic.degree || 'Bachelor',
-        currentSemester: academic.currentSemester || '1st Semester',
-        expectedGraduation: academic.expectedGraduation || '2028-02',
-        gpa: parseFloat(academic.gpa) || 3.8,
+        university: academic.university.trim(),
+        department: academic.department.trim(),
+        major: academic.major.trim(),
+        degree: (academic.degree || 'Bachelor') as 'Bachelor' | 'Master' | 'PhD',
+        currentSemester: academic.currentSemester.trim(),
+        expectedGraduation: academic.expectedGraduation,
+        gpa: parseFloat(academic.gpa) || 0,
         gpaScale: parseFloat(academic.gpaScale) || 4.0,
-        researchInterests: research.researchInterests || ['Artificial Intelligence'],
-        researchAreas: research.researchAreas || ['Artificial Intelligence'],
-        bio: research.bio || '',
+        researchInterests: research.researchInterests,
+        researchAreas: research.researchAreas,
+        bio: research.bio.trim(),
         researchExperience: [],
         projects: [],
         publications: [],
-        programmingLanguages: skills.programmingLanguages || ['Python'],
-        frameworks: skills.frameworks || ['PyTorch'],
-        technicalSkills: skills.technicalSkills || ['Deep Learning'],
-        researchTools: skills.researchTools || ['Git'],
+        programmingLanguages: skills.programmingLanguages,
+        frameworks: skills.frameworks,
+        technicalSkills: skills.technicalSkills,
+        researchTools: skills.researchTools,
         languageScores,
         verificationStatus: 'pending' as const,
         accountStatus: 'active' as const,
-        profileCompleteness: 75,
+        profileCompleteness: 0,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       }
+      draftStudentProfile.profileCompleteness = calculateProfileCompleteness(draftStudentProfile)
 
-      // 1. Save profile to localStorage
-      localStorage.setItem('rm_demo_student_profile', JSON.stringify(newStudentProfile))
-
-      // 2. Queue verification request in rm_demo_verifications
-      const newVerificationReq = {
-        id: `req-${Date.now()}`,
-        userId: user.uid,
-        userName: accountData.fullName,
-        userEmail: accountData.email,
-        userRole: 'student' as const,
-        university: academic.university || 'Seoul National University',
-        department: academic.department || 'Computer Science',
-        academicTitleOrDegree: `${academic.degree || 'Bachelor'} in ${academic.major || 'Computer Science'}`,
-        docType: 'Official Academic Transcript & Student Enrollment Letter',
-        docUrl: 'https://example.com/student_transcript.pdf',
-        status: 'pending' as const,
-        accountStatus: 'active' as const,
-        submittedAt: new Date().toISOString(),
-      }
-
-      const existingVerifications = localStorage.getItem('rm_demo_verifications')
-      const verificationsList = existingVerifications ? JSON.parse(existingVerifications) : []
-      localStorage.setItem('rm_demo_verifications', JSON.stringify([newVerificationReq, ...verificationsList]))
-
-      // 3. Add to rm_demo_system_users
-      const newSystemUser = {
-        uid: user.uid,
-        displayName: accountData.fullName,
-        email: accountData.email,
-        role: 'student' as const,
-        university: academic.university || 'Seoul National University',
-        department: academic.department || 'Computer Science',
-        academicTitleOrDegree: `${academic.degree || 'Bachelor'} in ${academic.major || 'Computer Science'}`,
-        verificationStatus: 'pending' as const,
-        accountStatus: 'active' as const,
-        createdAt: new Date().toISOString().slice(0, 10),
-        applicationsCount: 0,
-      }
-      const existingUsers = localStorage.getItem('rm_demo_system_users')
-      const usersList = existingUsers ? JSON.parse(existingUsers) : []
-      localStorage.setItem('rm_demo_system_users', JSON.stringify([newSystemUser, ...usersList]))
-
-      try {
-        await setDoc(doc(db, 'students', user.uid), {
-          ...newStudentProfile,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        })
-      } catch {
-        // demo mode Firestore fallback
-      }
+      await setDoc(doc(db, 'students', activeUser.uid), {
+        ...draftStudentProfile,
+        photoURL: activeUser.photoURL || null,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
 
       navigate('/dashboard/student')
     } catch (err: unknown) {
       const code = (err as { code?: string })?.code
+      const message = (err as { message?: string })?.message
       if (code === 'auth/email-already-in-use') {
         setError('This email is already registered. Please sign in.')
+      } else if (
+        code === 'auth/inconsistent-account-records' ||
+        code === 'auth/profile-already-exists' ||
+        code === 'auth/role-conflict'
+      ) {
+        setError(message || 'Account conflict detected. Please sign in or contact support.')
       } else {
-        setError('Sign up failed. Please try again.')
+        setError('Sign up failed. Please check your connection and try again.')
         console.error(err)
       }
     } finally {
@@ -240,12 +278,72 @@ export default function StudentSignup() {
           {currentStep === 0 && (
             <div className="space-y-4 fade-in-up">
               <h2 className="font-semibold text-white text-lg mb-5">Account Information</h2>
+
+              {isGoogleAuth ? (
+                <div className="rounded-2xl bg-emerald-500/10 border border-emerald-500/25 px-4 py-3 flex items-center gap-3 text-xs text-emerald-300">
+                  <CheckCircle2 size={16} className="text-emerald-400 shrink-0" />
+                  <span>
+                    Connected with Google as <strong>{user?.email}</strong>. Complete your account details below.
+                  </span>
+                </div>
+              ) : (
+                <>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    fullWidth
+                    loading={isGoogleLoading}
+                    onClick={handleGoogleSignUp}
+                    className="flex items-center justify-center gap-2.5 cursor-pointer"
+                    id="student-google-signup-btn"
+                  >
+                    <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+                      <path
+                        fill="#4285F4"
+                        d="M23.49 12.27c0-.79-.07-1.54-.19-2.27H12v4.51h6.47c-.29 1.48-1.14 2.73-2.4 3.58v3h3.86c2.26-2.09 3.56-5.17 3.56-8.82z"
+                      />
+                      <path
+                        fill="#34A853"
+                        d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.86-3c-1.08.72-2.45 1.16-4.07 1.16-3.13 0-5.78-2.11-6.73-4.96H1.29v3.09C3.26 21.3 7.31 24 12 24z"
+                      />
+                      <path
+                        fill="#FBBC05"
+                        d="M5.27 14.29c-.25-.72-.38-1.49-.38-2.29s.13-1.57.38-2.29V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.98-3.09z"
+                      />
+                      <path
+                        fill="#EA4335"
+                        d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.98 3.09c.95-2.85 3.6-4.96 6.73-4.96z"
+                      />
+                    </svg>
+                    <span>Continue with Google</span>
+                  </Button>
+
+                  <div className="relative flex items-center justify-center py-1">
+                    <div className="border-t border-white/10 w-full" />
+                    <span className="px-3 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+                      or register with email
+                    </span>
+                    <div className="border-t border-white/10 w-full" />
+                  </div>
+                </>
+              )}
+
+              {error && (
+                <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3 text-sm text-red-400">
+                  {error}
+                </div>
+              )}
+
               <Input label="Full Name" placeholder="Dr. Jane Smith" required {...accountForm.register('fullName')} error={accountForm.formState.errors.fullName?.message} id="signup-fullname" />
               <Input label="Username" placeholder="janesmith" required {...accountForm.register('username')} error={accountForm.formState.errors.username?.message} id="signup-username" hint="Letters, numbers, underscore only. Cannot be changed later." />
-              <Input label="Email Address" type="email" placeholder="jane@university.edu" required {...accountForm.register('email')} error={accountForm.formState.errors.email?.message} id="signup-email" />
+              <Input label="Email Address" type="email" placeholder="jane@university.edu" required readOnly={isGoogleAuth} {...accountForm.register('email')} error={accountForm.formState.errors.email?.message} id="signup-email" />
               <Select label="Country" options={COUNTRY_OPTIONS} placeholder="Select your country" required {...accountForm.register('country')} error={accountForm.formState.errors.country?.message} id="signup-country" />
-              <Input label="Password" type="password" placeholder="At least 8 characters" required {...accountForm.register('password')} error={accountForm.formState.errors.password?.message} id="signup-password" />
-              <Input label="Confirm Password" type="password" placeholder="Repeat your password" required {...accountForm.register('confirmPassword')} error={accountForm.formState.errors.confirmPassword?.message} id="signup-confirm-password" />
+              {!isGoogleAuth && (
+                <>
+                  <Input label="Password" type="password" placeholder="At least 8 characters" required {...accountForm.register('password')} error={accountForm.formState.errors.password?.message} id="signup-password" />
+                  <Input label="Confirm Password" type="password" placeholder="Repeat your password" required {...accountForm.register('confirmPassword')} error={accountForm.formState.errors.confirmPassword?.message} id="signup-confirm-password" />
+                </>
+              )}
             </div>
           )}
 
