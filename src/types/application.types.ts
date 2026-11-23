@@ -1,7 +1,6 @@
 export type ApplicationStatus =
   | 'submitted'
   | 'under_review'
-  | 'shortlisted'
   | 'interview'
   | 'accepted'
   | 'rejected'
@@ -33,11 +32,15 @@ export interface Application {
   }
   matchExplanation: string
 
-  cvUrl: string
-  transcriptUrl?: string
+  cvUrl?: string
+  studentGpa?: number
+  studentGpaScale?: number
   applicationStatement: string
 
   status: ApplicationStatus
+  interviewAt?: string
+  interviewMeetingUrl?: string
+  interviewInstructions?: string
   statusHistory: StatusEvent[]
 
   submittedAt: string

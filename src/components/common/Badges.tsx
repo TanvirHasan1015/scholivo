@@ -1,78 +1,7 @@
-import { CheckCircle2, Shield, Clock, XCircle, Sparkles } from 'lucide-react'
-import type { VerificationStatus, RecruitingStatus } from '@/types/user.types'
+import { Sparkles } from 'lucide-react'
+import type { RecruitingStatus } from '@/types/user.types'
+import type { ApplicationStatus } from '@/types/application.types'
 import { RECRUITING_STATUS_LABELS, cn } from '@/utils/helpers'
-
-// ── Verification Badge ────────────────────────────────────────────────────────
-
-interface VerificationBadgeProps {
-  status: VerificationStatus
-  showLabel?: boolean
-  size?: 'sm' | 'md'
-  className?: string
-}
-
-const verificationConfig = {
-  verified: {
-    label: 'Verified Faculty',
-    icon: CheckCircle2,
-    className: 'bg-emerald-50 text-emerald-700 border-emerald-200 font-semibold',
-    iconClassName: 'text-emerald-600',
-  },
-  pending: {
-    label: 'Verification Pending',
-    icon: Clock,
-    className: 'bg-amber-50 text-amber-700 border-amber-200 font-medium',
-    iconClassName: 'text-amber-600',
-  },
-  more_info_required: {
-    label: 'Needs More Info',
-    icon: Clock,
-    className: 'bg-purple-50 text-purple-700 border-purple-200 font-medium',
-    iconClassName: 'text-purple-600',
-  },
-  rejected: {
-    label: 'Verification Rejected',
-    icon: XCircle,
-    className: 'bg-red-50 text-red-700 border-red-200 font-medium',
-    iconClassName: 'text-red-600',
-  },
-  unsubmitted: {
-    label: 'Not Verified',
-    icon: Shield,
-    className: 'bg-slate-100 text-slate-600 border-slate-200 font-medium',
-    iconClassName: 'text-slate-400',
-  },
-  unverified: {
-    label: 'Unverified',
-    icon: Shield,
-    className: 'bg-slate-100 text-slate-600 border-slate-200 font-medium',
-    iconClassName: 'text-slate-400',
-  },
-}
-
-export function VerificationBadge({
-  status,
-  showLabel = true,
-  size = 'sm',
-  className,
-}: VerificationBadgeProps) {
-  const current = verificationConfig[status] || verificationConfig.unsubmitted
-  const Icon = current.icon
-
-  return (
-    <span
-      className={cn(
-        'inline-flex items-center gap-1.5 rounded-full border',
-        size === 'sm' ? 'px-2 py-0.5 text-xs' : 'px-3 py-1 text-sm',
-        current.className,
-        className
-      )}
-    >
-      <Icon size={size === 'sm' ? 13 : 15} className={current.iconClassName} />
-      {showLabel && current.label}
-    </span>
-  )
-}
 
 // ── Recruiting Status Badge ───────────────────────────────────────────────────
 
@@ -145,15 +74,14 @@ export function MatchPill({ score, prefix = '', showSparkle = false, className }
 // ── Application Status Badge ──────────────────────────────────────────────────
 
 export interface ApplicationStatusBadgeProps {
-  status: 'submitted' | 'under_review' | 'shortlisted' | 'interview_scheduled' | 'accepted' | 'rejected'
+  status: ApplicationStatus
   className?: string
 }
 
-const statusConfig: Record<ApplicationStatusBadgeProps['status'], { label: string; className: string }> = {
+const statusConfig: Record<ApplicationStatus, { label: string; className: string }> = {
   submitted: { label: 'Submitted', className: 'status-submitted' },
   under_review: { label: 'Under Review', className: 'status-review' },
-  shortlisted: { label: 'Shortlisted', className: 'status-shortlisted' },
-  interview_scheduled: { label: 'Interview Scheduled', className: 'status-interview' },
+  interview: { label: 'Interview', className: 'status-interview' },
   accepted: { label: 'Accepted', className: 'status-accepted' },
   rejected: { label: 'Rejected', className: 'status-rejected' },
 }

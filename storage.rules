@@ -1,0 +1,53 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // 1. Position-scoped application CVs
+    // - Owner student can upload/replace/delete their CV
+    // - Owner student can read their own CV
+    // - The professor who owns the position in the submitted application can read this CV
+    // - All other students and unrelated professors are strictly denied
+    match /cvs/{studentId}/{positionId}/{fileName} {
+      allow write: if request.auth != null
+                   && request.auth.uid == studentId
+                   && request.resource.size < 10 * 1024 * 1024
+                   && request.resource.contentType.matches('application/(pdf|msword|vnd.openxmlformats-officedocument.wordprocessingml.document)');
+
+      allow read: if request.auth != null && (
+        request.auth.uid == studentId ||
+        (
+          firestore.exists(/databases/(default)/documents/applications/$('app-' + studentId + '-' + positionId)) &&
+          firestore.get(/databases/(default)/documents/applications/$('app-' + studentId + '-' + positionId)).data.professorId == request.auth.uid
+        )
+      );
+
+      allow delete: if request.auth != null && request.auth.uid == studentId;
+    }
+
+    // 2. Personal profile CV files (strictly student owner-only)
+    // - Only the authenticated student can read, upload, replace, or delete their profile CV
+    // - No other users or professors can read or scan these files
+    match /cvs/{studentId}/{fileName} {
+      allow write: if request.auth != null
+                   && request.auth.uid == studentId
+                   && request.resource.size < 10 * 1024 * 1024
+                   && request.resource.contentType.matches('application/(pdf|msword|vnd.openxmlformats-officedocument.wordprocessingml.document)');
+
+      allow read: if request.auth != null && request.auth.uid == studentId;
+
+      allow delete: if request.auth != null && request.auth.uid == studentId;
+    }
+
+    // 3. User profile photos (owner-only upload/replace/delete, public read for profile & directory cards)
+    match /profilePhotos/{userId}/{fileName} {
+      allow write: if request.auth != null
+                   && request.auth.uid == userId
+                   && request.resource.size < 5 * 1024 * 1024
+                   && request.resource.contentType.matches('image/(jpeg|jpg|png|webp)');
+
+      allow read: if true;
+
+      allow delete: if request.auth != null && request.auth.uid == userId;
+    }
+  }
+}

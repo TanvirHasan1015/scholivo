@@ -94,7 +94,6 @@ export const FUNDING_LABELS: Record<string, string> = {
 export const STATUS_LABELS: Record<string, string> = {
   submitted: 'Submitted',
   under_review: 'Under Review',
-  shortlisted: 'Shortlisted',
   interview: 'Interview',
   accepted: 'Accepted',
   rejected: 'Rejected',

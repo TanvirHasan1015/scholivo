@@ -1,25 +1,52 @@
 import {
   createUserWithEmailAndPassword,
   onAuthStateChanged,
-  sendEmailVerification,
   signInWithEmailAndPassword,
   signOut,
   updateProfile,
   type User,
 } from 'firebase/auth'
 import { doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore'
-import { createContext, useContext, useEffect, useState, type ReactNode } from 'react'
-import { auth, db, isDemoMode } from '@/lib/firebase'
-import type { UserRole } from '@/types/user.types'
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
+import { auth, db } from '@/lib/firebase'
+import {
+  buildDirectoryEntryFromProfessor,
+  buildDirectoryEntryFromStudent,
+  loadSplitStudentProfile,
+  stripLegacyProfessorEmailIfPresent,
+  syncUserDirectoryEntry,
+} from '@/lib/messaging'
+import type { ProfessorProfile, UserRole } from '@/types/user.types'
 
 interface AuthContextValue {
   user: User | null
   role: UserRole | null
   loading: boolean
-  signIn: (email: string, password: string) => Promise<void>
-  signUp: (email: string, password: string, displayName: string, role: UserRole) => Promise<User>
+  sessionError: string | null
+  retrySession: () => Promise<void>
+  signIn: (email: string, password: string) => Promise<UserRole | null>
+  signUp: (
+    email: string,
+    password: string,
+    displayName: string,
+    role: UserRole,
+    onProfileSetup?: (user: User) => Promise<void>
+  ) => Promise<User>
   logout: () => Promise<void>
   refreshUser: () => Promise<void>
+}
+
+function isTransientFirestoreError(err: unknown): boolean {
+  const code = ((err as { code?: string })?.code || '').toLowerCase()
+  const msg = ((err as { message?: string })?.message || '').toLowerCase()
+  return (
+    code.includes('unavailable') ||
+    code.includes('deadline-exceeded') ||
+    code.includes('network-request-failed') ||
+    msg.includes('offline') ||
+    msg.includes('network') ||
+    msg.includes('failed to get document because the client is offline')
+  )
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null)
@@ -28,160 +55,330 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null)
   const [role, setRole] = useState<UserRole | null>(null)
   const [loading, setLoading] = useState(true)
+  const [sessionError, setSessionError] = useState<string | null>(null)
+  const activeAuthTransitionRef = useRef(false)
+
+  const isValidRole = (value: unknown): value is UserRole =>
+    value === 'student' || value === 'professor'
 
   const fetchRole = async (uid: string): Promise<UserRole | null> => {
-    try {
-      const snap = await getDoc(doc(db, 'users', uid))
-      if (snap.exists()) {
-        return snap.data().role as UserRole
+    const snap = await getDoc(doc(db, 'users', uid))
+    if (snap.exists()) {
+      const fetchedRole = snap.data().role
+      if (isValidRole(fetchedRole)) {
+        if (fetchedRole === 'professor') {
+          const pSnap = await getDoc(doc(db, 'professors', uid))
+          if (!pSnap.exists()) {
+            console.warn('Incomplete professor profile for UID:', uid)
+            return null
+          }
+          const raw = pSnap.data() as Record<string, unknown>
+          stripLegacyProfessorEmailIfPresent(uid, raw)
+          syncUserDirectoryEntry(
+            buildDirectoryEntryFromProfessor({
+              ...(raw as Partial<ProfessorProfile>),
+              uid,
+            })
+          ).catch(() => {})
+        } else if (fetchedRole === 'student') {
+          const res = await loadSplitStudentProfile(uid)
+          if (!res.exists) {
+            console.warn('Incomplete student profile for UID:', uid)
+            return null
+          }
+          syncUserDirectoryEntry(
+            buildDirectoryEntryFromStudent({
+              ...res.data,
+              uid,
+            })
+          ).catch(() => {})
+        }
+        return fetchedRole
       }
-    } catch (e) {
-      console.error('Failed to fetch role:', e)
+      console.error('Invalid or missing role in users/{uid} for UID:', uid)
+      return null
     }
+
+    // Legacy account check: inspect BOTH students/{uid} and professors/{uid} before backfilling
+    const [studentRes, profRes] = await Promise.allSettled([
+      getDoc(doc(db, 'students', uid)),
+      getDoc(doc(db, 'professors', uid)),
+    ])
+
+    if (
+      (studentRes.status === 'rejected' && isTransientFirestoreError(studentRes.reason)) ||
+      (profRes.status === 'rejected' && isTransientFirestoreError(profRes.reason))
+    ) {
+      throw studentRes.status === 'rejected' ? studentRes.reason : (profRes as PromiseRejectedResult).reason
+    }
+
+    const studentSnap = studentRes.status === 'fulfilled' ? studentRes.value : null
+    const profSnap = profRes.status === 'fulfilled' ? profRes.value : null
+
+    const hasStudent = Boolean(studentSnap?.exists())
+    const hasProf = Boolean(profSnap?.exists())
+
+    // Ambiguous state (both exist) or uninitialized state (neither exists): do not auto-assign a role
+    if ((hasStudent && hasProf) || (!hasStudent && !hasProf)) {
+      if (hasStudent && hasProf) {
+        console.error(
+          'Ambiguous account state: both student and professor profiles exist for UID:',
+          uid
+        )
+      }
+      return null
+    }
+
+    if (hasStudent && !hasProf && studentSnap) {
+      const sData = studentSnap.data() as { fullName?: string }
+      await setDoc(doc(db, 'users', uid), {
+        uid,
+        email: auth.currentUser?.email || null,
+        displayName: sData.fullName || auth.currentUser?.displayName || 'Student Researcher',
+        role: 'student',
+        isActive: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }).catch(() => {})
+      loadSplitStudentProfile(uid)
+        .then((res) => {
+          if (res.exists) {
+            syncUserDirectoryEntry(
+              buildDirectoryEntryFromStudent({
+                ...res.data,
+                uid,
+              })
+            ).catch(() => {})
+          }
+        })
+        .catch(() => {})
+      return 'student'
+    }
+
+    if (hasProf && !hasStudent && profSnap) {
+      const pData = profSnap.data() as Record<string, unknown>
+      await setDoc(doc(db, 'users', uid), {
+        uid,
+        email: auth.currentUser?.email || null,
+        displayName:
+          (typeof pData.fullName === 'string' && pData.fullName) ||
+          auth.currentUser?.displayName ||
+          'Faculty Member',
+        role: 'professor',
+        isActive: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }).catch(() => {})
+      stripLegacyProfessorEmailIfPresent(uid, pData)
+      syncUserDirectoryEntry(
+        buildDirectoryEntryFromProfessor({
+          ...(pData as Partial<ProfessorProfile>),
+          uid,
+        })
+      ).catch(() => {})
+      return 'professor'
+    }
+
     return null
   }
 
-  useEffect(() => {
-    if (isDemoMode) {
-      // In demo mode, load demo student session
-      const isLoggedOut = localStorage.getItem('rm_logged_out') === 'true'
-      const saved = localStorage.getItem('rm_demo_user')
+  const resolveAuthenticatedSession = async (firebaseUser: User) => {
+    setSessionError(null)
+    try {
+      const userRole = await fetchRole(firebaseUser.uid)
+      if (!userRole) {
+        console.warn('Failed role/profile resolution for UID:', firebaseUser.uid)
+        await signOut(auth).catch(() => {})
+        setUser(null)
+        setRole(null)
+        setSessionError('Your account profile setup is incomplete. Please complete registration on the sign-up page.')
+      } else {
+        setUser(firebaseUser)
+        setRole(userRole)
+        setSessionError(null)
+      }
+    } catch (err) {
+      console.error('Temporary error resolving session:', err)
+      if (isTransientFirestoreError(err)) {
+        // Preserve authenticated Firebase Auth session during temporary Firestore/network outage
+        setUser(firebaseUser)
+        setRole(null)
+        setSessionError('Unable to verify your account due to a temporary connection issue. Please retry.')
+      } else {
+        await signOut(auth).catch(() => {})
+        setUser(null)
+        setRole(null)
+        setSessionError('Failed to verify your account permissions. Please sign in again.')
+      }
+    }
+  }
 
-      if (saved && !isLoggedOut) {
-        try {
-          const parsed = JSON.parse(saved)
-          setUser(parsed.user)
-          setRole(parsed.role)
-        } catch {
-          localStorage.removeItem('rm_demo_user')
-          setUser(null)
-          setRole(null)
-        }
-      } else if (!isLoggedOut) {
-        // First-time visit in demo mode defaults to student session for frictionless preview
-        const defaultStudent = {
-          uid: 'demo-student',
-          email: 'alex.rivera@university.edu',
-          displayName: 'Alex Rivera',
-          photoURL: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&q=80&w=200',
-          emailVerified: true,
-        } as unknown as User
-        setUser(defaultStudent)
-        setRole('student')
-        localStorage.setItem('rm_demo_user', JSON.stringify({ user: defaultStudent, role: 'student' }))
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      // If signIn() or signUp() is actively resolving the user and role, let it finish
+      // so onAuthStateChanged does not race and overwrite role or flicker loading state.
+      if (activeAuthTransitionRef.current) {
+        return
+      }
+      setLoading(true)
+      if (firebaseUser) {
+        await resolveAuthenticatedSession(firebaseUser)
       } else {
         setUser(null)
         setRole(null)
-      }
-      setLoading(false)
-      return
-    }
-
-    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
-      setUser(firebaseUser)
-      if (firebaseUser) {
-        const userRole = await fetchRole(firebaseUser.uid)
-        setRole(userRole)
-      } else {
-        setRole(null)
+        setSessionError(null)
       }
       setLoading(false)
     })
     return unsubscribe
   }, [])
 
-  const signIn = async (email: string, password: string) => {
-    if (isDemoMode) {
-      localStorage.removeItem('rm_logged_out')
-      const lower = email.toLowerCase().trim()
-
-      // Check if user already exists in registered demo system users
-      let matchedSysUser: any = null
-      const systemUsersStr = localStorage.getItem('rm_demo_system_users')
-      if (systemUsersStr) {
-        try {
-          const sysUsers = JSON.parse(systemUsersStr)
-          matchedSysUser = sysUsers.find((u: any) => u.email && u.email.toLowerCase() === lower)
-        } catch {
-          // ignore
-        }
-      }
-
-      const assignedRole: UserRole = matchedSysUser?.role
-        ? matchedSysUser.role
-        : lower.includes('admin')
-        ? 'admin'
-        : (lower.includes('prof') || lower.includes('faculty') || lower.includes('kim'))
-        ? 'professor'
-        : 'student'
-
-      const demoUser = {
-        uid: matchedSysUser?.uid || (assignedRole === 'professor' ? 'demo-1' : assignedRole === 'admin' ? 'demo-admin' : 'demo-student'),
-        email: matchedSysUser?.email || email || (assignedRole === 'professor' ? 'minji.kim@kaist.ac.kr' : assignedRole === 'admin' ? 'admin@scholivo.edu' : 'alex.rivera@university.edu'),
-        displayName: matchedSysUser?.displayName || (assignedRole === 'professor' ? 'Prof. Minji Kim' : assignedRole === 'admin' ? 'System Administrator' : 'Alex Rivera'),
-        photoURL: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&q=80&w=200',
-        emailVerified: true,
-      } as unknown as User
-
-      setUser(demoUser)
-      setRole(assignedRole)
-      localStorage.setItem('rm_demo_user', JSON.stringify({ user: demoUser, role: assignedRole }))
-      return
+  const retrySession = async () => {
+    if (!auth.currentUser) return
+    setLoading(true)
+    try {
+      await resolveAuthenticatedSession(auth.currentUser)
+    } finally {
+      setLoading(false)
     }
-    await signInWithEmailAndPassword(auth, email, password)
+  }
+
+  const signIn = async (email: string, password: string): Promise<UserRole | null> => {
+    activeAuthTransitionRef.current = true
+    setLoading(true)
+    setSessionError(null)
+    try {
+      const credential = await signInWithEmailAndPassword(auth, email.trim(), password)
+      const userRole = await fetchRole(credential.user.uid)
+      if (!userRole) {
+        await signOut(auth).catch(() => {})
+        setUser(null)
+        setRole(null)
+        return null
+      }
+      setUser(credential.user)
+      setRole(userRole)
+      return userRole
+    } finally {
+      activeAuthTransitionRef.current = false
+      setLoading(false)
+    }
   }
 
   const signUp = async (
     email: string,
     password: string,
     displayName: string,
-    userRole: UserRole
+    userRole: UserRole,
+    onProfileSetup?: (user: User) => Promise<void>
   ): Promise<User> => {
-    if (isDemoMode) {
-      localStorage.removeItem('rm_logged_out')
-      const demoUser = {
-        uid: `demo-${Date.now()}`,
-        email,
-        displayName,
-        photoURL: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&q=80&w=200',
-        emailVerified: true,
-      } as unknown as User
-      setUser(demoUser)
+    activeAuthTransitionRef.current = true
+    setLoading(true)
+    setSessionError(null)
+    let newUser: User
+
+    try {
+      try {
+        const credential = await createUserWithEmailAndPassword(auth, email.trim(), password)
+        newUser = credential.user
+      } catch (err: unknown) {
+        const code = (err as { code?: string })?.code
+        // If a previous signup attempt created the Auth account but failed before finishing
+        // Firestore profile creation, allow the user to resume and complete registration.
+        if (code === 'auth/email-already-in-use') {
+          const previousUser = auth.currentUser
+          const reusingExistingSession =
+            Boolean(previousUser) &&
+            previousUser?.email?.toLowerCase() === email.trim().toLowerCase()
+          let signedInForRecovery = false
+
+          try {
+            const candidateUser = reusingExistingSession && previousUser
+              ? previousUser
+              : (await signInWithEmailAndPassword(auth, email.trim(), password)).user
+
+            if (!reusingExistingSession) {
+              signedInForRecovery = true
+            }
+
+            const [userDocRes, studentDocRes, profDocRes] = await Promise.allSettled([
+              getDoc(doc(db, 'users', candidateUser.uid)),
+              getDoc(doc(db, 'students', candidateUser.uid)),
+              getDoc(doc(db, 'professors', candidateUser.uid)),
+            ])
+
+            const userDocSnap = userDocRes.status === 'fulfilled' ? userDocRes.value : null
+            const hasStudentDoc =
+              studentDocRes.status === 'fulfilled' && studentDocRes.value.exists()
+            const hasProfDoc = profDocRes.status === 'fulfilled' && profDocRes.value.exists()
+            const recordedRole = userDocSnap?.exists() ? userDocSnap.data().role : null
+
+            // Block if account has conflicting profiles, belongs to the opposite role, or is already complete
+            if (
+              (hasStudentDoc && hasProfDoc) ||
+              (recordedRole && recordedRole !== userRole) ||
+              (userRole === 'student' && hasProfDoc) ||
+              (userRole === 'professor' && hasStudentDoc) ||
+              (userRole === 'student' && hasStudentDoc && recordedRole === 'student') ||
+              (userRole === 'professor' && hasProfDoc && recordedRole === 'professor')
+            ) {
+              if (signedInForRecovery) {
+                await signOut(auth).catch(() => {})
+              }
+              throw err
+            }
+
+            newUser = candidateUser
+          } catch (recoveryErr) {
+            if (signedInForRecovery && auth.currentUser?.email?.toLowerCase() === email.trim().toLowerCase()) {
+              await signOut(auth).catch(() => {})
+            }
+            if (recoveryErr === err) throw err
+            throw err
+          }
+        } else {
+          throw err
+        }
+      }
+
+      try {
+        await updateProfile(newUser, { displayName })
+      } catch (profileErr) {
+        console.warn('Could not update displayName on Auth user:', profileErr)
+      }
+
+      await setDoc(
+        doc(db, 'users', newUser.uid),
+        {
+          uid: newUser.uid,
+          email: newUser.email,
+          displayName,
+          role: userRole,
+          isActive: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      )
+
+      if (onProfileSetup) {
+        await onProfileSetup(newUser)
+      }
+
+      setUser(newUser)
       setRole(userRole)
-      localStorage.setItem('rm_demo_user', JSON.stringify({ user: demoUser, role: userRole }))
-      return demoUser
+      return newUser
+    } finally {
+      activeAuthTransitionRef.current = false
+      setLoading(false)
     }
-    const credential = await createUserWithEmailAndPassword(auth, email, password)
-    const { user: newUser } = credential
-
-    await updateProfile(newUser, { displayName })
-    await sendEmailVerification(newUser)
-
-    // Create base user document
-    await setDoc(doc(db, 'users', newUser.uid), {
-      uid: newUser.uid,
-      email: newUser.email,
-      displayName,
-      role: userRole,
-      isActive: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    })
-
-    setRole(userRole)
-    return newUser
   }
 
   const logout = async () => {
-    if (isDemoMode) {
-      localStorage.removeItem('rm_demo_user')
-      localStorage.setItem('rm_logged_out', 'true')
-      setUser(null)
-      setRole(null)
-      return
-    }
     await signOut(auth)
+    setUser(null)
     setRole(null)
+    setSessionError(null)
   }
 
   const refreshUser = async () => {
@@ -192,7 +389,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   return (
-    <AuthContext.Provider value={{ user, role, loading, signIn, signUp, logout, refreshUser }}>
+    <AuthContext.Provider value={{ user, role, loading, sessionError, retrySession, signIn, signUp, logout, refreshUser }}>
       {children}
     </AuthContext.Provider>
   )

@@ -5,14 +5,16 @@ import type { StudentProfile } from '@/types/user.types'
 // ── Jaccard Similarity ────────────────────────────────────────────────────────
 
 function jaccardSimilarity(setA: string[], setB: string[]): number {
-  if (setA.length === 0 && setB.length === 0) return 1
-  if (setA.length === 0 || setB.length === 0) return 0
+  const safeA = setA ?? []
+  const safeB = setB ?? []
+  if (safeA.length === 0 && safeB.length === 0) return 1
+  if (safeA.length === 0 || safeB.length === 0) return 0
 
   const normalizeTerms = (terms: string[]) =>
-    terms.map((t) => t.toLowerCase().trim())
+    terms.filter(Boolean).map((t) => t.toLowerCase().trim())
 
-  const a = new Set(normalizeTerms(setA))
-  const b = new Set(normalizeTerms(setB))
+  const a = new Set(normalizeTerms(safeA))
+  const b = new Set(normalizeTerms(safeB))
 
   // Also count partial substring matches (e.g. "CV" matches "Computer Vision")
   let intersectionCount = 0
@@ -38,10 +40,13 @@ function jaccardSimilarity(setA: string[], setB: string[]): number {
 // ── Research Interests Score (35%) ────────────────────────────────────────────
 
 function scoreResearchInterests(student: StudentProfile, position: Position): { score: number; matched: string[] } {
-  const studentTerms = [...student.researchInterests, ...student.researchAreas]
-  const positionTerms = [...position.researchTopics, position.researchArea]
+  const studentTerms = [...(student.researchInterests ?? []), ...(student.researchAreas ?? [])]
+  const positionTerms = [
+    ...(position.researchTopics ?? []),
+    ...(position.researchArea ? [position.researchArea] : []),
+  ]
 
-  const normalized = (terms: string[]) => terms.map((t) => t.toLowerCase().trim())
+  const normalized = (terms: string[]) => terms.filter(Boolean).map((t) => t.toLowerCase().trim())
   const sNorm = normalized(studentTerms)
   const pNorm = normalized(positionTerms)
 
@@ -62,16 +67,16 @@ function scoreResearchInterests(student: StudentProfile, position: Position): { 
 
 function scoreSkills(student: StudentProfile, position: Position): { score: number; matched: string[] } {
   const studentSkills = [
-    ...student.programmingLanguages,
-    ...student.frameworks,
-    ...student.technicalSkills,
-    ...student.researchTools,
+    ...(student.programmingLanguages ?? []),
+    ...(student.frameworks ?? []),
+    ...(student.technicalSkills ?? []),
+    ...(student.researchTools ?? []),
   ]
 
-  const normalized = (terms: string[]) => terms.map((t) => t.toLowerCase().trim())
+  const normalized = (terms: string[]) => terms.filter(Boolean).map((t) => t.toLowerCase().trim())
   const sSkills = normalized(studentSkills)
-  const required = normalized(position.requiredSkills)
-  const preferred = normalized(position.preferredSkills)
+  const required = normalized(position.requiredSkills ?? [])
+  const preferred = normalized(position.preferredSkills ?? [])
 
   const matched: string[] = []
   let requiredScore = 0
@@ -102,14 +107,17 @@ function scoreSkills(student: StudentProfile, position: Position): { score: numb
 // ── Language Score (15%) ──────────────────────────────────────────────────────
 
 function scoreLanguage(student: StudentProfile, position: Position): number {
-  if (!position.languageRequirements || position.languageRequirements.length === 0) return 1
+  const requirements = position.languageRequirements ?? []
+  if (!requirements || requirements.length === 0) return 1
 
   let total = 0
   let count = 0
 
-  position.languageRequirements.forEach((req) => {
-    const studentScore = student.languageScores.find(
-      (ls) => ls.type.toLowerCase() === req.type.toLowerCase()
+  const studentScores = student.languageScores ?? []
+
+  requirements.forEach((req) => {
+    const studentScore = studentScores.find(
+      (ls) => ls?.type && req?.type && ls.type.toLowerCase() === req.type.toLowerCase()
     )
 
     if (!studentScore) {
@@ -142,8 +150,10 @@ const FIELD_GROUPS: Record<string, string[]> = {
 }
 
 function scoreMajor(student: StudentProfile, position: Position): number {
-  const studentMajor = student.major.toLowerCase()
-  const positionArea = position.researchArea.toLowerCase()
+  const studentMajor = (student.major ?? '').toLowerCase()
+  const positionArea = (position.researchArea ?? '').toLowerCase()
+
+  if (!studentMajor || !positionArea) return 0.2
 
   // Exact match
   if (studentMajor.includes(positionArea) || positionArea.includes(studentMajor)) return 1
@@ -155,8 +165,8 @@ function scoreMajor(student: StudentProfile, position: Position): number {
   }
 
   // Cross-disciplinary similarity (partial)
-  const studentWords = studentMajor.split(/\s+/)
-  const positionWords = positionArea.split(/\s+/)
+  const studentWords = studentMajor.split(/\s+/).filter(Boolean)
+  const positionWords = positionArea.split(/\s+/).filter(Boolean)
   const overlap = studentWords.filter((w) => positionWords.includes(w) && w.length > 3)
   if (overlap.length > 0) return 0.5
 
@@ -166,9 +176,9 @@ function scoreMajor(student: StudentProfile, position: Position): number {
 // ── Experience Score (10%) ────────────────────────────────────────────────────
 
 function scoreExperience(student: StudentProfile): number {
-  const expCount = student.researchExperience.length
-  const pubCount = student.publications.length
-  const projectCount = student.projects.length
+  const expCount = (student.researchExperience ?? []).length
+  const pubCount = (student.publications ?? []).length
+  const projectCount = (student.projects ?? []).length
 
   let score = 0
 
@@ -197,15 +207,18 @@ function generateExplanation(
 ): string {
   const parts: string[] = []
 
-  if (matchedResearch.length > 0) {
-    const top = matchedResearch.slice(0, 3).map((k) => k.replace(/\b\w/g, (c) => c.toUpperCase()))
+  const safeResearch = matchedResearch ?? []
+  const safeSkills = matchedSkills ?? []
+
+  if (safeResearch.length > 0) {
+    const top = safeResearch.slice(0, 3).map((k) => k.replace(/\b\w/g, (c) => c.toUpperCase()))
     parts.push(`Strong research overlap in ${top.join(', ')}.`)
   } else {
     parts.push('Limited research interest overlap detected.')
   }
 
-  if (matchedSkills.length > 0) {
-    const top = matchedSkills.slice(0, 4).map((k) => k.replace(/\b\w/g, (c) => c.toUpperCase()))
+  if (safeSkills.length > 0) {
+    const top = safeSkills.slice(0, 4).map((k) => k.replace(/\b\w/g, (c) => c.toUpperCase()))
     parts.push(`Matching skills: ${top.join(', ')}.`)
   }
 

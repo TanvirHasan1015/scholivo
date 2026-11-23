@@ -1,11 +1,10 @@
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, Navigate, useNavigate } from 'react-router-dom'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { Mail, Lock, Eye, EyeOff, Sparkles, ArrowRight, Shield } from 'lucide-react'
+import { Mail, Lock, Eye, EyeOff } from 'lucide-react'
 import { useAuth } from '@/context/AuthContext'
-import { isDemoMode } from '@/lib/firebase'
 import { Input } from '@/components/common/Input'
 import { Button } from '@/components/common/Button'
 import { BrandLogo } from '@/components/common/BrandLogo'
@@ -18,10 +17,11 @@ const schema = z.object({
 type FormData = z.infer<typeof schema>
 
 export default function Login() {
-  const { signIn, role } = useAuth()
+  const { user, role, loading, sessionError, retrySession, signIn, logout } = useAuth()
   const navigate = useNavigate()
   const [showPassword, setShowPassword] = useState(false)
   const [authError, setAuthError] = useState('')
+  const [retrying, setRetrying] = useState(false)
 
   const {
     register,
@@ -29,55 +29,66 @@ export default function Login() {
     formState: { errors, isSubmitting },
   } = useForm<FormData>({ resolver: zodResolver(schema) })
 
+  // If already authenticated with a valid authoritative role, redirect straight to the user's dashboard
+  if (!loading && user && (role === 'student' || role === 'professor')) {
+    return (
+      <Navigate
+        to={role === 'professor' ? '/dashboard/professor' : '/dashboard/student'}
+        replace
+      />
+    )
+  }
+
   const onSubmit = async (data: FormData) => {
     setAuthError('')
     try {
-      await signIn(data.email, data.password)
-      setTimeout(() => {
-        const currentRole = role
-        if (currentRole === 'professor') navigate('/dashboard/professor')
-        else if (currentRole === 'admin') navigate('/admin')
-        else navigate('/dashboard/student')
-      }, 100)
+      const resolvedRole = await signIn(data.email, data.password)
+      if (resolvedRole === 'professor') {
+        navigate('/dashboard/professor', { replace: true })
+      } else if (resolvedRole === 'student') {
+        navigate('/dashboard/student', { replace: true })
+      } else {
+        setAuthError('Your account profile setup is incomplete. Please complete registration on the sign-up page.')
+      }
     } catch (err: unknown) {
-      const code = (err as { code?: string })?.code
-      if (code === 'auth/user-not-found' || code === 'auth/wrong-password' || code === 'auth/invalid-credential') {
+      const code = ((err as { code?: string })?.code || '').toLowerCase()
+      const msg = ((err as { message?: string })?.message || '').toLowerCase()
+      if (
+        code === 'auth/user-not-found' ||
+        code === 'auth/wrong-password' ||
+        code === 'auth/invalid-credential'
+      ) {
         setAuthError('Invalid email or password. Please try again.')
+      } else if (code === 'auth/invalid-email') {
+        setAuthError('Please enter a valid email address.')
+      } else if (code === 'auth/user-disabled') {
+        setAuthError('This account has been disabled. Please contact support.')
+      } else if (code === 'auth/too-many-requests') {
+        setAuthError('Too many failed attempts. Please wait a few minutes and try again.')
+      } else if (
+        code === 'auth/network-request-failed' ||
+        code.includes('unavailable') ||
+        code.includes('deadline-exceeded') ||
+        msg.includes('offline') ||
+        msg.includes('network')
+      ) {
+        setAuthError('Network error while signing in. Please check your connection and try again.')
       } else {
         setAuthError('Sign in failed. Please try again.')
       }
     }
   }
 
-  const handleDemoSignIn = async () => {
-    setAuthError('')
+  const handleRetrySession = async () => {
+    setRetrying(true)
     try {
-      await signIn('alex.rivera@university.edu', 'demo123')
-      navigate('/dashboard/student')
-    } catch {
-      setAuthError('Demo sign in failed.')
+      await retrySession()
+    } finally {
+      setRetrying(false)
     }
   }
 
-  const handleDemoProfSignIn = async () => {
-    setAuthError('')
-    try {
-      await signIn('prof.kim@kaist.ac.kr', 'demo123')
-      navigate('/dashboard/professor')
-    } catch {
-      setAuthError('Demo professor sign in failed.')
-    }
-  }
-
-  const handleDemoAdminSignIn = async () => {
-    setAuthError('')
-    try {
-      await signIn('admin@scholivo.edu', 'demo123')
-      navigate('/admin')
-    } catch {
-      setAuthError('Demo admin sign in failed.')
-    }
-  }
+  const displayError = authError || sessionError
 
   return (
     <div className="min-h-screen bg-slate-50/70 flex items-center justify-center px-4 py-16">
@@ -120,9 +131,32 @@ export default function Login() {
               id="login-password"
             />
 
-            {authError && (
-              <div className="rounded-xl bg-red-50 border border-red-200 px-4 py-3 text-xs font-semibold text-red-600">
-                {authError}
+            {displayError && (
+              <div className="rounded-xl bg-red-50 border border-red-200 px-4 py-3 text-xs font-semibold text-red-600 space-y-2">
+                <p>{displayError}</p>
+                {user && !role && (
+                  <div className="flex items-center gap-2 pt-1">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      loading={retrying}
+                      onClick={handleRetrySession}
+                      className="text-xs"
+                    >
+                      Retry Session
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => logout()}
+                      className="text-xs text-red-700"
+                    >
+                      Sign Out
+                    </Button>
+                  </div>
+                )}
               </div>
             )}
 
@@ -130,49 +164,6 @@ export default function Login() {
               Sign In
             </Button>
           </form>
-
-          {isDemoMode && (
-            <div className="pt-2 space-y-2">
-              <Button
-                type="button"
-                variant="outline"
-                fullWidth
-                size="md"
-                onClick={handleDemoSignIn}
-                className="flex items-center justify-center gap-2 border-dashed border-blue-300 bg-blue-50/50 text-blue-700 hover:bg-blue-50 cursor-pointer font-semibold"
-                id="demo-student-login-btn"
-              >
-                <Sparkles size={14} className="text-blue-600" />
-                <span>Quick Sign-in as Demo Student (Alex)</span>
-              </Button>
-
-              <Button
-                type="button"
-                variant="outline"
-                fullWidth
-                size="md"
-                onClick={handleDemoProfSignIn}
-                className="flex items-center justify-center gap-2 border-dashed border-indigo-300 bg-indigo-50/50 text-indigo-700 hover:bg-indigo-50 cursor-pointer font-semibold"
-                id="demo-professor-login-btn"
-              >
-                <Sparkles size={14} className="text-indigo-600" />
-                <span>Quick Sign-in as Demo Professor (Prof. Kim)</span>
-              </Button>
-
-              <Button
-                type="button"
-                variant="outline"
-                fullWidth
-                size="md"
-                onClick={handleDemoAdminSignIn}
-                className="flex items-center justify-center gap-2 border-dashed border-purple-300 bg-purple-50/50 text-purple-700 hover:bg-purple-50 cursor-pointer font-semibold"
-                id="demo-admin-login-btn"
-              >
-                <Shield size={14} className="text-purple-600" />
-                <span>Quick Sign-in as Demo Administrator</span>
-              </Button>
-            </div>
-          )}
 
           <div className="pt-4 border-t border-slate-100">
             <p className="text-center text-xs text-slate-500">

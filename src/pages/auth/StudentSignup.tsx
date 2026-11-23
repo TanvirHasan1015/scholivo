@@ -1,17 +1,21 @@
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, Navigate, useNavigate } from 'react-router-dom'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { BookOpen, User, GraduationCap, FlaskConical, Code, Languages, FileText, ChevronRight, ChevronLeft } from 'lucide-react'
-import { doc, setDoc, serverTimestamp } from 'firebase/firestore'
+import { User, GraduationCap, FlaskConical, Code, Languages, FileText, ChevronRight, ChevronLeft } from 'lucide-react'
+import { serverTimestamp } from 'firebase/firestore'
 import { useAuth } from '@/context/AuthContext'
-import { db } from '@/lib/firebase'
+import {
+  buildDirectoryEntryFromStudent,
+  saveSplitStudentProfile,
+  syncUserDirectoryEntry,
+} from '@/lib/messaging'
 import { Input, Select, Textarea } from '@/components/common/Input'
 import { TagInput } from '@/components/common/TagInput'
 import { Button } from '@/components/common/Button'
 import { BrandLogo } from '@/components/common/BrandLogo'
-import { RESEARCH_AREAS, COUNTRIES } from '@/utils/helpers'
+import { RESEARCH_AREAS, COUNTRIES, calculateProfileCompleteness } from '@/utils/helpers'
 
 // ── Validation schema ─────────────────────────────────────────────────────────
 
@@ -47,10 +51,9 @@ const DEGREE_OPTIONS = [
 ]
 
 const COUNTRY_OPTIONS = COUNTRIES.map((c) => ({ value: c, label: c }))
-const AREA_OPTIONS = RESEARCH_AREAS.map((a) => ({ value: a, label: a }))
 
 export default function StudentSignup() {
-  const { signUp } = useAuth()
+  const { signUp, user: currentUser, role, loading: authLoading } = useAuth()
   const navigate = useNavigate()
   const [currentStep, setCurrentStep] = useState(0)
   const [error, setError] = useState('')
@@ -74,6 +77,8 @@ export default function StudentSignup() {
   const [language, setLanguage] = useState({
     ielts: '', toefl: '', topik: '', other: '', otherLabel: '',
   })
+  const [cvUrl, setCvUrl] = useState('')
+  const [portfolioUrl, setPortfolioUrl] = useState('')
 
   const handleNext = async () => {
     if (currentStep === 0) {
@@ -92,110 +97,102 @@ export default function StudentSignup() {
     setIsSubmitting(true)
     try {
       const accountData = accountForm.getValues()
-      const user = await signUp(accountData.email, accountData.password, accountData.fullName, 'student')
+      const languageScores: Array<{
+        id: string
+        type: 'IELTS' | 'TOEFL' | 'TOPIK' | 'Other'
+        score: string
+        label?: string
+      }> = []
+      if (language.ielts) languageScores.push({ id: 'ielts', type: 'IELTS' as const, score: language.ielts })
+      if (language.toefl) languageScores.push({ id: 'toefl', type: 'TOEFL' as const, score: language.toefl })
+      if (language.topik) languageScores.push({ id: 'topik', type: 'TOPIK' as const, score: language.topik })
+      if (language.other && language.otherLabel) languageScores.push({ id: 'other', type: 'Other' as const, score: language.other, label: language.otherLabel })
 
-      const languageScores = []
-      if (language.ielts) languageScores.push({ id: 'ielts', type: 'IELTS', score: language.ielts })
-      if (language.toefl) languageScores.push({ id: 'toefl', type: 'TOEFL', score: language.toefl })
-      if (language.topik) languageScores.push({ id: 'topik', type: 'TOPIK', score: language.topik })
-      if (language.other && language.otherLabel) languageScores.push({ id: 'other', type: 'Other', score: language.other, label: language.otherLabel })
+      const parsedGpa = parseFloat(academic.gpa)
+      const parsedGpaScale = parseFloat(academic.gpaScale)
 
-      const newStudentProfile = {
-        uid: user.uid,
-        fullName: accountData.fullName,
-        username: accountData.username,
-        email: accountData.email,
-        country: accountData.country,
-        university: academic.university || 'Seoul National University',
-        department: academic.department || 'Computer Science',
-        major: academic.major || 'Computer Science',
-        degree: academic.degree || 'Bachelor',
-        currentSemester: academic.currentSemester || '1st Semester',
-        expectedGraduation: academic.expectedGraduation || '2028-02',
-        gpa: parseFloat(academic.gpa) || 3.8,
-        gpaScale: parseFloat(academic.gpaScale) || 4.0,
-        researchInterests: research.researchInterests || ['Artificial Intelligence'],
-        researchAreas: research.researchAreas || ['Artificial Intelligence'],
-        bio: research.bio || '',
-        researchExperience: [],
-        projects: [],
-        publications: [],
-        programmingLanguages: skills.programmingLanguages || ['Python'],
-        frameworks: skills.frameworks || ['PyTorch'],
-        technicalSkills: skills.technicalSkills || ['Deep Learning'],
-        researchTools: skills.researchTools || ['Git'],
-        languageScores,
-        verificationStatus: 'pending' as const,
-        accountStatus: 'active' as const,
-        profileCompleteness: 75,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      }
+      await signUp(accountData.email, accountData.password, accountData.fullName, 'student', async (user) => {
+        const baseProfile = {
+          uid: user.uid,
+          fullName: accountData.fullName.trim(),
+          username: accountData.username.trim(),
+          email: accountData.email.trim(),
+          country: accountData.country,
+          university: academic.university.trim(),
+          department: academic.department.trim(),
+          major: academic.major.trim(),
+          degree: (academic.degree || 'Master') as 'Bachelor' | 'Master' | 'PhD',
+          currentSemester: academic.currentSemester.trim(),
+          expectedGraduation: academic.expectedGraduation,
+          gpa: Number.isFinite(parsedGpa) ? parsedGpa : 0,
+          gpaScale: Number.isFinite(parsedGpaScale) ? parsedGpaScale : 4.0,
+          researchInterests: research.researchInterests,
+          researchAreas: research.researchAreas,
+          bio: research.bio.trim(),
+          researchExperience: [],
+          projects: [],
+          publications: [],
+          programmingLanguages: skills.programmingLanguages,
+          frameworks: skills.frameworks,
+          technicalSkills: skills.technicalSkills,
+          researchTools: skills.researchTools,
+          languageScores,
+          cvUrl: cvUrl.trim(),
+          portfolioUrl: portfolioUrl.trim(),
+          savedProfessorIds: [],
+        }
 
-      // 1. Save profile to localStorage
-      localStorage.setItem('rm_demo_student_profile', JSON.stringify(newStudentProfile))
+        const newStudentProfile = {
+          ...baseProfile,
+          profileCompleteness: calculateProfileCompleteness({
+            ...baseProfile,
+            languageScores,
+            cvUrl: cvUrl.trim(),
+          }),
+        }
 
-      // 2. Queue verification request in rm_demo_verifications
-      const newVerificationReq = {
-        id: `req-${Date.now()}`,
-        userId: user.uid,
-        userName: accountData.fullName,
-        userEmail: accountData.email,
-        userRole: 'student' as const,
-        university: academic.university || 'Seoul National University',
-        department: academic.department || 'Computer Science',
-        academicTitleOrDegree: `${academic.degree || 'Bachelor'} in ${academic.major || 'Computer Science'}`,
-        docType: 'Official Academic Transcript & Student Enrollment Letter',
-        docUrl: 'https://example.com/student_transcript.pdf',
-        status: 'pending' as const,
-        accountStatus: 'active' as const,
-        submittedAt: new Date().toISOString(),
-      }
-
-      const existingVerifications = localStorage.getItem('rm_demo_verifications')
-      const verificationsList = existingVerifications ? JSON.parse(existingVerifications) : []
-      localStorage.setItem('rm_demo_verifications', JSON.stringify([newVerificationReq, ...verificationsList]))
-
-      // 3. Add to rm_demo_system_users
-      const newSystemUser = {
-        uid: user.uid,
-        displayName: accountData.fullName,
-        email: accountData.email,
-        role: 'student' as const,
-        university: academic.university || 'Seoul National University',
-        department: academic.department || 'Computer Science',
-        academicTitleOrDegree: `${academic.degree || 'Bachelor'} in ${academic.major || 'Computer Science'}`,
-        verificationStatus: 'pending' as const,
-        accountStatus: 'active' as const,
-        createdAt: new Date().toISOString().slice(0, 10),
-        applicationsCount: 0,
-      }
-      const existingUsers = localStorage.getItem('rm_demo_system_users')
-      const usersList = existingUsers ? JSON.parse(existingUsers) : []
-      localStorage.setItem('rm_demo_system_users', JSON.stringify([newSystemUser, ...usersList]))
-
-      try {
-        await setDoc(doc(db, 'students', user.uid), {
+        await saveSplitStudentProfile(user.uid, {
           ...newStudentProfile,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         })
-      } catch {
-        // demo mode Firestore fallback
-      }
 
-      navigate('/dashboard/student')
+        await syncUserDirectoryEntry(buildDirectoryEntryFromStudent(newStudentProfile))
+      })
+
+      navigate('/dashboard/student', { replace: true })
     } catch (err: unknown) {
-      const code = (err as { code?: string })?.code
+      const code = ((err as { code?: string })?.code || '').toLowerCase()
+      const msg = ((err as { message?: string })?.message || '').toLowerCase()
       if (code === 'auth/email-already-in-use') {
         setError('This email is already registered. Please sign in.')
+      } else if (code === 'auth/invalid-email') {
+        setError('Please enter a valid email address.')
+      } else if (code === 'auth/weak-password') {
+        setError('Password is too weak. Please use at least 8 characters.')
+      } else if (code === 'auth/too-many-requests') {
+        setError('Too many attempts. Please wait a few minutes and try again.')
+      } else if (code === 'auth/user-disabled') {
+        setError('This account has been disabled. Please contact support.')
+      } else if (
+        code === 'auth/network-request-failed' ||
+        code.includes('unavailable') ||
+        code.includes('deadline-exceeded') ||
+        msg.includes('offline') ||
+        msg.includes('network')
+      ) {
+        setError('Network error while saving your profile. Please check your connection and click Create Account again to retry.')
       } else {
-        setError('Sign up failed. Please try again.')
+        setError('Sign up failed while saving your profile. Please try again.')
         console.error(err)
       }
     } finally {
       setIsSubmitting(false)
     }
+  }
+
+  if (!authLoading && !isSubmitting && currentUser && (role === 'student' || role === 'professor')) {
+    return <Navigate to={role === 'professor' ? '/dashboard/professor' : '/dashboard/student'} replace />
   }
 
   return (
@@ -365,21 +362,26 @@ export default function StudentSignup() {
           {currentStep === 5 && (
             <div className="space-y-5 fade-in-up">
               <div className="flex items-center justify-between mb-5">
-                <h2 className="font-semibold text-white text-lg">Documents</h2>
-                <span className="text-xs text-slate-500">Can be added later</span>
+                <h2 className="font-semibold text-white text-lg">CV & Portfolio</h2>
+                <span className="text-xs text-slate-500">Optional — can also upload or update later</span>
               </div>
-              <div className="glass rounded-2xl border border-white/8 p-5 text-center">
-                <FileText size={32} className="text-slate-600 mx-auto mb-3" />
-                <p className="text-slate-400 text-sm mb-1">CV / Resume</p>
-                <p className="text-xs text-slate-600 mb-4">You can upload your CV after creating your account from your profile page.</p>
-                <Button variant="secondary" size="sm" type="button">Upload CV (PDF)</Button>
-              </div>
-              <div className="glass rounded-2xl border border-white/8 p-5 text-center">
-                <FileText size={32} className="text-slate-600 mx-auto mb-3" />
-                <p className="text-slate-400 text-sm mb-1">Academic Transcript</p>
-                <p className="text-xs text-slate-600 mb-4">Optional. You can add this later from your profile.</p>
-                <Button variant="secondary" size="sm" type="button">Upload Transcript (PDF)</Button>
-              </div>
+              <Input
+                label="Curriculum Vitae (CV) Link"
+                type="url"
+                placeholder="https://example.com/your-cv.pdf"
+                value={cvUrl}
+                onChange={(e) => setCvUrl(e.target.value)}
+                id="signup-cv-url"
+                hint="You can also upload a PDF/DOCX CV file directly from your Student Profile or when applying."
+              />
+              <Input
+                label="Personal Website / GitHub Portfolio"
+                type="url"
+                placeholder="https://github.com/username"
+                value={portfolioUrl}
+                onChange={(e) => setPortfolioUrl(e.target.value)}
+                id="signup-portfolio-url"
+              />
               {error && (
                 <div className="rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3 text-sm text-red-400">
                   {error}

@@ -1,25 +1,30 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { doc, getDoc } from 'firebase/firestore'
+import { doc, getDoc, writeBatch } from 'firebase/firestore'
 import {
   ArrowLeft, CheckCircle2, Clock, FileText, ExternalLink,
-  MessageSquare, Sparkles, Building, User, Calendar, GraduationCap,
-  Award, Globe, Check, AlertCircle, X, ChevronRight, FileCheck, ShieldAlert
+  MessageSquare, Sparkles, Building, Calendar, GraduationCap,
+  Award, Globe, Check, AlertCircle, X, FileCheck, ShieldAlert, Video
 } from 'lucide-react'
-import { db, isDemoMode } from '@/lib/firebase'
+import { db } from '@/lib/firebase'
+import {
+  formatInterviewDateTime,
+  toDateTimeLocalInputValue,
+  validateMeetingUrl,
+} from '@/lib/notifications'
 import { useAuth } from '@/context/AuthContext'
 import type { Application, ApplicationStatus } from '@/types/application.types'
-import type { StudentProfile } from '@/types/user.types'
+import type { ProfessorProfile, StudentProfile } from '@/types/user.types'
+import type { Position } from '@/types/position.types'
+import { computeMatch } from '@/lib/matching'
 import { Button } from '@/components/common/Button'
 import { Avatar } from '@/components/common/Avatar'
 import { MatchScoreBadge, MatchBreakdownPanel } from '@/components/matching/MatchScore'
 import { STATUS_LABELS, formatDate } from '@/utils/helpers'
-import { DEMO_PROFESSOR_APPLICATIONS, DEMO_APPLICANT_PROFILES, DEMO_APPLICATIONS } from '@/lib/demoData'
 
 const ALL_STATUSES: ApplicationStatus[] = [
   'submitted',
   'under_review',
-  'shortlisted',
   'interview',
   'accepted'
 ]
@@ -27,7 +32,6 @@ const ALL_STATUSES: ApplicationStatus[] = [
 const STATUS_PILL_STYLES: Record<string, string> = {
   submitted: 'bg-slate-100 text-slate-700 border-slate-200',
   under_review: 'bg-blue-50 text-blue-700 border-blue-200',
-  shortlisted: 'bg-amber-50 text-amber-700 border-amber-200',
   interview: 'bg-purple-50 text-purple-700 border-purple-200',
   accepted: 'bg-emerald-50 text-emerald-700 border-emerald-200',
   rejected: 'bg-rose-50 text-rose-700 border-rose-200',
@@ -35,190 +39,355 @@ const STATUS_PILL_STYLES: Record<string, string> = {
 
 export default function ApplicationDetail() {
   const { applicationId } = useParams<{ applicationId: string }>()
-  const { user, role } = useAuth()
+  const { user, role, loading: authLoading } = useAuth()
   const navigate = useNavigate()
 
   const [app, setApp] = useState<Application | null>(null)
-  const [candidateProfile, setCandidateProfile] = useState<Partial<StudentProfile> | null>(null)
+  const [candidateProfile, setCandidateProfile] = useState<StudentProfile | null>(null)
+  const [position, setPosition] = useState<Position | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [notFound, setNotFound] = useState(false)
+  const [unauthorized, setUnauthorized] = useState(false)
   const [isUpdating, setIsUpdating] = useState(false)
   const [statusNote, setStatusNote] = useState('')
   const [selectedNewStatus, setSelectedNewStatus] = useState<ApplicationStatus | null>(null)
+  const [interviewDateTimeInput, setInterviewDateTimeInput] = useState('')
+  const [interviewMeetingUrlInput, setInterviewMeetingUrlInput] = useState('')
+  const [interviewInstructionsInput, setInterviewInstructionsInput] = useState('')
+  const [isRescheduling, setIsRescheduling] = useState(false)
   const [showNoteModal, setShowNoteModal] = useState(false)
   const [successToast, setSuccessToast] = useState<string | null>(null)
+  const [updateError, setUpdateError] = useState<string | null>(null)
+  const isUpdatingRef = useRef(false)
 
-  // Faculty verification status
-  const [profVerificationStatus, setProfVerificationStatus] = useState<string>(() => {
-    if (role === 'professor') {
-      const savedVerifications = localStorage.getItem('rm_demo_verifications')
-      if (savedVerifications) {
-        try {
-          const list = JSON.parse(savedVerifications)
-          const myRecord = list.find((item: any) =>
-            (user && (item.userId === user.uid || (item.applicantEmail && user.email && item.applicantEmail.toLowerCase() === user.email.toLowerCase()))) ||
-            (!user && item.userId === 'demo-1')
-          )
-          if (myRecord) return myRecord.status
-        } catch {}
-      }
-      const savedProf = localStorage.getItem('rm_demo_professor_profile')
-      if (savedProf) {
-        try {
-          const p = JSON.parse(savedProf)
-          if (p.verificationStatus) return p.verificationStatus
-        } catch {}
-      }
-    }
-    return 'verified'
-  })
-
-  // 1. Load Application
   useEffect(() => {
-    if (!applicationId) return
+    if (authLoading) return
+    let isMounted = true
 
-    // Priority A: Check localStorage
-    const savedApps = localStorage.getItem('rm_demo_applications')
-    if (savedApps) {
+    async function loadApplicationData() {
+      if (!applicationId || !user) {
+        if (isMounted) setLoading(false)
+        return
+      }
+
+      if (isMounted) {
+        setLoading(true)
+        setNotFound(false)
+        setUnauthorized(false)
+        setApp(null)
+        setCandidateProfile(null)
+        setPosition(null)
+      }
+
       try {
-        const parsed: Application[] = JSON.parse(savedApps)
-        const found = parsed.find(
-          (a) =>
-            a.id === applicationId ||
-            (applicationId === 'app1' && a.id === 'app-101') ||
-            (applicationId === 'app-101' && a.id === 'app1')
-        )
-        if (found) {
-          setApp(found)
-          resolveCandidateProfile(found.studentId)
+        const snap = await getDoc(doc(db, 'applications', applicationId))
+        if (!isMounted) return
+
+        if (!snap.exists()) {
+          setNotFound(true)
           return
         }
-      } catch (e) {
-        console.warn('Error reading rm_demo_applications', e)
+
+        const data = { ...(snap.data() as Application), id: snap.id }
+
+        // Enforce positive ownership allowlist
+        const isOwner =
+          (role === 'student' && data.studentId === user.uid) ||
+          (role === 'professor' && data.professorId === user.uid)
+
+        if (!isOwner) {
+          setUnauthorized(true)
+          return
+        }
+
+        setApp(data)
+
+        const [studentRes, positionRes, profRes] = await Promise.allSettled([
+          data.studentId ? getDoc(doc(db, 'students', data.studentId)) : Promise.resolve(null),
+          data.positionId ? getDoc(doc(db, 'positions', data.positionId)) : Promise.resolve(null),
+          data.professorId ? getDoc(doc(db, 'professors', data.professorId)) : Promise.resolve(null),
+        ])
+
+        if (!isMounted) return
+
+        const profData =
+          profRes.status === 'fulfilled' && profRes.value && profRes.value.exists()
+            ? (profRes.value.data() as ProfessorProfile)
+            : null
+
+        if (studentRes.status === 'fulfilled' && studentRes.value && studentRes.value.exists()) {
+          const studentData = studentRes.value.data() as StudentProfile
+          setCandidateProfile({
+            ...studentData,
+            uid: studentData.uid || studentRes.value.id,
+            researchInterests: Array.isArray(studentData.researchInterests) ? studentData.researchInterests : [],
+            researchAreas: Array.isArray(studentData.researchAreas) ? studentData.researchAreas : [],
+            researchExperience: Array.isArray(studentData.researchExperience) ? studentData.researchExperience : [],
+            projects: Array.isArray(studentData.projects) ? studentData.projects : [],
+            publications: Array.isArray(studentData.publications) ? studentData.publications : [],
+            programmingLanguages: Array.isArray(studentData.programmingLanguages) ? studentData.programmingLanguages : [],
+            frameworks: Array.isArray(studentData.frameworks) ? studentData.frameworks : [],
+            technicalSkills: Array.isArray(studentData.technicalSkills) ? studentData.technicalSkills : [],
+            researchTools: Array.isArray(studentData.researchTools) ? studentData.researchTools : [],
+            languageScores: Array.isArray(studentData.languageScores) ? studentData.languageScores : [],
+          })
+        }
+
+        if (positionRes.status === 'fulfilled' && positionRes.value && positionRes.value.exists()) {
+          const posData = positionRes.value.data() as Position
+          setPosition({
+            ...posData,
+            id: positionRes.value.id,
+            professorName: profData?.fullName || posData.professorName || data.professorName,
+            university: profData?.university || posData.university || data.university,
+            department: profData?.department || posData.department || '',
+            requiredSkills: Array.isArray(posData.requiredSkills) ? posData.requiredSkills : [],
+            preferredSkills: Array.isArray(posData.preferredSkills) ? posData.preferredSkills : [],
+          })
+        }
+
+        if (profData) {
+          setApp((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  professorName: profData.fullName || prev.professorName,
+                  university: profData.university || prev.university,
+                }
+              : prev
+          )
+        }
+      } catch (err) {
+        console.error('Error loading application detail from Firestore:', err)
+        if (isMounted) setNotFound(true)
+      } finally {
+        if (isMounted) setLoading(false)
       }
     }
 
-    // Priority B: Check static demo applications
-    const demoFound =
-      DEMO_PROFESSOR_APPLICATIONS.find(
-        (a) => a.id === applicationId || (applicationId === 'app1' && a.id === 'app-101')
-      ) || DEMO_APPLICATIONS.find((a) => a.id === applicationId)
-    if (demoFound) {
-      setApp(demoFound)
-      resolveCandidateProfile(demoFound.studentId)
+    loadApplicationData()
+    return () => {
+      isMounted = false
+    }
+  }, [applicationId, user, role, authLoading])
+
+  const matchedKeywords = useMemo(() => {
+    if (candidateProfile && position) {
+      return computeMatch(candidateProfile, position).matchedKeywords
+    }
+    return []
+  }, [candidateProfile, position])
+
+  const handleInitiateStatusChange = (newStatus: ApplicationStatus) => {
+    if (!app) return
+    if (app.status === 'accepted' || app.status === 'rejected') return
+    if (app.status === newStatus) {
+      if (newStatus === 'interview') {
+        handleInitiateReschedule()
+      }
       return
     }
-
-    // Priority C: Firebase Firestore fallback
-    async function fetchFromFirebase() {
-      try {
-        const snap = await getDoc(doc(db, 'applications', applicationId!))
-        if (snap.exists()) {
-          const data = { id: snap.id, ...snap.data() } as Application
-          setApp(data)
-          resolveCandidateProfile(data.studentId)
-        } else {
-          // Default fallback to first demo application
-          setApp(DEMO_PROFESSOR_APPLICATIONS[0])
-          resolveCandidateProfile(DEMO_PROFESSOR_APPLICATIONS[0].studentId)
-        }
-      } catch {
-        setApp(DEMO_PROFESSOR_APPLICATIONS[0])
-        resolveCandidateProfile(DEMO_PROFESSOR_APPLICATIONS[0].studentId)
-      }
-    }
-
-    fetchFromFirebase()
-  }, [applicationId])
-
-  const resolveCandidateProfile = (studentId?: string) => {
-    if (!studentId) return
-
-    // Check localStorage student profile if same user
-    const localStudent = localStorage.getItem('rm_demo_student_profile')
-    if (localStudent && (studentId === 'demo-student' || studentId === 'student-1')) {
-      try {
-        setCandidateProfile(JSON.parse(localStudent))
-        return
-      } catch (e) {
-        // pass
-      }
-    }
-
-    if (DEMO_APPLICANT_PROFILES[studentId]) {
-      setCandidateProfile(DEMO_APPLICANT_PROFILES[studentId])
-    }
-  }
-
-  // 2. Status Update Handler
-  const handleInitiateStatusChange = (newStatus: ApplicationStatus) => {
+    setIsRescheduling(false)
     setSelectedNewStatus(newStatus)
+    setInterviewDateTimeInput(newStatus === 'interview' ? toDateTimeLocalInputValue(app.interviewAt) : '')
+    setInterviewMeetingUrlInput(newStatus === 'interview' ? app.interviewMeetingUrl || '' : '')
+    setInterviewInstructionsInput(newStatus === 'interview' ? app.interviewInstructions || '' : '')
     setStatusNote('')
+    setUpdateError(null)
     setShowNoteModal(true)
   }
 
-  const handleConfirmStatusChange = () => {
-    if (!app || !selectedNewStatus) return
+  const handleInitiateReschedule = () => {
+    if (!app || app.status !== 'interview') return
+    setIsRescheduling(true)
+    setSelectedNewStatus('interview')
+    setInterviewDateTimeInput(toDateTimeLocalInputValue(app.interviewAt))
+    setInterviewMeetingUrlInput(app.interviewMeetingUrl || '')
+    setInterviewInstructionsInput(app.interviewInstructions || '')
+    setStatusNote('')
+    setUpdateError(null)
+    setShowNoteModal(true)
+  }
 
+  const handleConfirmStatusChange = async () => {
+    if (isUpdatingRef.current) return
+    if (!app || !selectedNewStatus || !user) return
+    if (app.status === 'accepted' || app.status === 'rejected') {
+      setShowNoteModal(false)
+      return
+    }
+    if (role !== 'professor' || app.professorId !== user.uid) {
+      setUpdateError('Only the professor who owns this position may update candidate application status.')
+      return
+    }
+
+    let nextInterviewIso: string | undefined
+    let normalizedMeetingUrl = ''
+    let trimmedInstructions = ''
+    if (selectedNewStatus === 'interview') {
+      const parsed = Date.parse(interviewDateTimeInput)
+      if (!interviewDateTimeInput.trim() || Number.isNaN(parsed)) {
+        setUpdateError('Please select a valid interview date and time.')
+        return
+      }
+      const urlCheck = validateMeetingUrl(interviewMeetingUrlInput)
+      if (!urlCheck.valid) {
+        setUpdateError(urlCheck.error || 'Please enter a valid Zoom or meeting URL.')
+        return
+      }
+      normalizedMeetingUrl = urlCheck.normalized
+      trimmedInstructions = interviewInstructionsInput.trim()
+      if (trimmedInstructions.length > 2000) {
+        setUpdateError('Interview instructions must be 2,000 characters or fewer.')
+        return
+      }
+      nextInterviewIso = new Date(parsed).toISOString()
+      const dateChanged = nextInterviewIso !== app.interviewAt
+      const urlChanged = normalizedMeetingUrl !== (app.interviewMeetingUrl || '')
+      const instructionsChanged = trimmedInstructions !== (app.interviewInstructions || '')
+      if (isRescheduling && !dateChanged && !urlChanged && !instructionsChanged) {
+        setUpdateError('Please update the interview date/time, meeting link, or instructions.')
+        return
+      }
+    } else if (app.status === selectedNewStatus) {
+      setShowNoteModal(false)
+      return
+    }
+
+    isUpdatingRef.current = true
     setIsUpdating(true)
-    const newNote = statusNote.trim() || `Status updated to ${STATUS_LABELS[selectedNewStatus]}`
+    setUpdateError(null)
+
+    const now = new Date().toISOString()
+    const formattedSchedule = nextInterviewIso ? formatInterviewDateTime(nextInterviewIso) : ''
+    const defaultNote =
+      selectedNewStatus === 'interview'
+        ? isRescheduling
+          ? `Interview rescheduled for ${formattedSchedule}`
+          : `Interview scheduled for ${formattedSchedule}`
+        : `Status updated to ${STATUS_LABELS[selectedNewStatus]}`
+    const newNote = statusNote.trim() || defaultNote
     const updatedHistory = [
-      ...app.statusHistory,
+      ...(app.statusHistory || []),
       {
         status: selectedNewStatus,
-        changedAt: new Date().toISOString(),
+        changedAt: now,
         note: newNote,
       },
     ]
 
-    const updatedApp: Application = {
-      ...app,
-      status: selectedNewStatus,
-      statusHistory: updatedHistory,
-      updatedAt: new Date().toISOString(),
+    const notifType =
+      selectedNewStatus === 'interview'
+        ? isRescheduling
+          ? 'interview_rescheduled'
+          : 'interview_scheduled'
+        : 'application_status_changed'
+    const notifTitle =
+      notifType === 'interview_scheduled'
+        ? 'Interview Scheduled'
+        : notifType === 'interview_rescheduled'
+        ? 'Interview Rescheduled'
+        : 'Application Status Updated'
+    const notifDescription =
+      notifType === 'interview_scheduled'
+        ? `${app.professorName} scheduled an interview for ${app.positionTitle} on ${formattedSchedule}${normalizedMeetingUrl ? ' (meeting link included)' : ''}.`
+        : notifType === 'interview_rescheduled'
+        ? `${app.professorName} updated the interview details for ${app.positionTitle} (${formattedSchedule}${normalizedMeetingUrl ? ', meeting link included' : ''}).`
+        : `Your application for ${app.positionTitle} is now ${STATUS_LABELS[selectedNewStatus]}.`
+    const notifId = `notif_app_${app.id}_h_${updatedHistory.length}`
+
+    try {
+      const batch = writeBatch(db)
+      const updateFields: Record<string, unknown> = {
+        status: selectedNewStatus,
+        statusHistory: updatedHistory,
+        updatedAt: now,
+      }
+      if (selectedNewStatus === 'interview' && nextInterviewIso) {
+        updateFields.interviewAt = nextInterviewIso
+        updateFields.interviewMeetingUrl = normalizedMeetingUrl
+        updateFields.interviewInstructions = trimmedInstructions
+      }
+      batch.update(doc(db, 'applications', app.id), updateFields)
+      batch.set(doc(db, 'users', app.studentId, 'notifications', notifId), {
+        id: notifId,
+        recipientId: app.studentId,
+        actorId: user.uid,
+        type: notifType,
+        title: notifTitle,
+        description: notifDescription,
+        applicationId: app.id,
+        positionId: app.positionId,
+        isRead: false,
+        createdAt: now,
+      })
+      await batch.commit()
+
+      setApp({
+        ...app,
+        status: selectedNewStatus,
+        ...(selectedNewStatus === 'interview' && nextInterviewIso
+          ? {
+              interviewAt: nextInterviewIso,
+              interviewMeetingUrl: normalizedMeetingUrl,
+              interviewInstructions: trimmedInstructions,
+            }
+          : {}),
+        statusHistory: updatedHistory,
+        updatedAt: now,
+      })
+      setShowNoteModal(false)
+      setSuccessToast(
+        isRescheduling
+          ? `Interview rescheduled for ${formattedSchedule}`
+          : `Application marked as "${STATUS_LABELS[selectedNewStatus]}"`
+      )
+      setTimeout(() => setSuccessToast(null), 3500)
+    } catch (err) {
+      console.error('Failed to update application status in Firestore:', err)
+      const firebaseCode = (err as { code?: string })?.code
+      if (firebaseCode === 'permission-denied') {
+        setUpdateError(
+          'Failed to save application status update (permission-denied). Ensure the latest firestore.rules are published to Firebase and you own this position.'
+        )
+      } else {
+        setUpdateError(
+          `Failed to save application status update${firebaseCode ? ` (${firebaseCode})` : ''}. Please try again.`
+        )
+      }
+    } finally {
+      isUpdatingRef.current = false
+      setIsUpdating(false)
     }
-
-    setApp(updatedApp)
-
-    // Save to localStorage
-    const savedAppsStr = localStorage.getItem('rm_demo_applications')
-    let allApps: Application[] = savedAppsStr ? JSON.parse(savedAppsStr) : [...DEMO_PROFESSOR_APPLICATIONS]
-    allApps = allApps.map(a => a.id === updatedApp.id ? updatedApp : a)
-    localStorage.setItem('rm_demo_applications', JSON.stringify(allApps))
-
-    setShowNoteModal(false)
-    setIsUpdating(false)
-    setSuccessToast(`Application marked as "${STATUS_LABELS[selectedNewStatus]}"`)
-    setTimeout(() => setSuccessToast(null), 3500)
   }
 
   const isProf = role === 'professor'
 
-  // Restrict access for unverified faculty
-  if (isProf && profVerificationStatus !== 'verified') {
+  if (authLoading || loading) {
+    return (
+      <div className="min-h-screen pt-28 pb-20 px-4 text-center">
+        <div className="animate-spin w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full mx-auto mb-4" />
+        <p className="text-sm text-slate-500">Loading candidate application dossier...</p>
+      </div>
+    )
+  }
+
+  if (unauthorized) {
     return (
       <div className="min-h-screen bg-slate-50/70 pt-24 pb-20 px-4 sm:px-6">
         <div className="max-w-xl mx-auto bg-white rounded-3xl border border-slate-200/80 p-8 sm:p-10 text-center shadow-xs space-y-5">
-          <div className="w-16 h-16 rounded-2xl bg-amber-50 border border-amber-200 flex items-center justify-center mx-auto text-amber-600">
+          <div className="w-16 h-16 rounded-2xl bg-rose-50 border border-rose-200 flex items-center justify-center mx-auto text-rose-600">
             <ShieldAlert size={32} />
           </div>
-          <div>
-            <span className="inline-block px-3 py-1 rounded-full text-xs font-semibold bg-amber-100/80 text-amber-800 border border-amber-200 uppercase tracking-wider mb-2">
-              Verification Required
-            </span>
-            <h2 className="text-xl sm:text-2xl font-bold font-display text-slate-900 tracking-tight">
-              Application Dossier Review Restricted
-            </h2>
-          </div>
+          <h2 className="text-xl sm:text-2xl font-bold font-display text-slate-900 tracking-tight">
+            Access Restricted
+          </h2>
           <p className="text-slate-600 text-xs sm:text-sm leading-relaxed max-w-md mx-auto">
-            Your faculty institutional affiliation is currently{' '}
-            <strong className="text-amber-800 capitalize font-semibold">{profVerificationStatus.replace('_', ' ')}</strong>.
-            To protect applicant privacy and academic confidentiality, only verified faculty may inspect candidate dossiers, transcripts, and statement letters.
+            You do not have permission to view this application dossier. Only the submitting student and the professor who owns this position may view it.
           </p>
-          <div className="pt-3 flex flex-col sm:flex-row items-center justify-center gap-3">
-            <Button variant="secondary" onClick={() => navigate('/dashboard/professor')} className="text-xs">
-              Return to Professor Dashboard
-            </Button>
-            <Button variant="primary" onClick={() => navigate('/profile/professor/edit')} className="text-xs bg-blue-600 text-white">
-              Edit Lab Profile
+          <div className="pt-3 flex items-center justify-center">
+            <Button variant="secondary" onClick={() => navigate(isProf ? '/dashboard/professor' : '/applications')} className="text-xs">
+              Return to {isProf ? 'Professor Dashboard' : 'My Applications'}
             </Button>
           </div>
         </div>
@@ -226,11 +395,25 @@ export default function ApplicationDetail() {
     )
   }
 
-  if (!app) {
+  if (notFound || !app) {
     return (
-      <div className="min-h-screen pt-28 pb-20 px-4 text-center">
-        <div className="animate-spin w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full mx-auto mb-4" />
-        <p className="text-sm text-slate-500">Loading candidate application dossier...</p>
+      <div className="min-h-screen bg-slate-50/70 pt-24 pb-20 px-4 sm:px-6">
+        <div className="max-w-xl mx-auto bg-white rounded-3xl border border-slate-200/80 p-8 sm:p-10 text-center shadow-xs space-y-5">
+          <div className="w-16 h-16 rounded-2xl bg-slate-100 border border-slate-200 flex items-center justify-center mx-auto text-slate-500">
+            <AlertCircle size={32} />
+          </div>
+          <h2 className="text-xl sm:text-2xl font-bold font-display text-slate-900 tracking-tight">
+            Application Not Found
+          </h2>
+          <p className="text-slate-600 text-xs sm:text-sm leading-relaxed max-w-md mx-auto">
+            The requested application dossier could not be found in the database.
+          </p>
+          <div className="pt-3 flex items-center justify-center">
+            <Button variant="secondary" onClick={() => navigate(isProf ? '/dashboard/professor' : '/applications')} className="text-xs">
+              Return to {isProf ? 'Professor Dashboard' : 'My Applications'}
+            </Button>
+          </div>
+        </div>
       </div>
     )
   }
@@ -242,11 +425,11 @@ export default function ApplicationDetail() {
         {/* Back button & Toast */}
         <div className="flex items-center justify-between">
           <button
-            onClick={() => navigate(isProf ? '/dashboard/professor' : '/dashboard/student')}
+            onClick={() => navigate(isProf ? '/dashboard/professor' : '/applications')}
             className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-slate-900 transition-colors py-1 px-2.5 rounded-lg hover:bg-slate-200/60"
           >
             <ArrowLeft size={14} />
-            Back to {isProf ? 'Professor Dashboard' : 'Student Dashboard'}
+            Back to {isProf ? 'Professor Dashboard' : 'My Applications'}
           </button>
 
           {successToast && (
@@ -262,7 +445,7 @@ export default function ApplicationDetail() {
           <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6 pb-6 border-b border-slate-100">
             <div className="flex items-start sm:items-center gap-4">
               <Avatar
-                src={app.studentPhotoURL}
+                src={candidateProfile?.photoURL ?? app.studentPhotoURL}
                 name={app.studentName}
                 size="lg"
                 className="w-16 h-16 rounded-2xl border border-slate-200 text-lg font-bold"
@@ -299,11 +482,31 @@ export default function ApplicationDetail() {
               <Button
                 variant="secondary"
                 size="sm"
-                onClick={() => navigate('/messages')}
+                onClick={() => {
+                  const targetUid = isProf ? app.studentId : app.professorId
+                  if (!targetUid) {
+                    navigate('/messages')
+                    return
+                  }
+                  const params = new URLSearchParams({
+                    to: targetUid,
+                    context: app.positionTitle || 'Application Inquiry',
+                    name: isProf ? app.studentName || 'Student Applicant' : app.professorName || 'Faculty Member',
+                    role: isProf ? 'student' : 'professor',
+                    university: isProf ? candidateProfile?.university || '' : app.university || '',
+                    department: isProf ? candidateProfile?.department || '' : '',
+                    headline: isProf ? 'Student Applicant' : 'Professor',
+                  })
+                  if (app.positionId) {
+                    params.set('positionId', app.positionId)
+                  }
+                  navigate(`/messages?${params.toString()}`)
+                }}
                 className="border-slate-200 text-slate-700 hover:bg-slate-50 text-xs font-medium"
+                id="message-counterpart-btn"
               >
                 <MessageSquare size={14} className="mr-1.5 text-blue-600" />
-                Message Student
+                {isProf ? 'Message Student' : 'Message Lab'}
               </Button>
             </div>
           </div>
@@ -321,7 +524,7 @@ export default function ApplicationDetail() {
               )}
             </div>
 
-            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
               {ALL_STATUSES.map((st, idx) => {
                 const currentIdx = ALL_STATUSES.indexOf(app.status)
                 const isPassed = app.status !== 'rejected' && currentIdx >= idx
@@ -357,8 +560,89 @@ export default function ApplicationDetail() {
             </div>
           </div>
 
+          {/* Scheduled Interview Banner */}
+          {app.interviewAt && (
+            <div
+              className="mt-5 p-4 sm:p-5 rounded-2xl bg-purple-50/80 border border-purple-200 space-y-3"
+              id="interview-schedule-banner"
+            >
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-purple-100 text-purple-700 flex items-center justify-center shrink-0">
+                    <Calendar size={18} />
+                  </div>
+                  <div>
+                    <p className="text-xs font-bold text-purple-950 uppercase tracking-wider">
+                      Scheduled Interview
+                    </p>
+                    <p className="text-sm font-semibold text-purple-900 mt-0.5">
+                      {formatInterviewDateTime(app.interviewAt)}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  {app.interviewMeetingUrl && (
+                    <a
+                      href={app.interviewMeetingUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      id="join-zoom-meeting-link"
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-purple-600 hover:bg-purple-700 text-white text-xs font-semibold shadow-2xs transition-colors"
+                    >
+                      <Video size={14} />
+                      <span>Join Zoom Meeting</span>
+                      <ExternalLink size={12} />
+                    </a>
+                  )}
+                  {isProf && app.status === 'interview' && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={handleInitiateReschedule}
+                      className="text-xs border-purple-300 text-purple-800 hover:bg-purple-100 shrink-0"
+                      id="reschedule-interview-btn"
+                    >
+                      Edit / Reschedule Interview
+                    </Button>
+                  )}
+                </div>
+              </div>
+
+              {(app.interviewMeetingUrl || app.interviewInstructions) && (
+                <div className="pt-3 border-t border-purple-200/80 space-y-2 text-xs text-purple-900">
+                  {app.interviewMeetingUrl && (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="font-semibold text-purple-950">Meeting Link:</span>
+                      <a
+                        href={app.interviewMeetingUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-purple-700 hover:text-purple-900 underline break-all"
+                      >
+                        {app.interviewMeetingUrl}
+                      </a>
+                    </div>
+                  )}
+                  {app.interviewInstructions && (
+                    <div
+                      id="interview-instructions-display"
+                      className="p-3 rounded-xl bg-white/80 border border-purple-200/70 text-slate-700 whitespace-pre-line leading-relaxed"
+                    >
+                      <span className="block text-[11px] font-bold text-purple-950 uppercase tracking-wider mb-1">
+                        Interview Instructions
+                      </span>
+                      {app.interviewInstructions}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Professor Quick Status Management Bar */}
-          {isProf && (
+          {isProf && app.status !== 'accepted' && app.status !== 'rejected' && (
             <div className="mt-6 p-4 rounded-xl bg-slate-50 border border-slate-200 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
               <div className="flex items-center gap-2">
                 <FileCheck size={16} className="text-blue-600" />
@@ -382,18 +666,6 @@ export default function ApplicationDetail() {
 
                 <button
                   type="button"
-                  onClick={() => handleInitiateStatusChange('shortlisted')}
-                  className={`text-xs font-semibold px-3 py-1.5 rounded-lg border transition-all ${
-                    app.status === 'shortlisted'
-                      ? 'bg-amber-600 text-white border-amber-600'
-                      : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
-                  }`}
-                >
-                  Shortlist
-                </button>
-
-                <button
-                  type="button"
                   onClick={() => handleInitiateStatusChange('interview')}
                   className={`text-xs font-semibold px-3 py-1.5 rounded-lg border transition-all ${
                     app.status === 'interview'
@@ -407,11 +679,7 @@ export default function ApplicationDetail() {
                 <button
                   type="button"
                   onClick={() => handleInitiateStatusChange('accepted')}
-                  className={`text-xs font-semibold px-3 py-1.5 rounded-lg border transition-all ${
-                    app.status === 'accepted'
-                      ? 'bg-emerald-600 text-white border-emerald-600'
-                      : 'bg-white text-emerald-700 border-emerald-200 hover:bg-emerald-50'
-                  }`}
+                  className="text-xs font-semibold px-3 py-1.5 rounded-lg border transition-all bg-white text-emerald-700 border-emerald-200 hover:bg-emerald-50"
                 >
                   Accept
                 </button>
@@ -419,11 +687,7 @@ export default function ApplicationDetail() {
                 <button
                   type="button"
                   onClick={() => handleInitiateStatusChange('rejected')}
-                  className={`text-xs font-semibold px-3 py-1.5 rounded-lg border transition-all ${
-                    app.status === 'rejected'
-                      ? 'bg-rose-600 text-white border-rose-600'
-                      : 'bg-white text-rose-600 border-rose-200 hover:bg-rose-50'
-                  }`}
+                  className="text-xs font-semibold px-3 py-1.5 rounded-lg border transition-all bg-white text-rose-600 border-rose-200 hover:bg-rose-50"
                 >
                   Decline
                 </button>
@@ -445,9 +709,10 @@ export default function ApplicationDetail() {
                   <GraduationCap size={18} className="text-blue-600" />
                   Applicant Academic Profile
                 </h3>
-                {candidateProfile?.gpa && (
+                {(app.studentGpa || candidateProfile?.gpa) && (
                   <span className="text-xs font-bold text-blue-700 bg-blue-50 border border-blue-200 px-2.5 py-1 rounded-full">
-                    GPA: {candidateProfile.gpa} / {candidateProfile.gpaScale || 4.0}
+                    GPA: {app.studentGpa ?? candidateProfile?.gpa} /{' '}
+                    {app.studentGpaScale ?? candidateProfile?.gpaScale ?? 4.0}
                   </span>
                 )}
               </div>
@@ -460,17 +725,17 @@ export default function ApplicationDetail() {
                     {candidateProfile?.university || app.university}
                   </p>
                   <p className="text-slate-600 mt-0.5">
-                    {candidateProfile?.major || 'Computer Science'} • {candidateProfile?.degree || 'Bachelor'}
+                    {candidateProfile?.major || 'Not specified'} • {candidateProfile?.degree || 'Not specified'}
                   </p>
                 </div>
 
                 <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-100">
                   <span className="text-slate-400 block mb-0.5">Graduation Timeline</span>
                   <p className="font-semibold text-slate-900 text-sm">
-                    {candidateProfile?.expectedGraduation ? `Graduating ${candidateProfile.expectedGraduation}` : 'Completed'}
+                    {candidateProfile?.expectedGraduation ? `Graduating ${candidateProfile.expectedGraduation}` : 'Not specified'}
                   </p>
                   <p className="text-slate-600 mt-0.5">
-                    {candidateProfile?.currentSemester || 'Senior Undergraduate'}
+                    {candidateProfile?.currentSemester || 'Not specified'}
                   </p>
                 </div>
               </div>
@@ -509,32 +774,117 @@ export default function ApplicationDetail() {
                 </div>
               )}
 
-              {/* Technical Skills */}
-              {candidateProfile?.technicalSkills && candidateProfile.technicalSkills.length > 0 && (
+              {/* Technical Skills, Programming Languages, Frameworks & Tools */}
+              {(() => {
+                const allApplicantSkills = Array.from(
+                  new Set([
+                    ...(candidateProfile?.programmingLanguages || []),
+                    ...(candidateProfile?.frameworks || []),
+                    ...(candidateProfile?.technicalSkills || []),
+                    ...(candidateProfile?.researchTools || []),
+                  ])
+                )
+                return allApplicantSkills.length > 0 ? (
+                  <div>
+                    <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">
+                      Technical Skills & Tools
+                    </h4>
+                    <div className="flex flex-wrap gap-1.5">
+                      {allApplicantSkills.map((skill, idx) => (
+                        <span
+                          key={idx}
+                          className="px-2.5 py-1 rounded-lg text-xs font-medium bg-slate-100 text-slate-700"
+                        >
+                          {skill}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ) : null
+              })()}
+
+              {/* Prior Research Experience */}
+              {candidateProfile?.researchExperience &&
+                candidateProfile.researchExperience.length > 0 && (
+                  <div>
+                    <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">
+                      Prior Research Experience ({candidateProfile.researchExperience.length})
+                    </h4>
+                    <div className="space-y-2.5">
+                      {candidateProfile.researchExperience.map((exp, idx) => (
+                        <div
+                          key={exp.id || idx}
+                          className="p-3.5 rounded-xl bg-slate-50 border border-slate-200/80 text-xs space-y-1"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="font-bold text-slate-900">{exp.title}</span>
+                            <span className="text-[11px] font-medium text-slate-500">
+                              {exp.startDate} – {exp.isCurrent ? 'Present' : exp.endDate || 'Completed'}
+                            </span>
+                          </div>
+                          <p className="font-semibold text-blue-700">
+                            {exp.role} • {exp.organization}
+                          </p>
+                          {exp.description && (
+                            <p className="text-slate-600 leading-relaxed whitespace-pre-line">
+                              {exp.description}
+                            </p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+              {/* Publications */}
+              {candidateProfile?.publications && candidateProfile.publications.length > 0 && (
                 <div>
                   <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">
-                    Technical Skills & Tools
+                    Publications & Papers ({candidateProfile.publications.length})
                   </h4>
-                  <div className="flex flex-wrap gap-1.5">
-                    {candidateProfile.technicalSkills.map((skill, idx) => (
-                      <span key={idx} className="px-2.5 py-1 rounded-lg text-xs font-medium bg-slate-100 text-slate-700">
-                        {skill}
-                      </span>
+                  <div className="space-y-2">
+                    {candidateProfile.publications.map((pub, idx) => (
+                      <div
+                        key={pub.id || idx}
+                        className="p-3.5 rounded-xl bg-amber-50/40 border border-amber-200/70 text-xs space-y-0.5"
+                      >
+                        <p className="font-bold text-slate-900">{pub.title}</p>
+                        <p className="text-slate-600">
+                          {pub.conference || pub.journal} ({pub.year})
+                          {pub.authors && pub.authors.length > 0
+                            ? ` • ${pub.authors.join(', ')}`
+                            : ''}
+                        </p>
+                        {pub.doi && (
+                          <p className="text-[10px] text-blue-600 font-mono">DOI: {pub.doi}</p>
+                        )}
+                      </div>
                     ))}
                   </div>
                 </div>
               )}
             </div>
 
-            {/* Applicant Research / Motivation Statement */}
-            <div className="bg-white rounded-2xl border border-slate-200/80 p-6 shadow-xs space-y-4">
-              <h3 className="text-base font-bold font-display text-slate-900 flex items-center gap-2">
-                <FileText size={18} className="text-blue-600" />
-                Applicant Research Statement & Motivation
-              </h3>
-              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200/80">
-                <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-line italic">
-                  "{app.applicationStatement}"
+            {/* Research Motivation Section */}
+            <div
+              className="bg-white rounded-2xl border border-slate-200/80 p-6 shadow-xs space-y-4"
+              id="research-motivation-section"
+            >
+              <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+                <h3 className="text-base font-bold font-display text-slate-900 flex items-center gap-2">
+                  <FileText size={18} className="text-blue-600" />
+                  Research Motivation
+                </h3>
+                <span className="text-[11px] font-medium text-slate-400">
+                  Submitted with application
+                </span>
+              </div>
+              <div className="p-4 sm:p-5 rounded-xl bg-slate-50 border border-slate-200/80">
+                <p
+                  id="research-motivation-content"
+                  className="text-sm text-slate-800 leading-relaxed whitespace-pre-line break-words"
+                >
+                  {app.applicationStatement}
                 </p>
               </div>
             </div>
@@ -548,48 +898,32 @@ export default function ApplicationDetail() {
 
               <div className="space-y-3">
                 {/* CV Card */}
-                <div className="flex items-center justify-between p-3.5 rounded-xl bg-slate-50 border border-slate-200/80 hover:bg-slate-100/70 transition-colors">
-                  <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-xl bg-blue-100 text-blue-700 flex items-center justify-center font-bold text-xs">
-                      PDF
-                    </div>
-                    <div>
-                      <p className="text-sm font-semibold text-slate-900">Curriculum Vitae (CV)</p>
-                      <p className="text-xs text-slate-500">Applicant verified academic credentials</p>
-                    </div>
-                  </div>
-                  <a
-                    href={app.cvUrl || '#'}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-1 text-xs font-semibold text-blue-600 hover:text-blue-700 bg-white border border-slate-200 px-3 py-1.5 rounded-lg shadow-2xs hover:bg-slate-50 transition-colors"
-                  >
-                    View CV <ExternalLink size={12} />
-                  </a>
-                </div>
-
-                {/* Transcript Card */}
-                {app.transcriptUrl && (
+                {app.cvUrl ? (
                   <div className="flex items-center justify-between p-3.5 rounded-xl bg-slate-50 border border-slate-200/80 hover:bg-slate-100/70 transition-colors">
                     <div className="flex items-center gap-3">
-                      <div className="w-10 h-10 rounded-xl bg-emerald-100 text-emerald-700 flex items-center justify-center font-bold text-xs">
+                      <div className="w-10 h-10 rounded-xl bg-blue-100 text-blue-700 flex items-center justify-center font-bold text-xs">
                         PDF
                       </div>
                       <div>
-                        <p className="text-sm font-semibold text-slate-900">Official Academic Transcript</p>
-                        <p className="text-xs text-slate-500">Verified university course grades & credits</p>
+                        <p className="text-sm font-semibold text-slate-900">Curriculum Vitae (CV)</p>
+                        <p className="text-xs text-slate-500">Applicant academic credentials</p>
                       </div>
                     </div>
                     <a
-                      href={app.transcriptUrl}
+                      href={app.cvUrl}
                       target="_blank"
                       rel="noreferrer"
                       className="inline-flex items-center gap-1 text-xs font-semibold text-blue-600 hover:text-blue-700 bg-white border border-slate-200 px-3 py-1.5 rounded-lg shadow-2xs hover:bg-slate-50 transition-colors"
                     >
-                      View Transcript <ExternalLink size={12} />
+                      View CV <ExternalLink size={12} />
                     </a>
                   </div>
+                ) : (
+                  <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200/80 text-xs text-slate-500">
+                    No CV URL attached to this application.
+                  </div>
                 )}
+
 
                 {/* Portfolio URL if exists */}
                 {candidateProfile?.portfolioUrl && (
@@ -642,7 +976,7 @@ export default function ApplicationDetail() {
                       score: app.matchScore,
                       breakdown: app.matchBreakdown,
                       explanation: app.matchExplanation,
-                      matchedKeywords: ['Medical Vision', 'Deep Learning', 'PyTorch']
+                      matchedKeywords,
                     }}
                   />
                 </div>
@@ -656,7 +990,7 @@ export default function ApplicationDetail() {
               </h4>
 
               <div className="space-y-4 relative before:absolute before:top-2 before:bottom-2 before:left-2.5 before:w-0.5 before:bg-slate-200">
-                {app.statusHistory.map((item, i) => (
+                {(app.statusHistory || []).map((item, i) => (
                   <div key={i} className="flex items-start gap-3 relative pl-6">
                     <div className="absolute left-1.5 top-1 -translate-x-1/2 w-2.5 h-2.5 rounded-full bg-blue-600 ring-4 ring-white" />
                     <div className="text-xs space-y-0.5">
@@ -689,7 +1023,9 @@ export default function ApplicationDetail() {
           <div className="bg-white rounded-2xl border border-slate-200 shadow-xl max-w-md w-full p-6 space-y-4 animate-scaleUp">
             <div className="flex items-center justify-between pb-3 border-b border-slate-100">
               <h3 className="text-base font-bold text-slate-900 font-display">
-                Update Status to "{STATUS_LABELS[selectedNewStatus]}"
+                {isRescheduling
+                  ? 'Reschedule Interview'
+                  : `Update Status to "${STATUS_LABELS[selectedNewStatus]}"`}
               </h3>
               <button
                 type="button"
@@ -701,8 +1037,63 @@ export default function ApplicationDetail() {
             </div>
 
             <p className="text-xs text-slate-600">
-              You are updating {app.studentName}'s application for <strong>{app.positionTitle}</strong>. You may optionally add an evaluation note for your lab records.
+              {isRescheduling
+                ? `Choose a new interview date and time for ${app.studentName} (${app.positionTitle}).`
+                : <>You are updating {app.studentName}'s application for <strong>{app.positionTitle}</strong>. You may optionally add an evaluation note for your lab records.</>}
             </p>
+
+            {updateError && (
+              <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs flex items-center gap-2">
+                <AlertCircle size={14} className="shrink-0" />
+                <span>{updateError}</span>
+              </div>
+            )}
+
+            {selectedNewStatus === 'interview' && (
+              <div className="space-y-3">
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold text-slate-700" htmlFor="interview-datetime-input">
+                    Interview Date & Time (Required)
+                  </label>
+                  <input
+                    id="interview-datetime-input"
+                    type="datetime-local"
+                    value={interviewDateTimeInput}
+                    onChange={(e) => setInterviewDateTimeInput(e.target.value)}
+                    className="w-full text-xs rounded-xl border border-slate-200 px-3 py-2.5 focus:outline-none focus:ring-2 focus:ring-purple-600/30 focus:border-purple-600"
+                    required
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold text-slate-700" htmlFor="interview-meeting-url-input">
+                    Zoom / Meeting Link (Optional)
+                  </label>
+                  <input
+                    id="interview-meeting-url-input"
+                    type="url"
+                    value={interviewMeetingUrlInput}
+                    onChange={(e) => setInterviewMeetingUrlInput(e.target.value)}
+                    placeholder="https://zoom.us/j/123456789"
+                    className="w-full text-xs rounded-xl border border-slate-200 px-3 py-2.5 focus:outline-none focus:ring-2 focus:ring-purple-600/30 focus:border-purple-600"
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold text-slate-700" htmlFor="interview-instructions-input">
+                    Interview Instructions for Student (Optional)
+                  </label>
+                  <textarea
+                    id="interview-instructions-input"
+                    value={interviewInstructionsInput}
+                    onChange={(e) => setInterviewInstructionsInput(e.target.value)}
+                    placeholder="e.g., Please join 5 minutes early and prepare a brief overview of your research."
+                    rows={3}
+                    className="w-full text-xs rounded-xl border border-slate-200 p-3 focus:outline-none focus:ring-2 focus:ring-purple-600/30 focus:border-purple-600"
+                  />
+                </div>
+              </div>
+            )}
 
             <div className="space-y-1.5">
               <label className="text-xs font-semibold text-slate-700">
@@ -714,8 +1105,6 @@ export default function ApplicationDetail() {
                 placeholder={
                   selectedNewStatus === 'interview'
                     ? 'e.g., Scheduled technical discussion for next Tuesday via Zoom.'
-                    : selectedNewStatus === 'shortlisted'
-                    ? 'e.g., Impressive MICCAI paper, shortlisted for top 3 candidates.'
                     : selectedNewStatus === 'accepted'
                     ? 'e.g., Recommended for fully funded departmental scholarship.'
                     : 'e.g., Evaluation note...'

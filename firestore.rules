@@ -1,0 +1,979 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================================
+    // Core Authentication & Authoritative Role Helpers
+    // =========================================================================
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return request.auth != null ? request.auth.uid == userId : false;
+    }
+
+    function hasAuthoritativeUserDoc(uid) {
+      return exists(/databases/$(database)/documents/users/$(uid));
+    }
+
+    function userDocData(uid) {
+      return get(/databases/$(database)/documents/users/$(uid)).data;
+    }
+
+    // Role is verified from `users/{uid}` (or falling back to unambiguous profile doc for legacy accounts)
+    function authoritativeRole(uid) {
+      return hasAuthoritativeUserDoc(uid)
+        ? userDocData(uid).role
+        : (
+            exists(/databases/$(database)/documents/professors/$(uid)) && !exists(/databases/$(database)/documents/students/$(uid))
+              ? 'professor'
+              : (
+                  exists(/databases/$(database)/documents/students/$(uid)) && !exists(/databases/$(database)/documents/professors/$(uid))
+                    ? 'student'
+                    : null
+                )
+          );
+    }
+
+    function hasValidAccountRole(uid) {
+      return authoritativeRole(uid) in ['student', 'professor'];
+    }
+
+    function isProfessor() {
+      return request.auth != null ? authoritativeRole(request.auth.uid) == 'professor' : false;
+    }
+
+    function isStudent() {
+      return request.auth != null ? authoritativeRole(request.auth.uid) == 'student' : false;
+    }
+
+    // Resolve authoritative sender display name
+    function verifiedSenderName(uid) {
+      return exists(/databases/$(database)/documents/userDirectory/$(uid))
+        ? get(/databases/$(database)/documents/userDirectory/$(uid)).data.fullName
+        : (
+            exists(/databases/$(database)/documents/professors/$(uid))
+              ? get(/databases/$(database)/documents/professors/$(uid)).data.fullName
+              : (
+                  exists(/databases/$(database)/documents/students/$(uid))
+                    ? get(/databases/$(database)/documents/students/$(uid)).data.fullName
+                    : (
+                        hasAuthoritativeUserDoc(uid)
+                          ? userDocData(uid).displayName
+                          : null
+                      )
+                )
+          );
+    }
+
+    // Validate participant summary against actual stored profile or trusted userDirectory
+    function matchesOptionalStringField(docData, fieldName, value) {
+      return !(fieldName in docData)
+        ? value == ''
+        : value == docData[fieldName];
+    }
+
+    function matchesDirectoryData(d, summary) {
+      return (!('fullName' in d) || d.fullName == '' || summary.fullName == d.fullName)
+        && (!('username' in d) || d.username == '' || summary.username == d.username)
+        && summary.role == d.role
+        && matchesOptionalStringField(d, 'university', summary.university)
+        && matchesOptionalStringField(d, 'department', summary.department);
+    }
+
+    function matchesProfileDocData(d, expectedRole, summary) {
+      return (!('fullName' in d) || d.fullName == '' || summary.fullName == d.fullName)
+        && (!('username' in d) || d.username == '' || summary.username == d.username)
+        && summary.role == expectedRole
+        && matchesOptionalStringField(d, 'university', summary.university)
+        && matchesOptionalStringField(d, 'department', summary.department);
+    }
+
+    function matchesAuthoritativeProfile(uid, summary) {
+      let dirPath = /databases/$(database)/documents/userDirectory/$(uid);
+      let profPath = /databases/$(database)/documents/professors/$(uid);
+      let studentPath = /databases/$(database)/documents/students/$(uid);
+      return exists(dirPath)
+        ? matchesDirectoryData(get(dirPath).data, summary)
+        : (
+            exists(profPath)
+              ? matchesProfileDocData(get(profPath).data, 'professor', summary)
+              : (
+                  exists(studentPath)
+                    ? matchesProfileDocData(get(studentPath).data, 'student', summary)
+                    : (hasAuthoritativeUserDoc(uid) && summary.role == userDocData(uid).role)
+                )
+          );
+    }
+
+    // =========================================================================
+    // Field Allowlist Helpers for Public Profiles & Positions
+    // =========================================================================
+
+    function hasOnlyAllowedStudentProfileFields(data) {
+      return data.keys().hasOnly([
+        'uid',
+        'fullName',
+        'username',
+        'country',
+        'photoURL',
+        'university',
+        'department',
+        'major',
+        'degree',
+        'currentSemester',
+        'expectedGraduation',
+        'researchInterests',
+        'researchAreas',
+        'researchExperience',
+        'projects',
+        'publications',
+        'programmingLanguages',
+        'frameworks',
+        'technicalSkills',
+        'researchTools',
+        'languageScores',
+        'portfolioUrl',
+        'profileCompleteness',
+        'bio',
+        'createdAt',
+        'updatedAt'
+      ])
+      && !('email' in data)
+      && !('universityEmail' in data)
+      && !('gpa' in data)
+      && !('gpaScale' in data)
+      && !('cvUrl' in data)
+      && !('transcriptUrl' in data)
+      && !('savedProfessorIds' in data);
+    }
+
+    function hasValidStudentRequiredIdentity(userId, data) {
+      return data.uid == userId
+        && data.fullName is string
+        && data.username is string
+        && data.university is string
+        && data.department is string;
+    }
+
+    function hasOnlyAllowedProfessorProfileFields(data) {
+      return data.keys().hasOnly([
+        'uid',
+        'fullName',
+        'username',
+        'isPublicProfile',
+        'academicTitle',
+        'country',
+        'photoURL',
+        'university',
+        'department',
+        'faculty',
+        'universityProfileUrl',
+        'googleScholarUrl',
+        'orcid',
+        'personalWebpageUrl',
+        'biography',
+        'researchAreas',
+        'researchInterests',
+        'currentProjects',
+        'publications',
+        'labName',
+        'labDescription',
+        'labWebsiteUrl',
+        'labMembers',
+        'isRecruiting',
+        'recruitingStatus',
+        'fundingInfo',
+        'createdAt',
+        'updatedAt'
+      ])
+      && data.isPublicProfile == true
+      && !('email' in data);
+    }
+
+    function isValidProfessorFundingInfo(info) {
+      return info is map
+        && info.keys().hasOnly([
+          'fundingTypes',
+          'otherFundingTypeExplanation',
+          'fundingStatus',
+          'description',
+          'supportedStudentsCount',
+          'eligibilityRequirements',
+          'additionalNotes'
+        ])
+        && (!('fundingTypes' in info) || (info.fundingTypes is list && info.fundingTypes.size() <= 10))
+        && (!('otherFundingTypeExplanation' in info) || (info.otherFundingTypeExplanation is string && info.otherFundingTypeExplanation.size() <= 300))
+        && (!('fundingStatus' in info) || (
+          info.fundingStatus == ''
+          || info.fundingStatus in [
+            'currently_funded',
+            'funding_available_for_new_students',
+            'funding_available_for_selected_positions',
+            'seeking_additional_funding',
+            'no_current_funding'
+          ]
+        ))
+        && (!('description' in info) || (info.description is string && info.description.size() <= 2000))
+        && (!('supportedStudentsCount' in info) || info.supportedStudentsCount == null || (info.supportedStudentsCount is number && info.supportedStudentsCount >= 0 && info.supportedStudentsCount <= 500))
+        && (!('eligibilityRequirements' in info) || (info.eligibilityRequirements is string && info.eligibilityRequirements.size() <= 2000))
+        && (!('additionalNotes' in info) || (info.additionalNotes is string && info.additionalNotes.size() <= 2000));
+    }
+
+    function hasValidProfessorRequiredIdentity(userId, data) {
+      return data.uid == userId
+        && data.fullName is string
+        && data.username is string
+        && data.university is string
+        && data.department is string;
+    }
+
+    function hasOnlyAllowedPositionFields(data) {
+      return data.keys().hasOnly([
+        'id',
+        'professorId',
+        'professorName',
+        'professorTitle',
+        'professorPhotoURL',
+        'university',
+        'department',
+        'country',
+        'title',
+        'degreeType',
+        'description',
+        'researchArea',
+        'researchTopics',
+        'requiredSkills',
+        'preferredSkills',
+        'minimumGPA',
+        'gpaScale',
+        'languageRequirements',
+        'otherRequirements',
+        'fundingType',
+        'fundingDetails',
+        'stipend',
+        'applicationDeadline',
+        'startDate',
+        'isOpen',
+        'createdAt',
+        'updatedAt'
+      ])
+      && !('email' in data)
+      && !('cvUrl' in data)
+      && !('studentId' in data);
+    }
+
+    // =========================================================================
+    // 1. users/{userId} — Private Account Record (Owner-Only)
+    // =========================================================================
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow list: if false;
+
+      allow create: if isOwner(userId)
+        && request.resource.data.uid == userId
+        && request.resource.data.role in ['student', 'professor']
+        && (
+          (request.resource.data.role == 'student' && !exists(/databases/$(database)/documents/professors/$(userId))) ||
+          (request.resource.data.role == 'professor' && !exists(/databases/$(database)/documents/students/$(userId)))
+        );
+
+      allow update: if isOwner(userId)
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.role == resource.data.role;
+
+      allow delete: if false;
+
+      // =======================================================================
+      // 1a. users/{userId}/notifications/{notificationId} — Owner-Only Inbox
+      // =======================================================================
+      match /notifications/{notificationId} {
+        allow get, list: if isOwner(userId);
+
+        function isValidNotificationShape(data) {
+          return data.keys().hasOnly([
+            'id',
+            'recipientId',
+            'actorId',
+            'type',
+            'title',
+            'description',
+            'applicationId',
+            'positionId',
+            'isRead',
+            'createdAt'
+          ])
+          && data.id == notificationId
+          && data.recipientId == userId
+          && data.actorId == request.auth.uid
+          && data.actorId != userId
+          && data.title is string && data.title.size() >= 1 && data.title.size() <= 160
+          && data.description is string && data.description.size() >= 1 && data.description.size() <= 400
+          && data.applicationId is string && data.applicationId.size() >= 1
+          && data.positionId is string && data.positionId.size() >= 1
+          && data.isRead == false
+          && data.createdAt is string && data.createdAt.size() >= 10;
+        }
+
+        function isValidNotificationCreate() {
+          let data = request.resource.data;
+          let appPath = /databases/$(database)/documents/applications/$(data.applicationId);
+          let appAfter = getAfter(appPath).data;
+          return isSignedIn()
+            && !exists(/databases/$(database)/documents/users/$(userId)/notifications/$(notificationId))
+            && isValidNotificationShape(data)
+            && existsAfter(appPath)
+            && (
+              (
+                data.type == 'application_submitted'
+                && isStudent()
+                && !exists(appPath)
+                && appAfter.studentId == request.auth.uid
+                && appAfter.professorId == userId
+                && appAfter.status == 'submitted'
+                && appAfter.positionId == data.positionId
+              ) || (
+                data.type == 'application_status_changed'
+                && isProfessor()
+                && appAfter.professorId == request.auth.uid
+                && appAfter.studentId == userId
+                && appAfter.positionId == data.positionId
+                && appAfter.status in ['under_review', 'accepted', 'rejected']
+                && exists(appPath)
+                && get(appPath).data.status != appAfter.status
+              ) || (
+                data.type == 'interview_scheduled'
+                && isProfessor()
+                && appAfter.professorId == request.auth.uid
+                && appAfter.studentId == userId
+                && appAfter.positionId == data.positionId
+                && appAfter.status == 'interview'
+                && 'interviewAt' in appAfter
+                && appAfter.interviewAt is string
+                && exists(appPath)
+                && get(appPath).data.status != 'interview'
+              ) || (
+                data.type == 'interview_rescheduled'
+                && isProfessor()
+                && appAfter.professorId == request.auth.uid
+                && appAfter.studentId == userId
+                && appAfter.positionId == data.positionId
+                && appAfter.status == 'interview'
+                && 'interviewAt' in appAfter
+                && appAfter.interviewAt is string
+                && exists(appPath)
+                && get(appPath).data.status == 'interview'
+                && (
+                  !('interviewAt' in get(appPath).data)
+                  || get(appPath).data.interviewAt != appAfter.interviewAt
+                  || (('interviewMeetingUrl' in appAfter) && (!('interviewMeetingUrl' in get(appPath).data) || get(appPath).data.interviewMeetingUrl != appAfter.interviewMeetingUrl))
+                  || (('interviewInstructions' in appAfter) && (!('interviewInstructions' in get(appPath).data) || get(appPath).data.interviewInstructions != appAfter.interviewInstructions))
+                )
+              )
+            );
+        }
+
+        allow create: if isValidNotificationCreate();
+
+        allow update: if isOwner(userId)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead', 'readAt'])
+          && request.resource.data.isRead is bool
+          && (!('readAt' in request.resource.data) || request.resource.data.readAt is string);
+
+        allow delete: if false;
+      }
+    }
+
+    // =========================================================================
+    // 2. students/{userId} — Public Academic Student Profile (No Private Fields)
+    // =========================================================================
+    match /students/{userId} {
+      allow get, list: if isOwner(userId)
+        || (isProfessor() && hasOnlyAllowedStudentProfileFields(resource.data));
+
+      allow create, update: if isOwner(userId)
+        && isStudent()
+        && hasOnlyAllowedStudentProfileFields(request.resource.data)
+        && hasValidStudentRequiredIdentity(userId, request.resource.data);
+
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // 3. studentPrivate/{userId} — Strictly Private Student Data (Owner-Only)
+    // =========================================================================
+    match /studentPrivate/{userId} {
+      allow get: if isOwner(userId);
+      allow list: if false;
+
+      allow create, update: if isOwner(userId)
+        && isStudent()
+        && request.resource.data.keys().hasOnly([
+          'uid',
+          'email',
+          'gpa',
+          'gpaScale',
+          'cvUrl',
+          'transcriptUrl',
+          'savedProfessorIds',
+          'updatedAt'
+        ])
+        && request.resource.data.uid == userId;
+
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // 4. professors/{userId} — Public Faculty Profile (Explicit isPublicProfile Check)
+    // =========================================================================
+    match /professors/{userId} {
+      allow get, list: if (
+          resource.data.isPublicProfile == true
+          && !('email' in resource.data)
+          && hasOnlyAllowedProfessorProfileFields(resource.data)
+        )
+        || (isOwner(userId) && isProfessor());
+
+      allow create, update: if isOwner(userId)
+        && isProfessor()
+        && request.resource.data.isPublicProfile == true
+        && hasOnlyAllowedProfessorProfileFields(request.resource.data)
+        && hasValidProfessorRequiredIdentity(userId, request.resource.data)
+        && (!('fundingInfo' in request.resource.data) || isValidProfessorFundingInfo(request.resource.data.fundingInfo));
+
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // 5. userDirectory/{userId} — Privacy-Safe Discovery Directory (Role Enforced)
+    // =========================================================================
+    match /userDirectory/{userId} {
+      allow read: if isSignedIn();
+
+      allow create, update: if isOwner(userId)
+        && request.resource.data.keys().hasOnly([
+          'uid',
+          'fullName',
+          'username',
+          'role',
+          'university',
+          'department',
+          'headline',
+          'photoURL',
+          'researchAreas',
+          'updatedAt'
+        ])
+        && request.resource.data.uid == userId
+        && request.resource.data.role == authoritativeRole(userId)
+        && request.resource.data.fullName is string
+        && request.resource.data.fullName.size() >= 1
+        && request.resource.data.fullName.size() <= 120
+        && request.resource.data.username is string
+        && request.resource.data.username.size() >= 1
+        && request.resource.data.username.size() <= 80
+        && request.resource.data.university is string
+        && request.resource.data.university.size() <= 160
+        && request.resource.data.department is string
+        && request.resource.data.department.size() <= 160
+        && request.resource.data.headline is string
+        && request.resource.data.headline.size() <= 160
+        && request.resource.data.researchAreas is list
+        && request.resource.data.researchAreas.size() <= 10;
+
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // 6. positions/{positionId} — Public Research Opportunities (Read Protection)
+    // =========================================================================
+    match /positions/{positionId} {
+      // Public reads require that the position contains only safe public opportunity fields
+      // and contains no emails, student IDs, or CV URLs (protecting legacy documents)
+      allow get: if resource == null
+        || hasOnlyAllowedPositionFields(resource.data)
+        || (isProfessor() && resource.data.professorId == request.auth.uid);
+      allow list: if hasOnlyAllowedPositionFields(resource.data)
+        || (isProfessor() && resource.data.professorId == request.auth.uid);
+
+      allow create: if isProfessor()
+        && request.resource.data.professorId == request.auth.uid
+        && request.resource.data.id == positionId
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 200
+        && request.resource.data.isOpen is bool
+        && hasOnlyAllowedPositionFields(request.resource.data);
+
+      allow update: if isProfessor()
+        && resource.data.professorId == request.auth.uid
+        && request.resource.data.professorId == resource.data.professorId
+        && request.resource.data.id == resource.data.id
+        && hasOnlyAllowedPositionFields(request.resource.data);
+
+      allow delete: if isProfessor()
+        && resource.data.professorId == request.auth.uid;
+    }
+
+    // =========================================================================
+    // 7. applications/{applicationId} — Student Research Applications
+    // =========================================================================
+    match /applications/{applicationId} {
+      // Allow `get` on `resource == null` so checking a deterministic application ID never throws permission-denied
+      allow get: if isSignedIn() && (
+        resource == null ||
+        resource.data.studentId == request.auth.uid ||
+        resource.data.professorId == request.auth.uid
+      );
+
+      allow list: if isSignedIn() && (
+        resource.data.studentId == request.auth.uid ||
+        resource.data.professorId == request.auth.uid
+      );
+
+      // Validate that submitted CV references belong to the student
+      function isValidApplicationCvUrl(cv, studentId) {
+        return cv is string
+          && cv.size() >= 8
+          && cv.size() <= 1000
+          && (cv.matches('^https?://.*') || cv.matches('^gs://.*'))
+          && (
+            (!cv.matches('.*firebasestorage\\.googleapis\\.com.*') && !cv.matches('.*storage\\.googleapis\\.com.*') && !cv.matches('^gs://.*')) ||
+            cv.matches('.*[/%=]cvs(%2F|/)' + studentId + '(%2F|/).*')
+          );
+      }
+
+      function isValidApplicationCreate() {
+        let posPath = /databases/$(database)/documents/positions/$(request.resource.data.positionId);
+        return isStudent()
+          && exists(posPath)
+          && get(posPath).data.isOpen == true
+          && get(posPath).data.professorId == request.resource.data.professorId
+          && applicationId == ('app-' + request.auth.uid + '-' + request.resource.data.positionId)
+          && !exists(/databases/$(database)/documents/applications/$(applicationId))
+          && request.resource.data.keys().hasOnly([
+            'id',
+            'studentId',
+            'studentName',
+            'studentPhotoURL',
+            'professorId',
+            'positionId',
+            'positionTitle',
+            'professorName',
+            'university',
+            'matchScore',
+            'matchBreakdown',
+            'matchExplanation',
+            'cvUrl',
+            'studentGpa',
+            'studentGpaScale',
+            'applicationStatement',
+            'status',
+            'statusHistory',
+            'submittedAt',
+            'updatedAt',
+            'createdAt'
+          ])
+          && request.resource.data.id == applicationId
+          && request.resource.data.studentId == request.auth.uid
+          && request.resource.data.studentName is string
+          && request.resource.data.studentName.size() >= 1
+          && request.resource.data.studentName.size() <= 120
+          && request.resource.data.positionId is string
+          && request.resource.data.positionTitle is string
+          && request.resource.data.positionTitle.size() >= 1
+          && request.resource.data.positionTitle.size() <= 200
+          && request.resource.data.professorName is string
+          && request.resource.data.professorName.size() >= 1
+          && request.resource.data.professorName.size() <= 120
+          && request.resource.data.university is string
+          && request.resource.data.university.size() >= 1
+          && request.resource.data.university.size() <= 160
+          && request.resource.data.matchScore is number
+          && request.resource.data.matchScore >= 0
+          && request.resource.data.matchScore <= 100
+          && request.resource.data.matchBreakdown is map
+          && request.resource.data.matchBreakdown.keys().hasOnly([
+            'researchInterests',
+            'skills',
+            'language',
+            'major',
+            'experience'
+          ])
+          && request.resource.data.matchBreakdown.researchInterests is number
+          && request.resource.data.matchBreakdown.skills is number
+          && request.resource.data.matchBreakdown.language is number
+          && request.resource.data.matchBreakdown.major is number
+          && request.resource.data.matchBreakdown.experience is number
+          && request.resource.data.matchExplanation is string
+          && request.resource.data.matchExplanation.size() >= 1
+          && request.resource.data.matchExplanation.size() <= 2000
+          && (
+            !('cvUrl' in request.resource.data) ||
+            isValidApplicationCvUrl(request.resource.data.cvUrl, request.auth.uid)
+          )
+          && request.resource.data.applicationStatement is string
+          && request.resource.data.applicationStatement.size() >= 50
+          && request.resource.data.applicationStatement.size() <= 2000
+          && request.resource.data.status == 'submitted'
+          && request.resource.data.statusHistory is list
+          && request.resource.data.statusHistory.size() == 1
+          && request.resource.data.statusHistory[0].keys().hasOnly(['status', 'changedAt', 'note'])
+          && request.resource.data.statusHistory[0].status == 'submitted'
+          && request.resource.data.statusHistory[0].changedAt is string
+          && request.resource.data.submittedAt is string
+          && request.resource.data.updatedAt is string
+          && (
+            !('studentPhotoURL' in request.resource.data) ||
+            (request.resource.data.studentPhotoURL is string && request.resource.data.studentPhotoURL.size() <= 1000)
+          )
+          && (
+            !('studentGpa' in request.resource.data) ||
+            request.resource.data.studentGpa is number
+          )
+          && (
+            !('studentGpaScale' in request.resource.data) ||
+            request.resource.data.studentGpaScale is number
+          );
+      }
+
+      // Allowed status transitions in research application lifecycle:
+      // submitted -> under_review
+      // under_review -> interview, accepted, rejected
+      // interview -> accepted, rejected
+      // Note: 'accepted' and 'rejected' are strictly terminal states
+      function isValidStatusTransition(from, to) {
+        return from != to && (
+          (from == 'submitted' && to == 'under_review') ||
+          (from == 'under_review' && to in ['interview', 'accepted', 'rejected']) ||
+          (from == 'interview' && to in ['accepted', 'rejected'])
+        );
+      }
+
+      // Bounded prefix equality check for statusHistory (Firestore CEL does not support loops)
+      function isAppendOnlyStatusHistory(oldList, newList, newStatus) {
+        return newList is list
+          && oldList is list
+          && newList.size() == oldList.size() + 1
+          && newList.size() <= 12
+          && newList[oldList.size()].keys().hasOnly(['status', 'changedAt', 'note'])
+          && newList[oldList.size()].status == newStatus
+          && newList[oldList.size()].changedAt is string
+          && newList[oldList.size()].changedAt.size() >= 10
+          && (!('note' in newList[oldList.size()]) || (
+                newList[oldList.size()].note is string &&
+                newList[oldList.size()].note.size() <= 1000
+              ))
+          && (oldList.size() < 1 || newList[0] == oldList[0])
+          && (oldList.size() < 2 || newList[1] == oldList[1])
+          && (oldList.size() < 3 || newList[2] == oldList[2])
+          && (oldList.size() < 4 || newList[3] == oldList[3])
+          && (oldList.size() < 5 || newList[4] == oldList[4])
+          && (oldList.size() < 6 || newList[5] == oldList[5])
+          && (oldList.size() < 7 || newList[6] == oldList[6])
+          && (oldList.size() < 8 || newList[7] == oldList[7])
+          && (oldList.size() < 9 || newList[8] == oldList[8])
+          && (oldList.size() < 10 || newList[9] == oldList[9])
+          && (oldList.size() < 11 || newList[10] == oldList[10]);
+      }
+
+      function isValidInterviewTimestamp(val) {
+        return val is string && val.size() >= 10 && val.size() <= 40;
+      }
+
+      function isValidInterviewMeetingUrl(val) {
+        return val is string && val.size() <= 500 && (val == '' || val.matches('^https?://[^\\s]+$'));
+      }
+
+      function isValidInterviewInstructions(val) {
+        return val is string && val.size() <= 2000;
+      }
+
+      function isValidProfessorApplicationStatusUpdate() {
+        let validStatuses = ['submitted', 'under_review', 'interview', 'accepted', 'rejected'];
+        let affected = request.resource.data.diff(resource.data).affectedKeys();
+        let isStatusTransition = request.resource.data.status != resource.data.status
+          && isValidStatusTransition(resource.data.status, request.resource.data.status)
+          && (
+            request.resource.data.status != 'interview'
+            || ('interviewAt' in request.resource.data && isValidInterviewTimestamp(request.resource.data.interviewAt))
+          );
+        let interviewAtChanged = !('interviewAt' in resource.data) || request.resource.data.interviewAt != resource.data.interviewAt;
+        let meetingUrlChanged = ('interviewMeetingUrl' in request.resource.data)
+          && (!('interviewMeetingUrl' in resource.data) || request.resource.data.interviewMeetingUrl != resource.data.interviewMeetingUrl);
+        let instructionsChanged = ('interviewInstructions' in request.resource.data)
+          && (!('interviewInstructions' in resource.data) || request.resource.data.interviewInstructions != resource.data.interviewInstructions);
+        let isInterviewReschedule = resource.data.status == 'interview'
+          && request.resource.data.status == 'interview'
+          && 'interviewAt' in request.resource.data
+          && isValidInterviewTimestamp(request.resource.data.interviewAt)
+          && (interviewAtChanged || meetingUrlChanged || instructionsChanged);
+
+        return isProfessor()
+          && resource.data.professorId == request.auth.uid
+          && affected.hasOnly([
+            'status',
+            'interviewAt',
+            'interviewMeetingUrl',
+            'interviewInstructions',
+            'statusHistory',
+            'updatedAt'
+          ])
+          && (
+            request.resource.data.status == 'interview'
+            || (!('interviewMeetingUrl' in affected) && !('interviewInstructions' in affected))
+          )
+          && (!('interviewMeetingUrl' in request.resource.data) || isValidInterviewMeetingUrl(request.resource.data.interviewMeetingUrl))
+          && (!('interviewInstructions' in request.resource.data) || isValidInterviewInstructions(request.resource.data.interviewInstructions))
+          && request.resource.data.status in validStatuses
+          && (isStatusTransition || isInterviewReschedule)
+          && isAppendOnlyStatusHistory(
+            resource.data.statusHistory,
+            request.resource.data.statusHistory,
+            request.resource.data.status
+          );
+      }
+
+      allow create: if isValidApplicationCreate();
+      allow update: if isValidProfessorApplicationStatusUpdate();
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // 8. conversations/{conversationId} & messages/{messageId} — 1-to-1 Messaging
+    // =========================================================================
+    match /conversations/{conversationId} {
+
+      function isParticipant(data) {
+        return isSignedIn()
+          && data.participantIds is list
+          && data.participantIds.size() == 2
+          && request.auth.uid in data.participantIds;
+      }
+
+      function isCanonicalConversationId(participantIds) {
+        return participantIds is list
+          && participantIds.size() == 2
+          && participantIds[0] is string
+          && participantIds[1] is string
+          && participantIds[0] < participantIds[1]
+          && conversationId == (participantIds[0] + '_' + participantIds[1]);
+      }
+
+      function isValidParticipantSummaryShape(uid, summary) {
+        return summary is map
+          && summary.keys().hasOnly([
+            'uid',
+            'fullName',
+            'username',
+            'role',
+            'university',
+            'department',
+            'headline',
+            'photoURL'
+          ])
+          && summary.uid == uid
+          && summary.fullName is string
+          && summary.fullName.size() >= 1
+          && summary.fullName.size() <= 120
+          && summary.username is string
+          && summary.username.size() >= 1
+          && summary.username.size() <= 80
+          && summary.role in ['student', 'professor']
+          && summary.university is string
+          && summary.university.size() <= 160
+          && summary.department is string
+          && summary.department.size() <= 160
+          && summary.headline is string
+          && summary.headline.size() <= 160
+          && (!('photoURL' in summary) || (summary.photoURL is string && summary.photoURL.size() <= 1000));
+      }
+
+      function otherParticipantId(participantIds) {
+        return participantIds[0] == request.auth.uid
+          ? participantIds[1]
+          : participantIds[0];
+      }
+
+      function msgDocPath(msgId) {
+        return /databases/$(database)/documents/conversations/$(conversationId)/messages/$(msgId);
+      }
+
+      function isValidBatchMessagePreviewContent(convData, msgAfter) {
+        return msgAfter.senderId == request.auth.uid
+          && convData.lastMessageSenderId == msgAfter.senderId
+          && convData.lastMessage == msgAfter.content
+          && (
+            convData.lastMessageAt == msgAfter.createdAt
+            || (convData.lastMessageAt == request.time && msgAfter.createdAt == request.time)
+          );
+      }
+
+      // Validates that lastMessage preview fields exactly match the message created in the same atomic writeBatch
+      function isValidBatchMessagePreview(convData) {
+        let msgPath = msgDocPath(convData.lastMessageId);
+        return convData.lastMessageId is string
+          && !exists(msgPath)
+          && existsAfter(msgPath)
+          && isValidBatchMessagePreviewContent(convData, getAfter(msgPath).data);
+      }
+
+      function isValidConversationCreate() {
+        let data = request.resource.data;
+        let otherUid = otherParticipantId(data.participantIds);
+        let myRole = authoritativeRole(request.auth.uid);
+        let otherRole = authoritativeRole(otherUid);
+        let mySummary = data.participants[request.auth.uid];
+        let otherSummary = data.participants[otherUid];
+        return isParticipant(data)
+          && isCanonicalConversationId(data.participantIds)
+          && myRole in ['student', 'professor']
+          && otherRole in ['student', 'professor']
+          && data.keys().hasOnly([
+            'id',
+            'participantIds',
+            'participants',
+            'contextTitle',
+            'positionId',
+            'lastMessageId',
+            'lastMessage',
+            'lastMessageSenderId',
+            'lastMessageAt',
+            'lastReadAt',
+            'createdAt',
+            'updatedAt'
+          ])
+          && data.id == conversationId
+          && data.lastMessageSenderId == request.auth.uid
+          && data.lastMessage is string
+          && data.lastMessage.size() >= 1
+          && data.lastMessage.size() <= 4000
+          && isValidBatchMessagePreview(data)
+          && data.participants is map
+          && data.participants.keys().hasOnly(data.participantIds)
+          && data.participants.size() == 2
+          && isValidParticipantSummaryShape(request.auth.uid, mySummary)
+          && mySummary.role == myRole
+          && matchesAuthoritativeProfile(request.auth.uid, mySummary)
+          && isValidParticipantSummaryShape(otherUid, otherSummary)
+          && otherSummary.role == otherRole
+          && (
+            !exists(/databases/$(database)/documents/userDirectory/$(otherUid))
+            || matchesDirectoryData(
+              get(/databases/$(database)/documents/userDirectory/$(otherUid)).data,
+              otherSummary
+            )
+          )
+          && data.lastReadAt is map
+          && data.lastReadAt.keys().hasOnly([request.auth.uid]);
+      }
+
+      // Allow `get` on `resource == null` so checking whether a deterministic conversation ID exists does not fail
+      allow get: if isSignedIn() && (resource == null || isParticipant(resource.data));
+      allow list: if isSignedIn()
+        && request.auth.uid in resource.data.participantIds;
+
+      allow create: if isValidConversationCreate();
+
+      allow update: if isParticipant(resource.data)
+        && request.resource.data.id == resource.data.id
+        && request.resource.data.participantIds == resource.data.participantIds
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'participants',
+          'lastMessageId',
+          'lastMessage',
+          'lastMessageSenderId',
+          'lastMessageAt',
+          'lastReadAt',
+          'updatedAt'
+        ])
+        && request.resource.data.participants.diff(resource.data.participants).affectedKeys().hasOnly([
+          request.auth.uid
+        ])
+        && isValidParticipantSummaryShape(
+          request.auth.uid,
+          request.resource.data.participants[request.auth.uid]
+        )
+        && request.resource.data.participants[request.auth.uid].role == authoritativeRole(request.auth.uid)
+        && matchesAuthoritativeProfile(
+          request.auth.uid,
+          request.resource.data.participants[request.auth.uid]
+        )
+        && (
+          (
+            !('lastReadAt' in resource.data)
+            && request.resource.data.lastReadAt is map
+            && request.resource.data.lastReadAt.keys().hasOnly([request.auth.uid])
+          ) || (
+            'lastReadAt' in resource.data
+            && resource.data.lastReadAt is map
+            && request.resource.data.lastReadAt is map
+            && request.resource.data.lastReadAt.diff(resource.data.lastReadAt).affectedKeys().hasOnly([
+              request.auth.uid
+            ])
+          )
+        )
+        && (
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastReadAt'])
+          || (
+            request.resource.data.lastMessageSenderId == request.auth.uid
+            && request.resource.data.lastMessage is string
+            && request.resource.data.lastMessage.size() >= 1
+            && request.resource.data.lastMessage.size() <= 4000
+            && (request.resource.data.updatedAt == request.time || request.resource.data.updatedAt is string)
+            && isValidBatchMessagePreview(request.resource.data)
+          )
+        );
+
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        function parentConvPath() {
+          return /databases/$(database)/documents/conversations/$(conversationId);
+        }
+
+        // Authorizes access if the user is a participant either in the pre-existing conversation
+        // or in the conversation being created in the same atomic writeBatch (existsAfter / getAfter)
+        function isParentConvParticipant() {
+          return isSignedIn() && (
+            (exists(parentConvPath()) && request.auth.uid in get(parentConvPath()).data.participantIds) ||
+            (existsAfter(parentConvPath()) && request.auth.uid in getAfter(parentConvPath()).data.participantIds)
+          );
+        }
+
+        allow read: if isParentConvParticipant();
+
+        allow create: if isParentConvParticipant()
+          && request.resource.data.keys().hasOnly([
+            'id',
+            'conversationId',
+            'senderId',
+            'senderName',
+            'content',
+            'createdAt'
+          ])
+          && request.resource.data.id == messageId
+          && request.resource.data.conversationId == conversationId
+          && request.resource.data.senderId == request.auth.uid
+          && existsAfter(parentConvPath())
+          && getAfter(parentConvPath()).data.lastMessageId == messageId
+          && request.resource.data.senderName is string
+          && request.resource.data.senderName.size() >= 1
+          && request.resource.data.senderName.size() <= 120
+          && (
+            verifiedSenderName(request.auth.uid) == null ||
+            verifiedSenderName(request.auth.uid) == '' ||
+            request.resource.data.senderName == verifiedSenderName(request.auth.uid)
+          )
+          && request.resource.data.content is string
+          && request.resource.data.content.size() >= 1
+          && request.resource.data.content.size() <= 4000
+          && request.resource.data.createdAt == request.time;
+
+        allow update, delete: if false;
+      }
+    }
+  }
+}

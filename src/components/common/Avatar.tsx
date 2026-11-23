@@ -1,3 +1,4 @@
+import { useState, useEffect } from 'react'
 import { cn, getInitials } from '@/utils/helpers'
 
 interface AvatarProps {
@@ -16,12 +17,25 @@ const sizes = {
 }
 
 export function Avatar({ src, name, size = 'md', className }: AvatarProps) {
-  if (src) {
+  const [imgError, setImgError] = useState(false)
+
+  useEffect(() => {
+    setImgError(false)
+  }, [src])
+
+  const trimmedSrc = typeof src === 'string' ? src.trim() : ''
+
+  if (trimmedSrc && !imgError) {
     return (
       <img
-        src={src}
+        src={trimmedSrc}
         alt={name}
-        className={cn('rounded-full object-cover border border-slate-200 shadow-2xs shrink-0', sizes[size], className)}
+        onError={() => setImgError(true)}
+        className={cn(
+          'rounded-full object-cover aspect-square border border-slate-200 shadow-2xs shrink-0',
+          sizes[size],
+          className
+        )}
       />
     )
   }
@@ -29,7 +43,7 @@ export function Avatar({ src, name, size = 'md', className }: AvatarProps) {
   return (
     <div
       className={cn(
-        'rounded-full flex items-center justify-center font-medium border border-slate-200 shadow-2xs shrink-0',
+        'rounded-full flex items-center justify-center font-medium border border-slate-200 shadow-2xs shrink-0 aspect-square',
         'bg-slate-100 text-slate-700',
         sizes[size],
         className
