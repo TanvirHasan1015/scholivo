@@ -1,362 +1,867 @@
-import { useState, useEffect } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { Send, ArrowLeft, MessageSquare, CheckCheck, Clock, ShieldAlert, Search, Sparkles } from 'lucide-react'
+import { useState, useEffect, useMemo, useRef } from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import {
+  collection,
+  doc,
+  getDoc,
+  onSnapshot,
+  orderBy,
+  query,
+  where,
+  type Timestamp,
+} from 'firebase/firestore'
+import {
+  Send,
+  MessageSquare,
+  CheckCheck,
+  Plus,
+  Search,
+  X,
+  GraduationCap,
+  User as UserIcon,
+  AlertCircle,
+} from 'lucide-react'
+import { db } from '@/lib/firebase'
 import { useAuth } from '@/context/AuthContext'
+import {
+  buildDirectoryEntryFromProfessor,
+  buildDirectoryEntryFromStudent,
+  fetchDiscoverableUsers,
+  getConversationId,
+  loadSplitStudentProfile,
+  markConversationAsRead,
+  resolveUserDirectoryEntry,
+  sendConversationMessage,
+  stripLegacyProfessorEmailIfPresent,
+  syncUserDirectoryEntry,
+  toParticipantSummary,
+} from '@/lib/messaging'
+import type {
+  ConversationDocument,
+  ConversationParticipantSummary,
+  MessageDocument,
+  MessagingRole,
+  UserDirectoryEntry,
+} from '@/types/message.types'
+import type { ProfessorProfile, StudentProfile } from '@/types/user.types'
 import { Avatar } from '@/components/common/Avatar'
 import { Button } from '@/components/common/Button'
 
-interface Message {
+interface DraftConversation {
   id: string
-  senderId: string
-  senderName: string
-  content: string
-  sentAt: string
+  recipient: ConversationParticipantSummary
+  contextTitle: string
+  positionId?: string
 }
 
-interface Conversation {
-  id: string
-  participantName: string
-  participantRole: string
-  participantAvatar?: string
-  positionTitle: string
-  lastMessage: string
-  lastMessageAt: string
-  unread: boolean
-  messages: Message[]
-}
-
-const INITIAL_CONVERSATIONS: Conversation[] = [
-  {
-    id: 'conv-1',
-    participantName: 'Prof. Sungho Kim',
-    participantRole: 'Associate Professor, KAIST',
-    participantAvatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150',
-    positionTitle: 'PhD Position — Computer Vision & Medical AI',
-    lastMessage: 'Your experience with MICCAI is very promising. Are you available for a brief Zoom meeting next Tuesday?',
-    lastMessageAt: '10:45 AM',
-    unread: true,
-    messages: [
-      {
-        id: 'm1',
-        senderId: 'prof',
-        senderName: 'Prof. Sungho Kim',
-        content: 'Hello, thank you for submitting your application for our PhD opening in medical AI.',
-        sentAt: 'Yesterday at 3:15 PM'
-      },
-      {
-        id: 'm2',
-        senderId: 'student',
-        senderName: 'Student Applicant',
-        content: 'Thank you Professor! I am very excited about your recent work on 3D diffusion models for pathology synthesis.',
-        sentAt: 'Yesterday at 4:02 PM'
-      },
-      {
-        id: 'm3',
-        senderId: 'prof',
-        senderName: 'Prof. Sungho Kim',
-        content: 'Your experience with MICCAI is very promising. Are you available for a brief Zoom meeting next Tuesday at 2 PM KST?',
-        sentAt: '10:45 AM'
-      }
-    ]
-  },
-  {
-    id: 'conv-2',
-    participantName: 'Prof. Emily Chen',
-    participantRole: 'Full Professor, MIT',
-    participantAvatar: 'https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?w=150',
-    positionTitle: "Master's in NLP / AI",
-    lastMessage: 'We received your transcript and are reviewing it alongside other candidates.',
-    lastMessageAt: 'Oct 03',
-    unread: false,
-    messages: [
-      {
-        id: 'm10',
-        senderId: 'prof',
-        senderName: 'Prof. Emily Chen',
-        content: 'We received your transcript and are reviewing it alongside other candidates. We will update the status portal next week.',
-        sentAt: 'Oct 03 at 9:00 AM'
-      }
-    ]
+function toMillis(val: unknown): number {
+  if (!val) return 0
+  if (typeof val === 'object' && val !== null && 'toMillis' in val && typeof (val as Timestamp).toMillis === 'function') {
+    return (val as Timestamp).toMillis()
   }
-]
+  if (typeof val === 'string') {
+    const parsed = Date.parse(val)
+    return Number.isNaN(parsed) ? 0 : parsed
+  }
+  if (typeof val === 'number') return val
+  return 0
+}
+
+function formatTimestamp(val: unknown): string {
+  const ms = toMillis(val)
+  if (!ms) return 'Just now'
+  const date = new Date(ms)
+  const now = new Date()
+  const isToday =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate()
+
+  if (isToday) {
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  }
+  return date.toLocaleDateString([], { month: 'short', day: 'numeric' })
+}
+
+function resolveCounterpart(
+  conv: ConversationDocument,
+  currentUid?: string
+): ConversationParticipantSummary {
+  const otherUid = conv.participantIds?.find((id) => id !== currentUid) || ''
+  const summary = (otherUid && conv.participants?.[otherUid]) || undefined
+  return (
+    summary || {
+      uid: otherUid,
+      fullName: 'Scholivo Member',
+      role: 'student',
+      university: '',
+      headline: 'Researcher',
+    }
+  )
+}
 
 export default function Messages() {
   const { user, role } = useAuth()
   const navigate = useNavigate()
-  const [conversations, setConversations] = useState<Conversation[]>(INITIAL_CONVERSATIONS)
-  const [activeConvId, setActiveConvId] = useState<string>('conv-1')
-  const [inputMessage, setInputMessage] = useState('')
+  const [searchParams, setSearchParams] = useSearchParams()
 
-  // Verification status check for student
-  const [verificationStatus, setVerificationStatus] = useState<string>(() => {
-    if (role === 'student') {
-      const savedVerifications = localStorage.getItem('rm_demo_verifications')
-      if (savedVerifications) {
-        try {
-          const list = JSON.parse(savedVerifications)
-          const myRecord = list.find((item: any) =>
-            (user && (item.userId === user.uid || (item.applicantEmail && user.email && item.applicantEmail.toLowerCase() === user.email.toLowerCase()))) ||
-            (!user && item.userId === 'demo-student')
-          )
-          if (myRecord) return myRecord.status
-        } catch {}
+  const [mySummary, setMySummary] = useState<ConversationParticipantSummary | null>(null)
+  const [conversations, setConversations] = useState<ConversationDocument[]>([])
+  const [loadingConvs, setLoadingConvs] = useState(true)
+  const [activeConvId, setActiveConvId] = useState<string>('')
+  const [draftConv, setDraftConv] = useState<DraftConversation | null>(null)
+
+  const [messagesState, setMessagesState] = useState<{
+    convId: string
+    items: MessageDocument[]
+    error: string | null
+  }>({
+    convId: '',
+    items: [],
+    error: null,
+  })
+  const [inputMessage, setInputMessage] = useState('')
+  const [sending, setSending] = useState(false)
+  const [errorMsg, setErrorMsg] = useState<string | null>(null)
+
+  // User Directory Modal State
+  const [showDirectoryModal, setShowDirectoryModal] = useState(false)
+  const [directoryUsers, setDirectoryUsers] = useState<UserDirectoryEntry[]>([])
+  const [loadingDirectory, setLoadingDirectory] = useState(false)
+  const [directorySearch, setDirectorySearch] = useState('')
+  const [directoryRoleFilter, setDirectoryRoleFilter] = useState<'all' | MessagingRole>('all')
+
+  const messagesContainerRef = useRef<HTMLDivElement | null>(null)
+  const isNearBottomRef = useRef(true)
+  const forceScrollBottomRef = useRef(false)
+  const lastScrolledConvIdRef = useRef<string>('')
+  const prevFirstMsgIdRef = useRef<string>('')
+  const prevLastMsgIdRef = useRef<string>('')
+  const prevScrollHeightRef = useRef<number>(0)
+
+  // Ensure the messaging workspace always opens aligned below the navbar (not scrolled down from a previous page)
+  useEffect(() => {
+    window.scrollTo({ top: 0, left: 0, behavior: 'auto' })
+  }, [])
+
+  // 1. Load current user's profile and self-sync userDirectory entry
+  useEffect(() => {
+    let isMounted = true
+
+    async function initMySummary() {
+      if (!user) return
+      const effectiveRole: MessagingRole = role === 'professor' ? 'professor' : 'student'
+
+      try {
+        if (effectiveRole === 'professor') {
+          const profSnap = await getDoc(doc(db, 'professors', user.uid))
+          if (profSnap.exists()) {
+            const rawProf = profSnap.data() as Record<string, unknown>
+            stripLegacyProfessorEmailIfPresent(user.uid, rawProf)
+            const profData = rawProf as unknown as ProfessorProfile
+            const entry = buildDirectoryEntryFromProfessor({
+              ...profData,
+              uid: user.uid,
+            })
+            if (isMounted) setMySummary(toParticipantSummary(entry))
+            syncUserDirectoryEntry(entry).catch(() => {})
+            return
+          }
+        } else {
+          const loadedStudent = await loadSplitStudentProfile(user.uid)
+          if (loadedStudent.exists) {
+            const studentData = loadedStudent.data as StudentProfile
+            const entry = buildDirectoryEntryFromStudent({
+              ...studentData,
+              uid: user.uid,
+            })
+            if (isMounted) setMySummary(toParticipantSummary(entry))
+            syncUserDirectoryEntry(entry).catch(() => {})
+            return
+          }
+        }
+      } catch {
+        // Fallback to basic in-memory summary below
       }
-      const savedStudent = localStorage.getItem('rm_demo_student_profile')
-      if (savedStudent) {
-        try {
-          const p = JSON.parse(savedStudent)
-          if (p.verificationStatus) return p.verificationStatus
-        } catch {}
+
+      let resolvedDisplayName = user.displayName || 'Scholivo Member'
+      try {
+        const userSnap = await getDoc(doc(db, 'users', user.uid))
+        if (userSnap.exists()) {
+          const uData = userSnap.data() as { displayName?: string }
+          if (uData.displayName?.trim()) {
+            resolvedDisplayName = uData.displayName.trim()
+          }
+        }
+      } catch {
+        // Ignore
+      }
+
+      if (isMounted) {
+        const fallbackEntry: UserDirectoryEntry = {
+          uid: user.uid,
+          fullName: resolvedDisplayName,
+          username: user.uid,
+          role: effectiveRole,
+          university: '',
+          department: '',
+          headline: effectiveRole === 'professor' ? 'Professor' : 'Student Researcher',
+          ...(user.photoURL ? { photoURL: user.photoURL } : {}),
+          researchAreas: [],
+          updatedAt: new Date().toISOString(),
+        }
+        setMySummary(toParticipantSummary(fallbackEntry))
       }
     }
-    return 'verified'
-  })
 
-  useEffect(() => {
-    if (role === 'student') {
-      const savedVerifications = localStorage.getItem('rm_demo_verifications')
-      if (savedVerifications) {
-        try {
-          const list = JSON.parse(savedVerifications)
-          const myRecord = list.find((item: any) =>
-            (user && (item.userId === user.uid || (item.applicantEmail && user.email && item.applicantEmail.toLowerCase() === user.email.toLowerCase()))) ||
-            (!user && item.userId === 'demo-student')
-          )
-          if (myRecord) setVerificationStatus(myRecord.status)
-        } catch {}
-      }
+    initMySummary()
+    return () => {
+      isMounted = false
     }
   }, [user, role])
 
-  const isRestrictedStudent = role === 'student' && verificationStatus !== 'verified'
+  // 2. Real-time inbox subscription using Firestore onSnapshot
+  useEffect(() => {
+    const uid = user?.uid
+    if (!uid) return
 
-  const activeConv = conversations.find(c => c.id === activeConvId) || conversations[0]
+    const convQuery = query(
+      collection(db, 'conversations'),
+      where('participantIds', 'array-contains', uid)
+    )
 
-  const handleSendMessage = (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!inputMessage.trim() || isRestrictedStudent) return
+    const unsubscribe = onSnapshot(
+      convQuery,
+      (snap) => {
+        const list: ConversationDocument[] = snap.docs.map((d) => {
+          const data = d.data() as ConversationDocument
+          return {
+            ...data,
+            id: d.id,
+          }
+        })
 
-    const newMsg: Message = {
-      id: `msg-${Date.now()}`,
-      senderId: role === 'professor' ? 'prof' : 'student',
-      senderName: user?.displayName || 'Me',
-      content: inputMessage,
-      sentAt: 'Just now'
-    }
+        list.sort((a, b) => toMillis(b.lastMessageAt) - toMillis(a.lastMessageAt))
+        setConversations(list)
+        setLoadingConvs(false)
+      },
+      (err) => {
+        console.error('Real-time conversations listener error:', err)
+        setLoadingConvs(false)
+      }
+    )
 
-    setConversations(prev => prev.map(c => {
-      if (c.id === activeConvId) {
-        return {
-          ...c,
-          lastMessage: inputMessage,
-          lastMessageAt: 'Just now',
-          unread: false,
-          messages: [...c.messages, newMsg]
+    return () => unsubscribe()
+  }, [user?.uid])
+
+  // 3. Handle deep-link initiation (?to=<uid>&context=<title>&positionId=<id>&name=<name>&role=<role>&university=<uni>&department=<dept>&headline=<headline>)
+  useEffect(() => {
+    let isMounted = true
+    const targetUid = searchParams.get('to')?.trim()
+    const contextParam = searchParams.get('context')?.trim()
+    const positionIdParam = searchParams.get('positionId')?.trim()
+    const nameParam = searchParams.get('name')?.trim()
+    const usernameParam = searchParams.get('username')?.trim()
+    const roleParam = searchParams.get('role')?.trim()
+    const universityParam = searchParams.get('university')?.trim()
+    const departmentParam = searchParams.get('department')?.trim()
+    const headlineParam = searchParams.get('headline')?.trim()
+
+    async function handleRecipientParam() {
+      if (!user || !targetUid) return
+      if (targetUid === user.uid) {
+        setSearchParams({}, { replace: true })
+        return
+      }
+
+      const deterministicId = getConversationId(user.uid, targetUid)
+      const existing = conversations.find((c) => c.id === deterministicId)
+      if (existing) {
+        setDraftConv(null)
+        setActiveConvId(deterministicId)
+        setSearchParams({}, { replace: true })
+        return
+      }
+
+      const resolvedEntry = await resolveUserDirectoryEntry(targetUid)
+      if (!isMounted) return
+
+      let recipientSummary: ConversationParticipantSummary | null = null
+      if (resolvedEntry) {
+        recipientSummary = toParticipantSummary(resolvedEntry)
+      } else if (nameParam) {
+        const fallbackRole: MessagingRole = roleParam === 'professor' ? 'professor' : 'student'
+        recipientSummary = {
+          uid: targetUid,
+          fullName: nameParam,
+          username: usernameParam || targetUid,
+          role: fallbackRole,
+          university: universityParam || '',
+          department: departmentParam || '',
+          headline: headlineParam || (fallbackRole === 'professor' ? 'Professor' : 'Student Researcher'),
         }
       }
-      return c
-    }))
 
-    setInputMessage('')
+      if (!recipientSummary) {
+        setErrorMsg('Recipient profile could not be verified to start a conversation.')
+        setSearchParams({}, { replace: true })
+        return
+      }
+
+      setDraftConv({
+        id: deterministicId,
+        recipient: recipientSummary,
+        contextTitle: contextParam || 'Academic Inquiry',
+        ...(positionIdParam ? { positionId: positionIdParam } : {}),
+      })
+      setActiveConvId(deterministicId)
+      setSearchParams({}, { replace: true })
+    }
+
+    handleRecipientParam()
+    return () => {
+      isMounted = false
+    }
+  }, [user, role, searchParams, conversations, setSearchParams])
+
+  const visibleDraftConv = useMemo(() => {
+    if (!draftConv) return null
+    if (conversations.some((c) => c.id === draftConv.id)) return null
+    return draftConv
+  }, [draftConv, conversations])
+
+  const effectiveActiveConvId =
+    activeConvId || visibleDraftConv?.id || conversations[0]?.id || ''
+
+  const activeExistingConv = useMemo(
+    () => conversations.find((c) => c.id === effectiveActiveConvId) || null,
+    [conversations, effectiveActiveConvId]
+  )
+
+  const activeExistingConvId = activeExistingConv?.id || ''
+
+  // 4. Real-time message subscription for the active conversation using onSnapshot
+  useEffect(() => {
+    const uid = user?.uid
+    if (!uid || !activeExistingConvId) return
+
+    const msgQuery = query(
+      collection(db, 'conversations', activeExistingConvId, 'messages'),
+      orderBy('createdAt', 'asc')
+    )
+
+    const unsubscribe = onSnapshot(
+      msgQuery,
+      (snap) => {
+        const loaded: MessageDocument[] = snap.docs.map((d) => ({
+          ...(d.data() as MessageDocument),
+          id: d.id,
+        }))
+        setMessagesState({
+          convId: activeExistingConvId,
+          items: loaded,
+          error: null,
+        })
+      },
+      (err) => {
+        console.error('Real-time messages listener error:', err)
+        const msg = (err as { message?: string })?.message || 'Unable to load message history.'
+        setMessagesState({
+          convId: activeExistingConvId,
+          items: [],
+          error: `Failed to load message history: ${msg}`,
+        })
+      }
+    )
+
+    return () => unsubscribe()
+  }, [user?.uid, activeExistingConvId])
+
+  // 5. Mark active conversation as read only when it has unread activity from the counterpart
+  const activeLastMsgMs = toMillis(activeExistingConv?.lastMessageAt)
+  const activeLastReadMs = toMillis(user?.uid ? activeExistingConv?.lastReadAt?.[user.uid] : undefined)
+  const activeLastSenderId = activeExistingConv?.lastMessageSenderId || ''
+
+  useEffect(() => {
+    const uid = user?.uid
+    if (!uid || !activeExistingConvId) return
+    if (activeLastSenderId && activeLastSenderId !== uid && activeLastMsgMs > activeLastReadMs) {
+      markConversationAsRead(activeExistingConvId, uid)
+    }
+  }, [user?.uid, activeExistingConvId, activeLastSenderId, activeLastMsgMs, activeLastReadMs])
+
+  const isMessagesLoading = Boolean(
+    activeExistingConvId && messagesState.convId !== activeExistingConvId
+  )
+  const messagesError =
+    activeExistingConvId && messagesState.convId === activeExistingConvId
+      ? messagesState.error
+      : null
+  const displayedMessages = useMemo(
+    () =>
+      activeExistingConvId && messagesState.convId === activeExistingConvId
+        ? messagesState.items
+        : [],
+    [activeExistingConvId, messagesState.convId, messagesState.items]
+  )
+
+  const handleMessagesScroll = () => {
+    const container = messagesContainerRef.current
+    if (!container) return
+    const distanceFromBottom =
+      container.scrollHeight - container.scrollTop - container.clientHeight
+    isNearBottomRef.current = distanceFromBottom <= 96
   }
 
-  // If student is unverified / pending, render restriction barrier
-  if (isRestrictedStudent) {
-    return (
-      <div className="min-h-screen bg-slate-50/70 pt-20 pb-20 px-4 sm:px-6">
-        <div className="max-w-2xl mx-auto space-y-6">
-          <div className="flex items-center justify-between">
-            <button
-              onClick={() => navigate('/dashboard/student')}
-              className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-500 hover:text-slate-900 transition-colors py-1 px-2.5 rounded-lg hover:bg-slate-200/60"
-            >
-              <ArrowLeft size={14} />
-              Back to Student Dashboard
-            </button>
-          </div>
+  // Scroll only the internal message container (never the document/window)
+  useEffect(() => {
+    const container = messagesContainerRef.current
+    if (!container || isMessagesLoading) return
 
-          <div className="bg-white rounded-3xl border border-slate-200/80 p-8 sm:p-12 text-center shadow-xs space-y-6">
-            <div className="w-16 h-16 rounded-2xl bg-amber-50 border border-amber-200 flex items-center justify-center mx-auto text-amber-600">
-              <ShieldAlert size={32} />
-            </div>
+    const convChanged = lastScrolledConvIdRef.current !== effectiveActiveConvId
+    const firstMsgId = displayedMessages[0]?.id || ''
+    const lastMsgId = displayedMessages[displayedMessages.length - 1]?.id || ''
+    const lastMsgSenderId = displayedMessages[displayedMessages.length - 1]?.senderId || ''
 
-            <div>
-              <span className="inline-block px-3 py-1 rounded-full text-xs font-semibold bg-amber-100/80 text-amber-800 border border-amber-200 uppercase tracking-wider mb-2">
-                Verification Required
-              </span>
-              <h1 className="text-2xl sm:text-3xl font-bold font-display text-slate-900 tracking-tight">
-                Academic Messaging Restricted
-              </h1>
-            </div>
+    if (convChanged) {
+      lastScrolledConvIdRef.current = effectiveActiveConvId
+      isNearBottomRef.current = true
+      forceScrollBottomRef.current = false
+      container.scrollTop = container.scrollHeight
+    } else if (
+      prevFirstMsgIdRef.current &&
+      firstMsgId &&
+      firstMsgId !== prevFirstMsgIdRef.current &&
+      lastMsgId === prevLastMsgIdRef.current
+    ) {
+      // Older messages were prepended: preserve current reading position
+      const heightDiff = container.scrollHeight - prevScrollHeightRef.current
+      if (heightDiff > 0) {
+        container.scrollTop += heightDiff
+      }
+    } else if (
+      forceScrollBottomRef.current ||
+      (lastMsgId &&
+        lastMsgId !== prevLastMsgIdRef.current &&
+        (isNearBottomRef.current || lastMsgSenderId === user?.uid))
+    ) {
+      forceScrollBottomRef.current = false
+      container.scrollTo({
+        top: container.scrollHeight,
+        behavior: 'smooth',
+      })
+    }
 
-            <p className="text-slate-600 text-xs sm:text-sm leading-relaxed max-w-lg mx-auto">
-              Your student affiliation is currently{' '}
-              <strong className="text-amber-800 capitalize font-semibold">{verificationStatus.replace('_', ' ')}</strong>.
-              Direct messaging with faculty is reserved for verified students to protect academic communication standards. You may still search research opportunities and save faculty profiles.
-            </p>
+    prevFirstMsgIdRef.current = firstMsgId
+    prevLastMsgIdRef.current = lastMsgId
+    prevScrollHeightRef.current = container.scrollHeight
+  }, [displayedMessages, effectiveActiveConvId, isMessagesLoading, user?.uid])
 
-            <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200/70 max-w-md mx-auto text-left text-xs space-y-2 text-slate-600">
-              <div className="flex items-center gap-2 font-semibold text-slate-800">
-                <Sparkles size={14} className="text-blue-600" />
-                Available During Pending Status:
-              </div>
-              <ul className="list-disc list-inside space-y-1 text-slate-500 pl-1">
-                <li>Browse complete faculty profiles and publications</li>
-                <li>Search matching research opportunities</li>
-                <li>Save professors to your personal shortlist</li>
-                <li>Update your academic profile and credentials</li>
-              </ul>
-            </div>
+  const isConversationUnread = (conv: ConversationDocument): boolean => {
+    if (!user) return false
+    if (conv.lastMessageSenderId === user.uid) return false
+    const lastMsgMs = toMillis(conv.lastMessageAt)
+    const lastReadMs = toMillis(conv.lastReadAt?.[user.uid])
+    return lastMsgMs > lastReadMs
+  }
 
-            <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-3">
-              <Button
-                variant="primary"
-                onClick={() => navigate('/search')}
-                className="text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white"
-                id="browse-professors-btn"
-              >
-                <Search size={14} className="mr-1.5" />
-                Browse Faculty Directory
-              </Button>
-              <Button
-                variant="secondary"
-                onClick={() => navigate('/dashboard/student')}
-                className="text-xs font-semibold"
-              >
-                Return to Dashboard
-              </Button>
-            </div>
-          </div>
-        </div>
-      </div>
-    )
+  const activeCounterpart: ConversationParticipantSummary | null = useMemo(() => {
+    if (activeExistingConv) return resolveCounterpart(activeExistingConv, user?.uid)
+    if (visibleDraftConv && visibleDraftConv.id === effectiveActiveConvId) {
+      return visibleDraftConv.recipient
+    }
+    return null
+  }, [activeExistingConv, visibleDraftConv, effectiveActiveConvId, user?.uid])
+
+  const activeContextTitle =
+    activeExistingConv?.contextTitle ||
+    (visibleDraftConv && visibleDraftConv.id === effectiveActiveConvId
+      ? visibleDraftConv.contextTitle
+      : 'Academic Inquiry')
+
+  const handleOpenDirectoryModal = async () => {
+    if (!user) return
+    setShowDirectoryModal(true)
+    setLoadingDirectory(true)
+    try {
+      const effectiveRole: MessagingRole = role === 'professor' ? 'professor' : 'student'
+      const list = await fetchDiscoverableUsers(user.uid, effectiveRole)
+      setDirectoryUsers(list)
+    } catch (err) {
+      console.error('Failed to load user directory:', err)
+    } finally {
+      setLoadingDirectory(false)
+    }
+  }
+
+  const filteredDirectoryUsers = useMemo(() => {
+    const q = directorySearch.trim().toLowerCase()
+    return directoryUsers.filter((entry) => {
+      if (directoryRoleFilter !== 'all' && entry.role !== directoryRoleFilter) return false
+      if (!q) return true
+      return (
+        entry.fullName.toLowerCase().includes(q) ||
+        entry.username.toLowerCase().includes(q) ||
+        entry.university.toLowerCase().includes(q) ||
+        entry.department.toLowerCase().includes(q) ||
+        entry.headline.toLowerCase().includes(q) ||
+        entry.researchAreas.some((area) => area.toLowerCase().includes(q))
+      )
+    })
+  }, [directoryUsers, directorySearch, directoryRoleFilter])
+
+  const handleSelectDirectoryUser = (entry: UserDirectoryEntry) => {
+    if (!user || entry.uid === user.uid) return
+    const convId = getConversationId(user.uid, entry.uid)
+    const existing = conversations.find((c) => c.id === convId)
+    if (existing) {
+      setDraftConv(null)
+      setActiveConvId(convId)
+    } else {
+      setDraftConv({
+        id: convId,
+        recipient: toParticipantSummary(entry),
+        contextTitle: entry.role === 'professor' ? `${entry.fullName} Lab Inquiry` : 'Research Collaboration',
+      })
+      setActiveConvId(convId)
+    }
+    setShowDirectoryModal(false)
+    setDirectorySearch('')
+  }
+
+  const handleSendMessage = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (sending || !user || !activeCounterpart || !inputMessage.trim()) return
+
+    const contentToSend = inputMessage.trim()
+    setSending(true)
+    setErrorMsg(null)
+
+    const senderSummary: ConversationParticipantSummary = mySummary || {
+      uid: user.uid,
+      fullName: user.displayName || 'Scholivo Member',
+      username: user.uid,
+      role: role === 'professor' ? 'professor' : 'student',
+      university: '',
+      headline: role === 'professor' ? 'Professor' : 'Student Researcher',
+      ...(user.photoURL ? { photoURL: user.photoURL } : {}),
+    }
+
+    try {
+      const convId = await sendConversationMessage({
+        sender: senderSummary,
+        recipient: activeCounterpart,
+        content: contentToSend,
+        contextTitle: activeContextTitle,
+        positionId: activeExistingConv?.positionId || draftConv?.positionId,
+      })
+      forceScrollBottomRef.current = true
+      setInputMessage('')
+      setDraftConv(null)
+      setActiveConvId(convId)
+    } catch (err) {
+      console.error('Failed to send message:', err)
+      const fbErr = err as { code?: string; message?: string } | null
+      const code = fbErr?.code || 'unknown'
+      const detail = fbErr?.message || 'Unexpected error while sending message.'
+      if (code.includes('permission-denied')) {
+        setErrorMsg(`Message write blocked (${code}): ${detail}`)
+      } else {
+        setErrorMsg(`Failed to send message (${code}): ${detail}`)
+      }
+    } finally {
+      setSending(false)
+    }
   }
 
   return (
-    <div className="min-h-screen bg-slate-50/70 pt-8 pb-16 px-4 sm:px-6 max-w-7xl mx-auto flex flex-col">
-      <div className="flex-1 bg-white rounded-3xl border border-slate-200/80 shadow-2xs overflow-hidden grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 min-h-[640px]">
-        
+    <div className="bg-slate-50/70 py-4 px-4 sm:px-6 lg:px-8 xl:px-10 max-w-[1440px] mx-auto w-full flex flex-col">
+      {errorMsg && (
+        <div className="mb-3 bg-rose-50 border border-rose-200 rounded-2xl p-3 text-xs font-medium text-rose-700 flex items-center justify-between gap-2 shrink-0">
+          <div className="flex items-center gap-2">
+            <AlertCircle size={16} className="text-rose-600 shrink-0" />
+            <span>{errorMsg}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setErrorMsg(null)}
+            className="text-rose-500 hover:text-rose-700 cursor-pointer"
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
+
+      <div className="md:h-[calc(100dvh-6.25rem)] md:min-h-[460px] md:max-h-[860px] bg-white rounded-3xl border border-slate-200/80 shadow-2xs overflow-hidden grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4">
         {/* Left: Conversation list */}
-        <div className="border-r border-slate-200/80 flex flex-col bg-slate-50/40">
-          <div className="p-4 sm:p-5 border-b border-slate-200/80 bg-white">
-            <h1 className="font-bold text-slate-900 text-base font-display">Academic Inquiries</h1>
-            <p className="text-xs text-slate-500 mt-0.5">Direct correspondence with faculty & applicants</p>
+        <div className="border-b md:border-b-0 md:border-r border-slate-200/80 flex flex-col max-h-60 md:max-h-none min-h-0 overflow-hidden bg-slate-50/40">
+          <div className="p-4 border-b border-slate-200/80 bg-white flex items-center justify-between gap-2 shrink-0">
+            <div className="min-w-0">
+              <h1 className="font-bold text-slate-900 text-base font-display truncate">Academic Inquiries</h1>
+              <p className="text-xs text-slate-500 mt-0.5 truncate">Direct correspondence with faculty & students</p>
+            </div>
+            <Button
+              size="sm"
+              onClick={handleOpenDirectoryModal}
+              className="text-xs flex items-center gap-1.5 shrink-0"
+              id="new-message-btn"
+            >
+              <Plus size={14} />
+              <span>New</span>
+            </Button>
           </div>
 
-          <div className="flex-1 overflow-y-auto divide-y divide-slate-100">
-            {conversations.map(c => {
-              const active = c.id === activeConvId
-              return (
-                <button
-                  key={c.id}
-                  onClick={() => {
-                    setActiveConvId(c.id)
-                    setConversations(prev => prev.map(item => item.id === c.id ? { ...item, unread: false } : item))
-                  }}
-                  className={`w-full p-4 text-left transition-colors flex items-start gap-3 cursor-pointer ${
-                    active ? 'bg-blue-50/80 border-l-4 border-blue-600' : 'hover:bg-slate-100/60'
-                  }`}
-                  id={`conv-item-${c.id}`}
+          <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain divide-y divide-slate-100">
+            {loadingConvs ? (
+              <div className="p-8 text-center space-y-2">
+                <div className="w-6 h-6 rounded-full border-2 border-blue-600 border-t-transparent animate-spin mx-auto" />
+                <p className="text-xs text-slate-500">Loading conversations…</p>
+              </div>
+            ) : conversations.length === 0 && !visibleDraftConv ? (
+              <div className="p-8 text-center space-y-3">
+                <MessageSquare size={28} className="mx-auto text-slate-300" />
+                <p className="text-xs font-semibold text-slate-600">No conversations yet</p>
+                <p className="text-[11px] text-slate-400">
+                  Start a conversation with any student or professor in the Scholivo directory.
+                </p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleOpenDirectoryModal}
+                  className="text-xs mt-1"
                 >
-                  <div className="relative shrink-0">
-                    <Avatar src={c.participantAvatar} name={c.participantName} size="md" />
-                    {c.unread && (
-                      <span className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 bg-blue-600 rounded-full border-2 border-white" />
-                    )}
+                  Start New Conversation
+                </Button>
+              </div>
+            ) : (
+              <>
+                {visibleDraftConv && (
+                  <div
+                    className={`w-full p-4 transition-colors flex items-start gap-3 ${
+                      effectiveActiveConvId === visibleDraftConv.id
+                        ? 'bg-blue-50/80 border-l-4 border-blue-600'
+                        : 'hover:bg-slate-100/60'
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setActiveConvId(visibleDraftConv.id)}
+                      className="flex-1 min-w-0 text-left flex items-start gap-3 cursor-pointer"
+                    >
+                      <Avatar
+                        src={visibleDraftConv.recipient.photoURL}
+                        name={visibleDraftConv.recipient.fullName}
+                        size="md"
+                      />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center justify-between gap-1">
+                          <h3 className="text-xs font-bold text-blue-900 truncate">
+                            {visibleDraftConv.recipient.fullName}
+                          </h3>
+                          <span className="text-[10px] font-semibold text-blue-600 bg-blue-100 px-1.5 py-0.5 rounded shrink-0">
+                            Draft
+                          </span>
+                        </div>
+                        <p className="text-[11px] font-medium text-blue-700 truncate mt-0.5">
+                          {visibleDraftConv.contextTitle}
+                        </p>
+                        <p className="text-xs text-slate-400 italic truncate mt-1">
+                          Write your first message…
+                        </p>
+                      </div>
+                    </button>
+                    <button
+                      type="button"
+                      title="Discard draft"
+                      aria-label="Discard draft conversation"
+                      onClick={() => {
+                        setDraftConv(null)
+                        if (activeConvId === visibleDraftConv.id) {
+                          setActiveConvId(conversations[0]?.id || '')
+                        }
+                        setErrorMsg(null)
+                      }}
+                      className="p-1 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-white/80 cursor-pointer shrink-0"
+                    >
+                      <X size={13} />
+                    </button>
                   </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center justify-between">
-                      <h3 className={`text-xs font-bold truncate ${active ? 'text-blue-900' : 'text-slate-900'}`}>{c.participantName}</h3>
-                      <span className="text-[10px] text-slate-400 shrink-0">{c.lastMessageAt}</span>
-                    </div>
-                    <p className="text-[11px] font-medium text-blue-700 truncate mt-0.5">{c.positionTitle}</p>
-                    <p className="text-xs text-slate-500 truncate mt-1">{c.lastMessage}</p>
-                  </div>
-                </button>
-              )
-            })}
+                )}
+
+                {conversations.map((c) => {
+                  const counterpart = resolveCounterpart(c, user?.uid)
+                  const active = c.id === effectiveActiveConvId
+                  const unread = isConversationUnread(c)
+                  return (
+                    <button
+                      type="button"
+                      key={c.id}
+                      onClick={() => {
+                        setActiveConvId(c.id)
+                        if (user && unread) markConversationAsRead(c.id, user.uid)
+                      }}
+                      className={`w-full p-4 text-left transition-colors flex items-start gap-3 cursor-pointer ${
+                        active ? 'bg-blue-50/80 border-l-4 border-blue-600' : 'hover:bg-slate-100/60'
+                      }`}
+                      id={`conv-item-${c.id}`}
+                    >
+                      <div className="relative shrink-0">
+                        <Avatar
+                          src={counterpart.photoURL}
+                          name={counterpart.fullName}
+                          size="md"
+                        />
+                        {unread && (
+                          <span className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 bg-blue-600 rounded-full border-2 border-white" />
+                        )}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center justify-between gap-1">
+                          <h3
+                            className={`text-xs font-bold truncate ${
+                              active ? 'text-blue-900' : 'text-slate-900'
+                            }`}
+                          >
+                            {counterpart.fullName}
+                          </h3>
+                          <span className="text-[10px] text-slate-400 shrink-0">
+                            {formatTimestamp(c.lastMessageAt)}
+                          </span>
+                        </div>
+                        <p className="text-[11px] font-medium text-blue-700 truncate mt-0.5">
+                          {c.contextTitle || counterpart.headline || 'Academic Inquiry'}
+                        </p>
+                        <p
+                          className={`text-xs truncate mt-1 ${
+                            unread ? 'font-semibold text-slate-800' : 'text-slate-500'
+                          }`}
+                        >
+                          {c.lastMessageSenderId === user?.uid ? `You: ${c.lastMessage}` : c.lastMessage}
+                        </p>
+                      </div>
+                    </button>
+                  )
+                })}
+              </>
+            )}
           </div>
         </div>
 
         {/* Right: Message history & input */}
-        <div className="md:col-span-2 lg:col-span-3 flex flex-col bg-white">
-          {activeConv ? (
+        <div className="md:col-span-2 lg:col-span-3 flex flex-col h-[62dvh] min-h-[380px] md:h-full md:min-h-0 overflow-hidden bg-white">
+          {activeCounterpart ? (
             <>
               {/* Active header */}
-              <div className="p-4 sm:p-5 border-b border-slate-200/80 flex items-center justify-between bg-white">
-                <div className="flex items-center gap-3">
-                  <Avatar src={activeConv.participantAvatar} name={activeConv.participantName} size="md" />
-                  <div>
-                    <h2 className="text-sm font-bold text-slate-900">{activeConv.participantName}</h2>
-                    <p className="text-xs text-slate-500">{activeConv.participantRole}</p>
+              <div className="px-4 py-3.5 sm:px-5 border-b border-slate-200/80 flex items-center justify-between gap-3 bg-white shrink-0">
+                <div className="flex items-center gap-3 min-w-0">
+                  <Avatar
+                    src={activeCounterpart.photoURL}
+                    name={activeCounterpart.fullName}
+                    size="md"
+                  />
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <h2 className="text-sm font-bold text-slate-900 truncate">
+                        {activeCounterpart.fullName}
+                      </h2>
+                      <span
+                        className={`px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase tracking-wider border shrink-0 ${
+                          activeCounterpart.role === 'professor'
+                            ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
+                            : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                        }`}
+                      >
+                        {activeCounterpart.role === 'professor' ? 'Professor' : 'Student'}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-500 truncate">
+                      {[activeCounterpart.headline, activeCounterpart.university]
+                        .filter(Boolean)
+                        .join(' • ') || 'Scholivo Researcher'}
+                    </p>
                   </div>
                 </div>
 
-                <span className="px-3 py-1 rounded-full text-xs font-semibold bg-blue-50 text-blue-700 border border-blue-200">
-                  {activeConv.positionTitle}
+                <span
+                  title={activeContextTitle}
+                  className="hidden sm:inline-block px-3 py-1 rounded-full text-xs font-semibold bg-blue-50 text-blue-700 border border-blue-200 max-w-[240px] truncate shrink-0"
+                >
+                  {activeContextTitle}
                 </span>
               </div>
 
               {/* Message flow */}
-              <div className="flex-1 p-6 overflow-y-auto space-y-4 bg-slate-50/30">
-                {activeConv.messages.map(m => {
-                  const isMe = (role === 'student' && m.senderId === 'student') || (role === 'professor' && m.senderId === 'prof')
-                  return (
-                    <div
-                      key={m.id}
-                      className={`flex flex-col ${isMe ? 'items-end' : 'items-start'}`}
-                    >
+              <div
+                ref={messagesContainerRef}
+                onScroll={handleMessagesScroll}
+                className="flex-1 min-h-0 p-4 sm:p-5 overflow-y-auto overscroll-contain space-y-4 bg-slate-50/30"
+              >
+                {isMessagesLoading ? (
+                  <div className="py-12 text-center space-y-2">
+                    <div className="w-6 h-6 rounded-full border-2 border-blue-600 border-t-transparent animate-spin mx-auto" />
+                    <p className="text-xs text-slate-500">Loading message history…</p>
+                  </div>
+                ) : messagesError ? (
+                  <div className="py-8 px-4 max-w-md mx-auto bg-rose-50 border border-rose-200 rounded-2xl text-center space-y-1.5">
+                    <AlertCircle size={20} className="text-rose-600 mx-auto" />
+                    <p className="text-xs font-semibold text-rose-800">Could Not Load Messages</p>
+                    <p className="text-[11px] text-rose-700">{messagesError}</p>
+                  </div>
+                ) : displayedMessages.length === 0 ? (
+                  <div className="py-12 text-center space-y-1.5">
+                    <p className="text-xs font-semibold text-slate-600">
+                      Start your conversation with {activeCounterpart.fullName}
+                    </p>
+                    <p className="text-[11px] text-slate-400">
+                      Messages are private to the two participants in this thread.
+                    </p>
+                  </div>
+                ) : (
+                  displayedMessages.map((m) => {
+                    const isMe = m.senderId === user?.uid
+                    return (
                       <div
-                        className={`max-w-md p-3.5 rounded-2xl text-xs sm:text-sm leading-relaxed shadow-2xs ${
-                          isMe
-                            ? 'bg-blue-600 text-white rounded-br-none'
-                            : 'bg-white text-slate-800 rounded-bl-none border border-slate-200/80'
-                        }`}
+                        key={m.id}
+                        className={`flex flex-col ${isMe ? 'items-end' : 'items-start'}`}
                       >
-                        {m.content}
+                        <div
+                          className={`max-w-md p-3.5 rounded-2xl text-xs sm:text-sm leading-relaxed shadow-2xs whitespace-pre-wrap break-words ${
+                            isMe
+                              ? 'bg-blue-600 text-white rounded-br-none'
+                              : 'bg-white text-slate-800 rounded-bl-none border border-slate-200/80'
+                          }`}
+                        >
+                          {m.content}
+                        </div>
+                        <span className="text-[10px] text-slate-400 mt-1 px-1 flex items-center gap-1">
+                          {formatTimestamp(m.createdAt)}
+                          {isMe && <CheckCheck size={12} className="text-blue-500" />}
+                        </span>
                       </div>
-                      <span className="text-[10px] text-slate-400 mt-1 px-1 flex items-center gap-1">
-                        {m.sentAt}
-                        {isMe && <CheckCheck size={12} className="text-blue-500" />}
-                      </span>
-                    </div>
-                  )
-                })}
-              </div>
-
-              {/* Quick suggestions */}
-              <div className="px-4 py-2.5 border-t border-slate-200/60 bg-slate-50/60 flex items-center gap-2 overflow-x-auto text-xs text-slate-500">
-                <span className="text-[11px] font-semibold text-slate-400 shrink-0">Quick reply:</span>
-                <button
-                  type="button"
-                  onClick={() => setInputMessage('Yes, that time works perfectly for me. Looking forward to speaking with you!')}
-                  className="px-3 py-1 rounded-full bg-white hover:bg-slate-200/70 border border-slate-200 text-slate-700 shrink-0 transition-colors cursor-pointer text-xs"
-                >
-                  Yes, that time works for me &rarr;
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setInputMessage('Could you provide the Zoom / Google Meet link?')}
-                  className="px-3 py-1 rounded-full bg-white hover:bg-slate-200/70 border border-slate-200 text-slate-700 shrink-0 transition-colors cursor-pointer text-xs"
-                >
-                  Request meeting link &rarr;
-                </button>
+                    )
+                  })
+                )}
               </div>
 
               {/* Input bar */}
-              <form onSubmit={handleSendMessage} className="p-4 border-t border-slate-200/80 bg-white flex items-center gap-3">
+              <form
+                onSubmit={handleSendMessage}
+                className="p-3.5 sm:p-4 border-t border-slate-200/80 bg-white flex items-center gap-3 shrink-0"
+              >
                 <input
                   type="text"
-                  placeholder="Type your message..."
+                  placeholder={`Message ${activeCounterpart.fullName}…`}
                   value={inputMessage}
-                  onChange={e => setInputMessage(e.target.value)}
+                  onChange={(e) => setInputMessage(e.target.value)}
+                  maxLength={4000}
                   className="flex-1 rounded-xl border border-slate-200 px-4 py-2.5 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-600/30 focus:border-blue-600"
                   id="message-input-field"
                 />
                 <Button
                   type="submit"
                   size="md"
-                  disabled={!inputMessage.trim()}
+                  loading={sending}
+                  disabled={!inputMessage.trim() || sending}
                   className="text-xs bg-blue-600 hover:bg-blue-700 text-white"
                   id="send-message-btn"
                 >
@@ -365,13 +870,180 @@ export default function Messages() {
                 </Button>
               </form>
             </>
+          ) : loadingConvs ? (
+            <div className="flex-1 flex flex-col items-center justify-center p-10 text-center space-y-2">
+              <div className="w-7 h-7 rounded-full border-2 border-blue-600 border-t-transparent animate-spin" />
+              <p className="text-xs text-slate-500 font-medium">Loading conversations…</p>
+            </div>
           ) : (
-            <div className="flex-1 flex items-center justify-center text-slate-400 text-sm">
-              Select a conversation to begin
+            <div className="flex-1 flex flex-col items-center justify-center p-8 text-center space-y-3">
+              <div className="w-14 h-14 rounded-2xl bg-slate-50 border border-slate-200 flex items-center justify-center text-slate-400">
+                <MessageSquare size={26} />
+              </div>
+              <h2 className="text-base font-bold text-slate-800 font-display">
+                No Active Conversation Selected
+              </h2>
+              <p className="text-xs text-slate-500 max-w-sm">
+                Connect directly with professors or fellow students across the Scholivo research community.
+              </p>
+              <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+                <Button
+                  size="sm"
+                  onClick={handleOpenDirectoryModal}
+                  className="text-xs flex items-center gap-1.5"
+                >
+                  <Plus size={14} />
+                  <span>New Message</span>
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => navigate(role === 'professor' ? '/dashboard/professor' : '/search')}
+                  className="text-xs"
+                >
+                  {role === 'professor' ? 'Back to Dashboard' : 'Explore Faculty Directory'}
+                </Button>
+              </div>
             </div>
           )}
         </div>
       </div>
+
+      {/* User Directory Modal for Starting 1-to-1 Conversations */}
+      {showDirectoryModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl border border-slate-200 shadow-2xl w-full max-w-xl overflow-hidden flex flex-col max-h-[82vh]">
+            <div className="p-5 border-b border-slate-100 flex items-center justify-between">
+              <div>
+                <h2 className="text-base font-bold font-display text-slate-900">
+                  New Academic Conversation
+                </h2>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Message any registered student or professor on Scholivo
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowDirectoryModal(false)}
+                className="p-2 rounded-xl text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer"
+                aria-label="Close modal"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="p-4 border-b border-slate-100 bg-slate-50/50 space-y-3">
+              <div className="relative">
+                <Search
+                  size={15}
+                  className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400"
+                />
+                <input
+                  type="text"
+                  value={directorySearch}
+                  onChange={(e) => setDirectorySearch(e.target.value)}
+                  placeholder="Search by name, university, department, or research area…"
+                  className="w-full pl-9 pr-4 py-2 rounded-xl border border-slate-200 bg-white text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600"
+                  id="directory-search-input"
+                />
+              </div>
+
+              <div className="flex items-center gap-1.5">
+                {(['all', 'professor', 'student'] as const).map((tab) => (
+                  <button
+                    key={tab}
+                    type="button"
+                    onClick={() => setDirectoryRoleFilter(tab)}
+                    className={`px-3 py-1 rounded-full text-xs font-semibold transition-colors cursor-pointer ${
+                      directoryRoleFilter === tab
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-100'
+                    }`}
+                  >
+                    {tab === 'all'
+                      ? 'All Members'
+                      : tab === 'professor'
+                      ? 'Professors'
+                      : 'Students'}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto divide-y divide-slate-100 p-2">
+              {loadingDirectory ? (
+                <div className="py-12 text-center space-y-2">
+                  <div className="w-6 h-6 rounded-full border-2 border-blue-600 border-t-transparent animate-spin mx-auto" />
+                  <p className="text-xs text-slate-500">Loading researcher directory…</p>
+                </div>
+              ) : filteredDirectoryUsers.length === 0 ? (
+                <div className="py-12 text-center space-y-1">
+                  <p className="text-xs font-semibold text-slate-600">No matching members found</p>
+                  <p className="text-[11px] text-slate-400">
+                    Try adjusting your search keywords or role filter.
+                  </p>
+                </div>
+              ) : (
+                filteredDirectoryUsers.map((entry) => (
+                  <button
+                    key={entry.uid}
+                    type="button"
+                    onClick={() => handleSelectDirectoryUser(entry)}
+                    className="w-full p-3 rounded-2xl hover:bg-blue-50/60 transition-colors flex items-center justify-between gap-3 text-left cursor-pointer"
+                    id={`directory-user-${entry.uid}`}
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      <Avatar src={entry.photoURL} name={entry.fullName} size="md" />
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-bold text-slate-900 truncate">
+                            {entry.fullName}
+                          </span>
+                          <span
+                            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold border ${
+                              entry.role === 'professor'
+                                ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
+                                : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                            }`}
+                          >
+                            {entry.role === 'professor' ? (
+                              <GraduationCap size={10} />
+                            ) : (
+                              <UserIcon size={10} />
+                            )}
+                            {entry.role === 'professor' ? 'Professor' : 'Student'}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-600 truncate mt-0.5">
+                          {[entry.headline, entry.university, entry.department]
+                            .filter(Boolean)
+                            .join(' • ') || 'Scholivo Member'}
+                        </p>
+                        {entry.researchAreas.length > 0 && (
+                          <div className="flex flex-wrap gap-1 mt-1">
+                            {entry.researchAreas.slice(0, 3).map((area) => (
+                              <span
+                                key={area}
+                                className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 text-[10px] font-medium"
+                              >
+                                {area}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    <span className="text-xs font-semibold text-blue-600 shrink-0 px-2.5 py-1 rounded-xl bg-blue-50 border border-blue-200">
+                      Message
+                    </span>
+                  </button>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

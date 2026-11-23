@@ -1,5 +1,5 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
-import { Agentation } from 'agentation';
+import { Agentation } from 'agentation'
 import { AuthProvider } from '@/context/AuthContext'
 import { Navbar } from '@/components/common/Navbar'
 import { Footer } from '@/components/common/Footer'
@@ -8,6 +8,7 @@ import { ProtectedRoute } from '@/components/auth/ProtectedRoute'
 // Public Pages
 import Landing from '@/pages/Landing'
 import Login from '@/pages/auth/Login'
+import SignupRoleSelect from '@/pages/auth/SignupRoleSelect'
 import StudentSignup from '@/pages/auth/StudentSignup'
 import ProfessorSignup from '@/pages/auth/ProfessorSignup'
 import Search from '@/pages/search/Search'
@@ -24,7 +25,6 @@ import ApplicationDetail from '@/pages/application/ApplicationDetail'
 import ProfessorDashboard from '@/pages/professor/ProfessorDashboard'
 import ManagePositions from '@/pages/professor/ManagePositions'
 import ProfessorProfileEdit from '@/pages/professor/ProfessorProfileEdit'
-import AdminDashboard from '@/pages/admin/AdminDashboard'
 import Messages from '@/pages/messaging/Messages'
 
 export default function App() {
@@ -33,12 +33,13 @@ export default function App() {
       <AuthProvider>
         <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col font-sans selection:bg-blue-500/20 selection:text-blue-900">
           <Navbar />
-          
+
           <main className="flex-1">
             <Routes>
               {/* Public Routes */}
               <Route path="/" element={<Landing />} />
               <Route path="/login" element={<Login />} />
+              <Route path="/signup" element={<SignupRoleSelect />} />
               <Route path="/signup/student" element={<StudentSignup />} />
               <Route path="/signup/professor" element={<ProfessorSignup />} />
               <Route path="/search" element={<Search />} />
@@ -61,14 +62,9 @@ export default function App() {
               </Route>
 
               {/* Shared Protected Routes (both student & professor) */}
-              <Route element={<ProtectedRoute allowedRoles={['student', 'professor', 'admin']} />}>
+              <Route element={<ProtectedRoute allowedRoles={['student', 'professor']} />}>
                 <Route path="/applications/:applicationId" element={<ApplicationDetail />} />
                 <Route path="/messages" element={<Messages />} />
-              </Route>
-
-              {/* Admin Routes */}
-              <Route element={<ProtectedRoute allowedRoles={['admin']} />}>
-                <Route path="/admin" element={<AdminDashboard />} />
               </Route>
 
               {/* 404 Route */}

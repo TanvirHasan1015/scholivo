@@ -40,7 +40,7 @@ export interface LanguageScore {
 
 // ── User (Shared) ─────────────────────────────────────────────────────────────
 
-export type UserRole = 'student' | 'professor' | 'admin'
+export type UserRole = 'student' | 'professor'
 
 export interface BaseUser {
   uid: string
@@ -100,13 +100,6 @@ export interface StudentProfile {
   // Saved / Bookmarked Professors
   savedProfessorIds?: string[]
 
-  // Affiliation Verification & Account
-  verificationStatus?: AffiliationVerificationStatus
-  accountStatus?: AccountStatus
-  verificationNotes?: string
-  verificationDocUrl?: string
-  verificationRequestedAt?: string
-
   // Meta
   profileCompleteness: number
   bio?: string
@@ -114,36 +107,33 @@ export interface StudentProfile {
   updatedAt: string
 }
 
-// ── Verification & Account Status ──────────────────────────────────────────────
+// ── Professor ─────────────────────────────────────────────────────────────────
 
-export type AffiliationVerificationStatus =
-  | 'unverified'
-  | 'pending'
-  | 'verified'
-  | 'rejected'
-  | 'more_info_required'
-
-export type AccountStatus = 'active' | 'suspended' | 'banned'
-
-export type VerificationStatus = AffiliationVerificationStatus | 'unsubmitted'
 export type RecruitingStatus = 'actively_recruiting' | 'sometimes' | 'not_recruiting'
 
-export interface VerificationAuditLog {
-  id: string
-  userId: string
-  userName: string
-  userRole: UserRole
-  decision: AffiliationVerificationStatus
-  note?: string
-  reviewer: string
-  reviewedAt: string
-}
+export type ProfessorFundingSourceType =
+  | 'government'
+  | 'university'
+  | 'industry'
+  | 'national_international_grants'
+  | 'self_funded'
+  | 'other'
 
-export interface VerificationDoc {
-  type: 'faculty_id' | 'institutional_proof' | 'student_id' | 'enrollment_cert' | 'other'
-  url: string
-  uploadedAt: string
-  fileName: string
+export type ProfessorFundingAvailabilityStatus =
+  | 'currently_funded'
+  | 'funding_available_for_new_students'
+  | 'funding_available_for_selected_positions'
+  | 'seeking_additional_funding'
+  | 'no_current_funding'
+
+export interface ProfessorFundingInfo {
+  fundingTypes: ProfessorFundingSourceType[]
+  otherFundingTypeExplanation?: string
+  fundingStatus?: ProfessorFundingAvailabilityStatus | ''
+  description?: string
+  supportedStudentsCount?: number | null
+  eligibilityRequirements?: string
+  additionalNotes?: string
 }
 
 export interface ResearchProject {
@@ -167,7 +157,8 @@ export interface ProfessorProfile {
   uid: string
   fullName: string
   username: string
-  email: string
+  email?: string
+  isPublicProfile?: boolean
   academicTitle: string
   country: string
   photoURL?: string
@@ -196,16 +187,10 @@ export interface ProfessorProfile {
   labWebsiteUrl?: string
   labMembers?: LabMember[]
 
-  // Verification & Status
-  verificationStatus: VerificationStatus
-  verificationDocuments: VerificationDoc[]
-  verifiedAt?: string
-  verificationNotes?: string
-  accountStatus?: AccountStatus
-
-  // Recruiting
+  // Recruiting & Funding Availability
   isRecruiting: boolean
   recruitingStatus: RecruitingStatus
+  fundingInfo?: ProfessorFundingInfo
 
   // Meta
   createdAt: string

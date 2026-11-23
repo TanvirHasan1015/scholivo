@@ -1,11 +1,19 @@
 import { useState, useEffect } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
-import { collection, doc, getDoc, getDocs, query, where, limit } from 'firebase/firestore'
+import { collection, getDocs, query, where } from 'firebase/firestore'
 import { 
   Search, MapPin, GraduationCap, X, SlidersHorizontal, 
-  Sparkles, ArrowUpRight
+  Sparkles, ArrowUpRight, AlertCircle, DollarSign
 } from 'lucide-react'
 import { db } from '@/lib/firebase'
+import { fetchPublicProfessorsSafely, loadSplitStudentProfile } from '@/lib/messaging'
+import {
+  PROFESSOR_FUNDING_STATUS_LABELS,
+  PROFESSOR_FUNDING_STATUS_OPTIONS,
+  PROFESSOR_FUNDING_TYPE_LABELS,
+  getFundingStatusBadgeStyle,
+  normalizeProfessorFundingInfo,
+} from '@/lib/professorFunding'
 import { useAuth } from '@/context/AuthContext'
 import type { ProfessorProfile, StudentProfile } from '@/types/user.types'
 import type { Position } from '@/types/position.types'
@@ -14,11 +22,12 @@ import { computeMatch } from '@/lib/matching'
 type ProfessorWithPositions = ProfessorProfile & {
   positions: Position[]
   matchScore?: number
+  positionsError?: 'permission_denied' | 'network_error' | null
 }
 import { Avatar } from '@/components/common/Avatar'
 import { Button } from '@/components/common/Button'
 import { MatchChip } from '@/components/matching/MatchScore'
-import { VerificationBadge, RecruitingBadge } from '@/components/common/Badges'
+import { RecruitingBadge } from '@/components/common/Badges'
 import { RESEARCH_AREAS, COUNTRIES, FUNDING_LABELS, cn } from '@/utils/helpers'
 
 const DEGREE_FILTER_OPTIONS = ['Master', 'PhD', 'Research_Assistant', 'PostDoc']
@@ -33,6 +42,7 @@ export default function SearchPage() {
   const [professors, setProfessors] = useState<ProfessorWithPositions[]>([])
   const [studentProfile, setStudentProfile] = useState<StudentProfile | null>(null)
   const [loading, setLoading] = useState(true)
+  const [searchError, setSearchError] = useState<'permission_denied' | 'network_error' | null>(null)
   const [showFilters, setShowFilters] = useState(false)
 
   // Keep search query synced with URL searchParams
@@ -60,10 +70,10 @@ export default function SearchPage() {
         return
       }
       try {
-        const snap = await getDoc(doc(db, 'students', user.uid))
+        const loaded = await loadSplitStudentProfile(user.uid)
         if (!isMounted) return
-        if (snap.exists()) {
-          const data = snap.data() as StudentProfile
+        if (loaded.exists) {
+          const data = loaded.data as StudentProfile
           setStudentProfile({
             ...data,
             uid: data.uid || user.uid,
@@ -92,55 +102,85 @@ export default function SearchPage() {
     }
   }, [user, role])
 
-  // Load verified professors and their open positions from Firestore
+  // Load professors and their open positions from Firestore
   useEffect(() => {
     let isMounted = true
 
     const load = async () => {
-      try {
-        const snap = await getDocs(
-          query(collection(db, 'professors'), where('verificationStatus', '==', 'verified'), limit(50))
-        )
+      let hasPermissionDenied = false
+      let hasNetworkError = false
 
+      try {
+        const profList = await fetchPublicProfessorsSafely(100)
+
+        const seenUids = new Set<string>()
         const results: ProfessorWithPositions[] = []
 
-        for (const docSnap of snap.docs) {
-          const prof = docSnap.data() as ProfessorProfile
-          const profUid = prof.uid || docSnap.id
+        for (const prof of profList) {
+          const profUid = prof.uid
+          if (!profUid || seenUids.has(profUid)) continue
+          seenUids.add(profUid)
 
-          const posSnap = await getDocs(
-            query(collection(db, 'positions'), where('professorId', '==', profUid), where('isOpen', '==', true))
-          )
-          const positions = posSnap.docs.map((d) => {
-            const p = d.data() as Position
-            return {
-              ...p,
-              id: d.id,
-              researchTopics: Array.isArray(p.researchTopics) ? p.researchTopics : [],
-              requiredSkills: Array.isArray(p.requiredSkills) ? p.requiredSkills : [],
-              preferredSkills: Array.isArray(p.preferredSkills) ? p.preferredSkills : [],
+          let positions: Position[] = []
+          let posError: 'permission_denied' | 'network_error' | null = null
+
+          try {
+            const posSnap = await getDocs(
+              query(collection(db, 'positions'), where('professorId', '==', profUid), where('isOpen', '==', true))
+            )
+            positions = posSnap.docs.map((d) => {
+              const p = d.data() as Position
+              return {
+                ...p,
+                id: d.id,
+                researchTopics: Array.isArray(p.researchTopics) ? p.researchTopics : [],
+                requiredSkills: Array.isArray(p.requiredSkills) ? p.requiredSkills : [],
+                preferredSkills: Array.isArray(p.preferredSkills) ? p.preferredSkills : [],
+              }
+            })
+          } catch (posErr: unknown) {
+            console.error('Failed to query positions for professor:', profUid, posErr)
+            const errObj = posErr as { code?: string; message?: string } | null
+            const msg = `${errObj?.code || ''} ${errObj?.message || ''}`.toLowerCase()
+            if (msg.includes('permission-denied') || msg.includes('permission_denied') || msg.includes('missing or insufficient permissions')) {
+              posError = 'permission_denied'
+              hasPermissionDenied = true
+            } else {
+              posError = 'network_error'
+              hasNetworkError = true
             }
-          })
+            positions = []
+          }
 
           results.push({
             ...prof,
             uid: profUid,
             researchAreas: Array.isArray(prof.researchAreas) ? prof.researchAreas : [],
             researchInterests: Array.isArray(prof.researchInterests) ? prof.researchInterests : [],
+            fundingInfo: normalizeProfessorFundingInfo(prof.fundingInfo),
             positions,
+            positionsError: posError,
           })
         }
 
         if (isMounted) {
           setProfessors(results)
         }
-      } catch (err) {
+      } catch (err: unknown) {
         console.error('Failed to load professors from Firestore:', err)
+        const errObj = err as { code?: string; message?: string } | null
+        const msg = `${errObj?.code || ''} ${errObj?.message || ''}`.toLowerCase()
+        if (msg.includes('permission-denied') || msg.includes('permission_denied') || msg.includes('missing or insufficient permissions')) {
+          hasPermissionDenied = true
+        } else {
+          hasNetworkError = true
+        }
         if (isMounted) {
           setProfessors([])
         }
       } finally {
         if (isMounted) {
+          setSearchError(hasPermissionDenied ? 'permission_denied' : hasNetworkError ? 'network_error' : null)
           setLoading(false)
         }
       }
@@ -161,6 +201,17 @@ export default function SearchPage() {
     return { ...prof, matchScore: bestScore }
   })
 
+  // Dynamic research area filter options combining preset RESEARCH_AREAS and any custom areas in Firestore
+  const availableResearchAreas = Array.from(
+    new Set([
+      ...RESEARCH_AREAS,
+      ...professors.flatMap((prof) => [
+        ...prof.researchAreas,
+        ...prof.positions.map((p) => p.researchArea),
+      ]),
+    ].filter((a): a is string => typeof a === 'string' && a.trim().length > 0))
+  )
+
   // Normalize terms to handle case and en-dash/hyphen differences
   const normalize = (val: string) =>
     val
@@ -173,25 +224,65 @@ export default function SearchPage() {
   const filtered = professorsWithScores.filter((prof) => {
     const qNorm = normalize(q)
     const matchesQ =
-      !q ||
+      !qNorm ||
       [
         prof.fullName,
+        prof.username,
+        prof.academicTitle,
         prof.university,
         prof.department,
+        prof.faculty,
+        prof.labName,
+        prof.biography,
         ...prof.researchAreas,
         ...prof.researchInterests,
-        ...prof.positions.flatMap((p) => [p.title, p.researchArea, ...p.researchTopics]),
-      ].some((val) => val && normalize(val).includes(qNorm))
+        ...(prof.fundingInfo?.fundingTypes || []).map((t) => PROFESSOR_FUNDING_TYPE_LABELS[t] || t),
+        prof.fundingInfo?.otherFundingTypeExplanation,
+        prof.fundingInfo?.description,
+        ...prof.positions.flatMap((p) => [
+          p.title,
+          p.description,
+          p.researchArea,
+          ...(p.researchTopics || []),
+          ...(p.requiredSkills || []),
+          ...(p.preferredSkills || []),
+        ]),
+      ].some((val) => typeof val === 'string' && val && normalize(val).includes(qNorm))
 
+    const filterAreaNorm = normalize(filters.researchArea)
     const matchesArea =
-      !filters.researchArea ||
-      prof.researchAreas.some((a) => normalize(a) === normalize(filters.researchArea))
+      !filterAreaNorm ||
+      prof.researchAreas.some((a) => normalize(a) === filterAreaNorm || normalize(a).includes(filterAreaNorm)) ||
+      prof.researchInterests.some((a) => normalize(a) === filterAreaNorm || normalize(a).includes(filterAreaNorm)) ||
+      prof.positions.some(
+        (p) =>
+          (p.researchArea &&
+            (normalize(p.researchArea) === filterAreaNorm ||
+              normalize(p.researchArea).includes(filterAreaNorm))) ||
+          (p.researchTopics || []).some(
+            (t) => normalize(t) === filterAreaNorm || normalize(t).includes(filterAreaNorm)
+          )
+      )
     const matchesCountry = !filters.country || prof.country === filters.country
     const matchesUni =
       !filters.university || normalize(prof.university).includes(normalize(filters.university))
     const matchesRecruiting = !filters.recruiting || prof.isRecruiting
     const matchesDegree = !filters.degree || prof.positions.some((p) => p.degreeType === filters.degree)
-    const matchesFunding = !filters.funding || prof.positions.some((p) => p.fundingType === filters.funding)
+    const profStatus = prof.fundingInfo?.fundingStatus || ''
+    const matchesFunding =
+      !filters.funding ||
+      (filters.funding === 'prof_any_available'
+        ? [
+            'currently_funded',
+            'funding_available_for_new_students',
+            'funding_available_for_selected_positions',
+          ].includes(profStatus) ||
+          prof.positions.some((p) =>
+            ['fully_funded', 'partially_funded', 'scholarship'].includes(p.fundingType)
+          )
+        : PROFESSOR_FUNDING_STATUS_OPTIONS.some((o) => o.id === filters.funding)
+        ? profStatus === filters.funding
+        : prof.positions.some((p) => p.fundingType === filters.funding))
 
     return (
       matchesQ &&
@@ -203,8 +294,10 @@ export default function SearchPage() {
       matchesFunding
     )
   }).sort((a, b) => {
-    if (a.matchScore && b.matchScore) return b.matchScore - a.matchScore
-    return 0
+    const scoreA = a.matchScore ?? -1
+    const scoreB = b.matchScore ?? -1
+    if (scoreA !== scoreB) return scoreB - scoreA
+    return b.positions.length - a.positions.length
   })
 
   const handleSearch = (e: React.FormEvent) => {
@@ -224,13 +317,13 @@ export default function SearchPage() {
             <div>
               <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-blue-50 border border-blue-200 text-blue-700 text-xs font-semibold mb-2">
                 <Sparkles size={13} className="text-blue-600" />
-                <span>Verified Faculty Directory</span>
+                <span>Faculty Directory</span>
               </div>
               <h1 className="font-display text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight">
                 Find Research Labs & Professors
               </h1>
               <p className="text-slate-500 text-sm mt-1">
-                Search verified faculty by research field, institution, and funded graduate openings
+                Search faculty by research field, institution, and funded graduate openings
               </p>
             </div>
           </div>
@@ -302,7 +395,7 @@ export default function SearchPage() {
                     id="filter-area"
                   >
                     <option value="">All Research Areas</option>
-                    {RESEARCH_AREAS.map((a) => (
+                    {availableResearchAreas.map((a) => (
                       <option key={a} value={a}>{a}</option>
                     ))}
                   </select>
@@ -353,9 +446,19 @@ export default function SearchPage() {
                     id="filter-funding"
                   >
                     <option value="">Any Funding</option>
-                    {FUNDING_FILTER_OPTIONS.map((f) => (
-                      <option key={f} value={f}>{FUNDING_LABELS[f]}</option>
-                    ))}
+                    <option value="prof_any_available">Funding Available (Faculty or Positions)</option>
+                    <optgroup label="Faculty Funding Availability">
+                      {PROFESSOR_FUNDING_STATUS_OPTIONS.map((opt) => (
+                        <option key={opt.id} value={opt.id}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                    <optgroup label="Position Funding Package">
+                      {FUNDING_FILTER_OPTIONS.map((f) => (
+                        <option key={f} value={f}>{FUNDING_LABELS[f]}</option>
+                      ))}
+                    </optgroup>
                   </select>
                 </div>
 
@@ -428,6 +531,30 @@ export default function SearchPage() {
             </p>
           )}
         </div>
+
+        {/* Informational Alerts for Permission or Network Issues */}
+        {!loading && searchError === 'permission_denied' && (
+          <div className="p-4 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+            <div>
+              <h4 className="text-sm font-bold">Access Restricted</h4>
+              <p className="text-xs text-amber-800 mt-0.5">
+                Some directory records or positions could not be loaded due to Firestore security permissions.
+              </p>
+            </div>
+          </div>
+        )}
+        {!loading && searchError === 'network_error' && (
+          <div className="p-4 rounded-2xl bg-red-50 border border-red-200 text-red-900 flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
+            <div>
+              <h4 className="text-sm font-bold">Network Error</h4>
+              <p className="text-xs text-red-800 mt-0.5">
+                A network or connection issue occurred while querying the faculty directory.
+              </p>
+            </div>
+          </div>
+        )}
 
         {/* Results Grid */}
         {loading ? (
@@ -526,30 +653,46 @@ function ProfessorCard({
           )}
         </div>
 
-        {/* Verification & Recruiting Badges */}
+        {/* Recruiting & Funding Badges */}
         <div className="flex flex-wrap items-center gap-1.5 mb-3.5">
-          {professor.verificationStatus === 'verified' && (
-            <VerificationBadge status="verified" />
-          )}
           <RecruitingBadge status={professor.recruitingStatus} />
+          {professor.fundingInfo?.fundingStatus && (
+            <span
+              className={cn(
+                'inline-flex items-center gap-1 text-[11px] font-semibold px-2.5 py-0.5 rounded-full border',
+                getFundingStatusBadgeStyle(professor.fundingInfo.fundingStatus)
+              )}
+              id={`prof-card-funding-${professor.uid}`}
+            >
+              <DollarSign size={11} />
+              <span>{PROFESSOR_FUNDING_STATUS_LABELS[professor.fundingInfo.fundingStatus]}</span>
+            </span>
+          )}
         </div>
 
-        {/* Research Area Tags */}
-        <div className="flex flex-wrap gap-1.5 mb-5">
-          {professor.researchAreas.slice(0, 3).map((area) => (
-            <span
-              key={area}
-              className="text-xs font-medium px-2.5 py-1 rounded-lg bg-slate-50 border border-slate-200/80 text-slate-700"
-            >
-              {area}
-            </span>
-          ))}
-          {professor.researchAreas.length > 3 && (
-            <span className="text-xs font-semibold px-2 py-1 rounded-lg bg-slate-100 text-slate-500">
-              +{professor.researchAreas.length - 3}
-            </span>
-          )}
-        </div>
+        {/* Research Area & Topic Tags */}
+        {(() => {
+          const allTopics = Array.from(
+            new Set([...professor.researchAreas, ...professor.researchInterests].filter(Boolean))
+          )
+          return (
+            <div className="flex flex-wrap gap-1.5 mb-5">
+              {allTopics.slice(0, 3).map((area) => (
+                <span
+                  key={area}
+                  className="text-xs font-medium px-2.5 py-1 rounded-lg bg-slate-50 border border-slate-200/80 text-slate-700"
+                >
+                  {area}
+                </span>
+              ))}
+              {allTopics.length > 3 && (
+                <span className="text-xs font-semibold px-2 py-1 rounded-lg bg-slate-100 text-slate-500">
+                  +{allTopics.length - 3}
+                </span>
+              )}
+            </div>
+          )
+        })()}
       </div>
 
       {/* Positions Footer */}
@@ -573,6 +716,10 @@ function ProfessorCard({
               ))}
             </div>
           </div>
+        ) : professor.positionsError === 'permission_denied' ? (
+          <span className="text-xs text-amber-600 font-medium">Positions restricted</span>
+        ) : professor.positionsError === 'network_error' ? (
+          <span className="text-xs text-rose-500 font-medium">Positions unavailable</span>
         ) : (
           <span className="text-xs text-slate-400 italic">No current open positions</span>
         )}

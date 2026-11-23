@@ -275,7 +275,6 @@ body {
 /* Status badges */
 .status-submitted { color: #475569; background-color: #f1f5f9; border: 1px solid #e2e8f0; }
 .status-review { color: #b45309; background-color: #fffbeb; border: 1px solid #fde68a; }
-.status-shortlisted { color: #1d4ed8; background-color: #eff6ff; border: 1px solid #bfdbfe; }
 .status-interview { color: #6d28d9; background-color: #f5f3ff; border: 1px solid #ddd6fe; }
 .status-accepted { color: #047857; background-color: #ecfdf5; border: 1px solid #a7f3d0; }
 .status-rejected { color: #b91c1c; background-color: #fef2f2; border: 1px solid #fecaca; }

@@ -1,64 +1,52 @@
-import type { FirebaseError } from 'firebase/app'
 import {
   createUserWithEmailAndPassword,
-  fetchSignInMethodsForEmail,
-  GoogleAuthProvider,
-  linkWithCredential,
   onAuthStateChanged,
-  sendEmailVerification,
   signInWithEmailAndPassword,
-  signInWithPopup,
   signOut,
   updateProfile,
-  type AuthCredential,
   type User,
 } from 'firebase/auth'
 import { doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore'
-import { createContext, useContext, useEffect, useState, type ReactNode } from 'react'
-import { auth, db, googleProvider } from '@/lib/firebase'
-import type { UserRole } from '@/types/user.types'
-
-export type ExistingAccountStatus =
-  | 'new_user'
-  | 'incomplete_onboarding'
-  | 'existing_complete'
-  | 'inconsistent'
-
-export interface AccountInspectionResult {
-  status: ExistingAccountStatus
-  role: UserRole | null
-  hasUserDoc: boolean
-  hasStudentProfile: boolean
-  hasProfessorProfile: boolean
-  inconsistencyReason?: string
-}
-
-export interface GoogleSignInResult {
-  user: User
-  role: UserRole | null
-  accountStatus: Exclude<ExistingAccountStatus, 'inconsistent'>
-  isNewUser: boolean
-}
-
-export interface PendingGoogleLinkInfo {
-  email: string | null
-  existingMethods: string[]
-}
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
+import { auth, db } from '@/lib/firebase'
+import {
+  buildDirectoryEntryFromProfessor,
+  buildDirectoryEntryFromStudent,
+  loadSplitStudentProfile,
+  stripLegacyProfessorEmailIfPresent,
+  syncUserDirectoryEntry,
+} from '@/lib/messaging'
+import type { ProfessorProfile, UserRole } from '@/types/user.types'
 
 interface AuthContextValue {
   user: User | null
   role: UserRole | null
   loading: boolean
-  pendingGoogleLink: PendingGoogleLinkInfo | null
+  sessionError: string | null
+  retrySession: () => Promise<void>
   signIn: (email: string, password: string) => Promise<UserRole | null>
-  signUp: (email: string, password: string, displayName: string, role: UserRole) => Promise<User>
-  signInWithGoogle: () => Promise<GoogleSignInResult>
-  completeGoogleSignUp: (displayName: string, role: UserRole) => Promise<User>
-  inspectUserAccount: (uid: string) => Promise<AccountInspectionResult>
-  linkPendingGoogleCredential: () => Promise<void>
-  clearPendingGoogleLink: () => void
+  signUp: (
+    email: string,
+    password: string,
+    displayName: string,
+    role: UserRole,
+    onProfileSetup?: (user: User) => Promise<void>
+  ) => Promise<User>
   logout: () => Promise<void>
   refreshUser: () => Promise<void>
+}
+
+function isTransientFirestoreError(err: unknown): boolean {
+  const code = ((err as { code?: string })?.code || '').toLowerCase()
+  const msg = ((err as { message?: string })?.message || '').toLowerCase()
+  return (
+    code.includes('unavailable') ||
+    code.includes('deadline-exceeded') ||
+    code.includes('network-request-failed') ||
+    msg.includes('offline') ||
+    msg.includes('network') ||
+    msg.includes('failed to get document because the client is offline')
+  )
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null)
@@ -67,361 +55,330 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null)
   const [role, setRole] = useState<UserRole | null>(null)
   const [loading, setLoading] = useState(true)
-  const [pendingGoogleCredential, setPendingGoogleCredential] = useState<AuthCredential | null>(null)
-  const [pendingGoogleLink, setPendingGoogleLink] = useState<PendingGoogleLinkInfo | null>(null)
+  const [sessionError, setSessionError] = useState<string | null>(null)
+  const activeAuthTransitionRef = useRef(false)
 
-  const inspectUserAccount = async (uid: string): Promise<AccountInspectionResult> => {
-    const [userSnap, studentSnap, professorSnap] = await Promise.all([
-      getDoc(doc(db, 'users', uid)),
+  const isValidRole = (value: unknown): value is UserRole =>
+    value === 'student' || value === 'professor'
+
+  const fetchRole = async (uid: string): Promise<UserRole | null> => {
+    const snap = await getDoc(doc(db, 'users', uid))
+    if (snap.exists()) {
+      const fetchedRole = snap.data().role
+      if (isValidRole(fetchedRole)) {
+        if (fetchedRole === 'professor') {
+          const pSnap = await getDoc(doc(db, 'professors', uid))
+          if (!pSnap.exists()) {
+            console.warn('Incomplete professor profile for UID:', uid)
+            return null
+          }
+          const raw = pSnap.data() as Record<string, unknown>
+          stripLegacyProfessorEmailIfPresent(uid, raw)
+          syncUserDirectoryEntry(
+            buildDirectoryEntryFromProfessor({
+              ...(raw as Partial<ProfessorProfile>),
+              uid,
+            })
+          ).catch(() => {})
+        } else if (fetchedRole === 'student') {
+          const res = await loadSplitStudentProfile(uid)
+          if (!res.exists) {
+            console.warn('Incomplete student profile for UID:', uid)
+            return null
+          }
+          syncUserDirectoryEntry(
+            buildDirectoryEntryFromStudent({
+              ...res.data,
+              uid,
+            })
+          ).catch(() => {})
+        }
+        return fetchedRole
+      }
+      console.error('Invalid or missing role in users/{uid} for UID:', uid)
+      return null
+    }
+
+    // Legacy account check: inspect BOTH students/{uid} and professors/{uid} before backfilling
+    const [studentRes, profRes] = await Promise.allSettled([
       getDoc(doc(db, 'students', uid)),
       getDoc(doc(db, 'professors', uid)),
     ])
 
-    const hasUserDoc = userSnap.exists()
-    const hasStudentProfile = studentSnap.exists()
-    const hasProfessorProfile = professorSnap.exists()
-
-    if (!hasUserDoc && !hasStudentProfile && !hasProfessorProfile) {
-      return {
-        status: 'new_user',
-        role: null,
-        hasUserDoc: false,
-        hasStudentProfile: false,
-        hasProfessorProfile: false,
-      }
+    if (
+      (studentRes.status === 'rejected' && isTransientFirestoreError(studentRes.reason)) ||
+      (profRes.status === 'rejected' && isTransientFirestoreError(profRes.reason))
+    ) {
+      throw studentRes.status === 'rejected' ? studentRes.reason : (profRes as PromiseRejectedResult).reason
     }
 
-    if (hasStudentProfile && hasProfessorProfile) {
-      return {
-        status: 'inconsistent',
-        role: null,
-        hasUserDoc,
-        hasStudentProfile: true,
-        hasProfessorProfile: true,
-        inconsistencyReason:
-          'Account has both a student profile and a professor profile in Firestore. Please contact support to resolve this conflict.',
+    const studentSnap = studentRes.status === 'fulfilled' ? studentRes.value : null
+    const profSnap = profRes.status === 'fulfilled' ? profRes.value : null
+
+    const hasStudent = Boolean(studentSnap?.exists())
+    const hasProf = Boolean(profSnap?.exists())
+
+    // Ambiguous state (both exist) or uninitialized state (neither exists): do not auto-assign a role
+    if ((hasStudent && hasProf) || (!hasStudent && !hasProf)) {
+      if (hasStudent && hasProf) {
+        console.error(
+          'Ambiguous account state: both student and professor profiles exist for UID:',
+          uid
+        )
       }
+      return null
     }
 
-    if (!hasUserDoc && (hasStudentProfile || hasProfessorProfile)) {
-      return {
-        status: 'inconsistent',
-        role: null,
-        hasUserDoc: false,
-        hasStudentProfile,
-        hasProfessorProfile,
-        inconsistencyReason:
-          'A role profile exists without a corresponding base user record in Firestore. Please contact support.',
-      }
-    }
-
-    const rawRole = userSnap.data()?.role as unknown
-    if (rawRole !== 'student' && rawRole !== 'professor' && rawRole !== 'admin') {
-      return {
-        status: 'inconsistent',
-        role: null,
-        hasUserDoc: true,
-        hasStudentProfile,
-        hasProfessorProfile,
-        inconsistencyReason:
-          'Base user record has a missing or invalid role in Firestore. Please contact support.',
-      }
-    }
-
-    const userRole: UserRole = rawRole
-
-    if (userRole === 'student' && hasProfessorProfile) {
-      return {
-        status: 'inconsistent',
-        role: null,
-        hasUserDoc: true,
-        hasStudentProfile,
-        hasProfessorProfile: true,
-        inconsistencyReason:
-          'User role is set to "student" in users/{uid}, but a professor profile exists in professors/{uid}.',
-      }
-    }
-
-    if (userRole === 'professor' && hasStudentProfile) {
-      return {
-        status: 'inconsistent',
-        role: null,
-        hasUserDoc: true,
-        hasStudentProfile: true,
-        hasProfessorProfile,
-        inconsistencyReason:
-          'User role is set to "professor" in users/{uid}, but a student profile exists in students/{uid}.',
-      }
-    }
-
-    if (userRole === 'student' && !hasStudentProfile) {
-      return {
-        status: 'incomplete_onboarding',
+    if (hasStudent && !hasProf && studentSnap) {
+      const sData = studentSnap.data() as { fullName?: string }
+      await setDoc(doc(db, 'users', uid), {
+        uid,
+        email: auth.currentUser?.email || null,
+        displayName: sData.fullName || auth.currentUser?.displayName || 'Student Researcher',
         role: 'student',
-        hasUserDoc: true,
-        hasStudentProfile: false,
-        hasProfessorProfile: false,
-      }
+        isActive: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }).catch(() => {})
+      loadSplitStudentProfile(uid)
+        .then((res) => {
+          if (res.exists) {
+            syncUserDirectoryEntry(
+              buildDirectoryEntryFromStudent({
+                ...res.data,
+                uid,
+              })
+            ).catch(() => {})
+          }
+        })
+        .catch(() => {})
+      return 'student'
     }
 
-    if (userRole === 'professor' && !hasProfessorProfile) {
-      return {
-        status: 'incomplete_onboarding',
+    if (hasProf && !hasStudent && profSnap) {
+      const pData = profSnap.data() as Record<string, unknown>
+      await setDoc(doc(db, 'users', uid), {
+        uid,
+        email: auth.currentUser?.email || null,
+        displayName:
+          (typeof pData.fullName === 'string' && pData.fullName) ||
+          auth.currentUser?.displayName ||
+          'Faculty Member',
         role: 'professor',
-        hasUserDoc: true,
-        hasStudentProfile: false,
-        hasProfessorProfile: false,
-      }
+        isActive: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }).catch(() => {})
+      stripLegacyProfessorEmailIfPresent(uid, pData)
+      syncUserDirectoryEntry(
+        buildDirectoryEntryFromProfessor({
+          ...(pData as Partial<ProfessorProfile>),
+          uid,
+        })
+      ).catch(() => {})
+      return 'professor'
     }
 
-    return {
-      status: 'existing_complete',
-      role: userRole,
-      hasUserDoc: true,
-      hasStudentProfile,
-      hasProfessorProfile,
-    }
+    return null
   }
 
-  const fetchRole = async (uid: string): Promise<UserRole | null> => {
+  const resolveAuthenticatedSession = async (firebaseUser: User) => {
+    setSessionError(null)
     try {
-      const inspection = await inspectUserAccount(uid)
-      if (inspection.status === 'existing_complete') {
-        return inspection.role
+      const userRole = await fetchRole(firebaseUser.uid)
+      if (!userRole) {
+        console.warn('Failed role/profile resolution for UID:', firebaseUser.uid)
+        await signOut(auth).catch(() => {})
+        setUser(null)
+        setRole(null)
+        setSessionError('Your account profile setup is incomplete. Please complete registration on the sign-up page.')
+      } else {
+        setUser(firebaseUser)
+        setRole(userRole)
+        setSessionError(null)
       }
-      if (inspection.status === 'inconsistent') {
-        console.error('Inconsistent account records detected:', inspection.inconsistencyReason)
+    } catch (err) {
+      console.error('Temporary error resolving session:', err)
+      if (isTransientFirestoreError(err)) {
+        // Preserve authenticated Firebase Auth session during temporary Firestore/network outage
+        setUser(firebaseUser)
+        setRole(null)
+        setSessionError('Unable to verify your account due to a temporary connection issue. Please retry.')
+      } else {
+        await signOut(auth).catch(() => {})
+        setUser(null)
+        setRole(null)
+        setSessionError('Failed to verify your account permissions. Please sign in again.')
       }
-    } catch (e) {
-      console.error('Failed to fetch role:', e)
     }
-    return null
   }
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
-      setUser(firebaseUser)
+      // If signIn() or signUp() is actively resolving the user and role, let it finish
+      // so onAuthStateChanged does not race and overwrite role or flicker loading state.
+      if (activeAuthTransitionRef.current) {
+        return
+      }
+      setLoading(true)
       if (firebaseUser) {
-        const userRole = await fetchRole(firebaseUser.uid)
-        setRole(userRole)
+        await resolveAuthenticatedSession(firebaseUser)
       } else {
+        setUser(null)
         setRole(null)
+        setSessionError(null)
       }
       setLoading(false)
     })
     return unsubscribe
   }, [])
 
+  const retrySession = async () => {
+    if (!auth.currentUser) return
+    setLoading(true)
+    try {
+      await resolveAuthenticatedSession(auth.currentUser)
+    } finally {
+      setLoading(false)
+    }
+  }
+
   const signIn = async (email: string, password: string): Promise<UserRole | null> => {
-    const credential = await signInWithEmailAndPassword(auth, email, password)
-    const resolvedRole = await fetchRole(credential.user.uid)
-    setUser(credential.user)
-    setRole(resolvedRole)
-    return resolvedRole
+    activeAuthTransitionRef.current = true
+    setLoading(true)
+    setSessionError(null)
+    try {
+      const credential = await signInWithEmailAndPassword(auth, email.trim(), password)
+      const userRole = await fetchRole(credential.user.uid)
+      if (!userRole) {
+        await signOut(auth).catch(() => {})
+        setUser(null)
+        setRole(null)
+        return null
+      }
+      setUser(credential.user)
+      setRole(userRole)
+      return userRole
+    } finally {
+      activeAuthTransitionRef.current = false
+      setLoading(false)
+    }
   }
 
   const signUp = async (
     email: string,
     password: string,
     displayName: string,
-    userRole: UserRole
+    userRole: UserRole,
+    onProfileSetup?: (user: User) => Promise<void>
   ): Promise<User> => {
-    const credential = await createUserWithEmailAndPassword(auth, email, password)
-    const { user: newUser } = credential
+    activeAuthTransitionRef.current = true
+    setLoading(true)
+    setSessionError(null)
+    let newUser: User
 
-    await updateProfile(newUser, { displayName })
-    await sendEmailVerification(newUser)
-
-    // Create base user document
-    await setDoc(doc(db, 'users', newUser.uid), {
-      uid: newUser.uid,
-      email: newUser.email,
-      displayName,
-      role: userRole,
-      isActive: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    })
-
-    setRole(userRole)
-    return newUser
-  }
-
-  const signInWithGoogle = async (): Promise<GoogleSignInResult> => {
     try {
-      const credential = await signInWithPopup(auth, googleProvider)
-      const googleUser = credential.user
+      try {
+        const credential = await createUserWithEmailAndPassword(auth, email.trim(), password)
+        newUser = credential.user
+      } catch (err: unknown) {
+        const code = (err as { code?: string })?.code
+        // If a previous signup attempt created the Auth account but failed before finishing
+        // Firestore profile creation, allow the user to resume and complete registration.
+        if (code === 'auth/email-already-in-use') {
+          const previousUser = auth.currentUser
+          const reusingExistingSession =
+            Boolean(previousUser) &&
+            previousUser?.email?.toLowerCase() === email.trim().toLowerCase()
+          let signedInForRecovery = false
 
-      const inspection = await inspectUserAccount(googleUser.uid)
-
-      if (inspection.status === 'inconsistent') {
-        setRole(null)
-        const err = new Error(
-          inspection.inconsistencyReason ||
-            'Inconsistent user profile records were found. Please contact support.'
-        ) as Error & { code: string }
-        err.code = 'auth/inconsistent-account-records'
-        throw err
-      }
-
-      if (inspection.status === 'existing_complete') {
-        setUser(googleUser)
-        setRole(inspection.role)
-        return {
-          user: googleUser,
-          role: inspection.role,
-          accountStatus: 'existing_complete',
-          isNewUser: false,
-        }
-      }
-
-      if (inspection.status === 'incomplete_onboarding') {
-        setUser(googleUser)
-        setRole(null)
-        return {
-          user: googleUser,
-          role: inspection.role,
-          accountStatus: 'incomplete_onboarding',
-          isNewUser: false,
-        }
-      }
-
-      setUser(googleUser)
-      setRole(null)
-      return {
-        user: googleUser,
-        role: null,
-        accountStatus: 'new_user',
-        isNewUser: true,
-      }
-    } catch (err: unknown) {
-      const fbErr = err as FirebaseError & { customData?: { email?: string } }
-      if (fbErr?.code === 'auth/account-exists-with-different-credential') {
-        const conflictEmail = fbErr.customData?.email || null
-        const pendingCred = GoogleAuthProvider.credentialFromError(fbErr)
-        let existingMethods: string[] = []
-        if (conflictEmail) {
           try {
-            existingMethods = await fetchSignInMethodsForEmail(auth, conflictEmail)
-          } catch {
-            existingMethods = ['password']
+            const candidateUser = reusingExistingSession && previousUser
+              ? previousUser
+              : (await signInWithEmailAndPassword(auth, email.trim(), password)).user
+
+            if (!reusingExistingSession) {
+              signedInForRecovery = true
+            }
+
+            const [userDocRes, studentDocRes, profDocRes] = await Promise.allSettled([
+              getDoc(doc(db, 'users', candidateUser.uid)),
+              getDoc(doc(db, 'students', candidateUser.uid)),
+              getDoc(doc(db, 'professors', candidateUser.uid)),
+            ])
+
+            const userDocSnap = userDocRes.status === 'fulfilled' ? userDocRes.value : null
+            const hasStudentDoc =
+              studentDocRes.status === 'fulfilled' && studentDocRes.value.exists()
+            const hasProfDoc = profDocRes.status === 'fulfilled' && profDocRes.value.exists()
+            const recordedRole = userDocSnap?.exists() ? userDocSnap.data().role : null
+
+            // Block if account has conflicting profiles, belongs to the opposite role, or is already complete
+            if (
+              (hasStudentDoc && hasProfDoc) ||
+              (recordedRole && recordedRole !== userRole) ||
+              (userRole === 'student' && hasProfDoc) ||
+              (userRole === 'professor' && hasStudentDoc) ||
+              (userRole === 'student' && hasStudentDoc && recordedRole === 'student') ||
+              (userRole === 'professor' && hasProfDoc && recordedRole === 'professor')
+            ) {
+              if (signedInForRecovery) {
+                await signOut(auth).catch(() => {})
+              }
+              throw err
+            }
+
+            newUser = candidateUser
+          } catch (recoveryErr) {
+            if (signedInForRecovery && auth.currentUser?.email?.toLowerCase() === email.trim().toLowerCase()) {
+              await signOut(auth).catch(() => {})
+            }
+            if (recoveryErr === err) throw err
+            throw err
           }
+        } else {
+          throw err
         }
-        setPendingGoogleCredential(pendingCred)
-        setPendingGoogleLink({
-          email: conflictEmail,
-          existingMethods: existingMethods.length > 0 ? existingMethods : ['password'],
-        })
       }
-      throw err
-    }
-  }
 
-  const completeGoogleSignUp = async (
-    displayName: string,
-    userRole: UserRole
-  ): Promise<User> => {
-    const currentUser = auth.currentUser
-    if (!currentUser) {
-      const err = new Error('No authenticated Google user found. Please sign in with Google first.') as Error & {
-        code: string
+      try {
+        await updateProfile(newUser, { displayName })
+      } catch (profileErr) {
+        console.warn('Could not update displayName on Auth user:', profileErr)
       }
-      err.code = 'auth/no-current-user'
-      throw err
-    }
 
-    const inspection = await inspectUserAccount(currentUser.uid)
+      await setDoc(
+        doc(db, 'users', newUser.uid),
+        {
+          uid: newUser.uid,
+          email: newUser.email,
+          displayName,
+          role: userRole,
+          isActive: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      )
 
-    if (inspection.status === 'inconsistent') {
-      const err = new Error(
-        inspection.inconsistencyReason ||
-          'Inconsistent account records found in Firestore. Registration cannot proceed.'
-      ) as Error & { code: string }
-      err.code = 'auth/inconsistent-account-records'
-      throw err
-    }
-
-    if (inspection.status === 'existing_complete') {
-      const err = new Error(
-        'An account profile already exists for this Google user and cannot be overwritten.'
-      ) as Error & { code: string }
-      err.code = 'auth/profile-already-exists'
-      throw err
-    }
-
-    if (inspection.status === 'incomplete_onboarding') {
-      if (inspection.role && inspection.role !== userRole) {
-        const err = new Error(
-          `This account already started registration with role "${inspection.role}" and cannot be changed to "${userRole}".`
-        ) as Error & { code: string }
-        err.code = 'auth/role-conflict'
-        throw err
+      if (onProfileSetup) {
+        await onProfileSetup(newUser)
       }
-      // Do not overwrite the existing users/{uid} document; only update Auth displayName if needed
-      if (displayName && currentUser.displayName !== displayName) {
-        await updateProfile(currentUser, { displayName })
-      }
+
+      setUser(newUser)
       setRole(userRole)
-      return currentUser
+      return newUser
+    } finally {
+      activeAuthTransitionRef.current = false
+      setLoading(false)
     }
-
-    if (displayName && currentUser.displayName !== displayName) {
-      await updateProfile(currentUser, { displayName })
-    }
-
-    await setDoc(doc(db, 'users', currentUser.uid), {
-      uid: currentUser.uid,
-      email: currentUser.email,
-      displayName: displayName || currentUser.displayName || '',
-      role: userRole,
-      photoURL: currentUser.photoURL || null,
-      isActive: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    })
-
-    setRole(userRole)
-    return currentUser
-  }
-
-  const linkPendingGoogleCredential = async (): Promise<void> => {
-    const currentUser = auth.currentUser
-    if (!currentUser || !pendingGoogleCredential) {
-      const err = new Error(
-        'Please sign in with your existing email and password first before linking your Google account.'
-      ) as Error & { code: string }
-      err.code = 'auth/no-pending-credential'
-      throw err
-    }
-
-    if (
-      pendingGoogleLink?.email &&
-      currentUser.email &&
-      pendingGoogleLink.email.toLowerCase() !== currentUser.email.toLowerCase()
-    ) {
-      const err = new Error(
-        `The signed-in account (${currentUser.email}) does not match the Google account email (${pendingGoogleLink.email}) awaiting linking.`
-      ) as Error & { code: string }
-      err.code = 'auth/email-mismatch'
-      throw err
-    }
-
-    const linkedResult = await linkWithCredential(currentUser, pendingGoogleCredential)
-    setUser(linkedResult.user)
-    setPendingGoogleCredential(null)
-    setPendingGoogleLink(null)
-  }
-
-  const clearPendingGoogleLink = () => {
-    setPendingGoogleCredential(null)
-    setPendingGoogleLink(null)
   }
 
   const logout = async () => {
-    setPendingGoogleCredential(null)
-    setPendingGoogleLink(null)
     await signOut(auth)
+    setUser(null)
     setRole(null)
+    setSessionError(null)
   }
 
   const refreshUser = async () => {
@@ -432,23 +389,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   return (
-    <AuthContext.Provider
-      value={{
-        user,
-        role,
-        loading,
-        pendingGoogleLink,
-        signIn,
-        signUp,
-        signInWithGoogle,
-        completeGoogleSignUp,
-        inspectUserAccount,
-        linkPendingGoogleCredential,
-        clearPendingGoogleLink,
-        logout,
-        refreshUser,
-      }}
-    >
+    <AuthContext.Provider value={{ user, role, loading, sessionError, retrySession, signIn, signUp, logout, refreshUser }}>
       {children}
     </AuthContext.Provider>
   )

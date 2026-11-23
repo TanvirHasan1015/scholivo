@@ -1,13 +1,25 @@
 import { useState, useEffect, useMemo } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { collection, doc, getDoc, getDocs, setDoc, query, where, limit } from 'firebase/firestore'
+import { collection, getDocs, query, where } from 'firebase/firestore'
 import { 
   MapPin, Globe, ExternalLink, Heart, 
   Calendar, DollarSign, GraduationCap, Mail,
   Sparkles, ArrowLeft, ArrowUpRight,
-  Building, Briefcase
+  Building, Briefcase, AlertCircle
 } from 'lucide-react'
 import { db } from '@/lib/firebase'
+import {
+  fetchProfessorByUsernameOrIdSafely,
+  loadSplitStudentProfile,
+  saveStudentSavedProfessors,
+} from '@/lib/messaging'
+import {
+  PROFESSOR_FUNDING_STATUS_LABELS,
+  PROFESSOR_FUNDING_TYPE_LABELS,
+  getFundingStatusBadgeStyle,
+  hasProfessorFundingInfo,
+  normalizeProfessorFundingInfo,
+} from '@/lib/professorFunding'
 import { useAuth } from '@/context/AuthContext'
 import type { ProfessorProfile, StudentProfile } from '@/types/user.types'
 import type { Position } from '@/types/position.types'
@@ -15,8 +27,8 @@ import type { MatchResult } from '@/types/match.types'
 import { computeMatch } from '@/lib/matching'
 import { Avatar } from '@/components/common/Avatar'
 import { Button } from '@/components/common/Button'
-import { MatchScoreBadge } from '@/components/matching/MatchScore'
-import { VerificationBadge, RecruitingBadge } from '@/components/common/Badges'
+import { MatchScoreBadge, MatchChip } from '@/components/matching/MatchScore'
+import { RecruitingBadge } from '@/components/common/Badges'
 import { formatDate, FUNDING_LABELS, cn } from '@/utils/helpers'
 
 type Tab = 'overview' | 'research' | 'positions' | 'publications' | 'lab'
@@ -29,6 +41,7 @@ export default function ProfessorProfilePage() {
   const [professor, setProfessor] = useState<(ProfessorProfile & { positions: Position[] }) | null>(null)
   const [studentProfile, setStudentProfile] = useState<StudentProfile | null>(null)
   const [loading, setLoading] = useState(true)
+  const [positionsError, setPositionsError] = useState<'permission_denied' | 'network_error' | null>(null)
   const [activeTab, setActiveTab] = useState<Tab>('overview')
 
   const isSaved = useMemo(() => {
@@ -53,11 +66,7 @@ export default function ProfessorProfilePage() {
     setStudentProfile((prev) => (prev ? { ...prev, savedProfessorIds: nextIds } : prev))
 
     try {
-      await setDoc(
-        doc(db, 'students', user.uid),
-        { savedProfessorIds: nextIds, updatedAt: new Date().toISOString() },
-        { merge: true }
-      )
+      await saveStudentSavedProfessors(user.uid, nextIds)
     } catch (err) {
       console.error('Failed to update savedProfessorIds in Firestore:', err)
     }
@@ -77,40 +86,42 @@ export default function ProfessorProfilePage() {
       }
 
       try {
-        let profData: ProfessorProfile | null = null
-        let profUid = ''
-
-        const snap = await getDocs(
-          query(collection(db, 'professors'), where('username', '==', username), limit(1))
-        )
-
-        if (!snap.empty) {
-          profData = snap.docs[0].data() as ProfessorProfile
-          profUid = profData.uid || snap.docs[0].id
-        } else {
-          const byIdSnap = await getDoc(doc(db, 'professors', username))
-          if (byIdSnap.exists()) {
-            profData = byIdSnap.data() as ProfessorProfile
-            profUid = profData.uid || byIdSnap.id
-          }
-        }
+        const resolved = await fetchProfessorByUsernameOrIdSafely(username)
+        const profData = resolved ? resolved.profile : null
+        const profUid = resolved ? resolved.uid : ''
 
         if (!isMounted) return
 
         if (profData && profUid) {
-          const posSnap = await getDocs(
-            query(collection(db, 'positions'), where('professorId', '==', profUid), where('isOpen', '==', true))
-          )
-          const positions = posSnap.docs.map((d) => {
-            const p = d.data() as Position
-            return {
-              ...p,
-              id: d.id,
-              researchTopics: Array.isArray(p.researchTopics) ? p.researchTopics : [],
-              requiredSkills: Array.isArray(p.requiredSkills) ? p.requiredSkills : [],
-              preferredSkills: Array.isArray(p.preferredSkills) ? p.preferredSkills : [],
+          let positions: Position[] = []
+          try {
+            const posSnap = await getDocs(
+              query(collection(db, 'positions'), where('professorId', '==', profUid), where('isOpen', '==', true))
+            )
+            positions = posSnap.docs.map((d) => {
+              const p = d.data() as Position
+              return {
+                ...p,
+                id: d.id,
+                researchTopics: Array.isArray(p.researchTopics) ? p.researchTopics : [],
+                requiredSkills: Array.isArray(p.requiredSkills) ? p.requiredSkills : [],
+                preferredSkills: Array.isArray(p.preferredSkills) ? p.preferredSkills : [],
+              }
+            })
+            if (isMounted) setPositionsError(null)
+          } catch (posErr: unknown) {
+            console.error('Failed to load positions for professor:', posErr)
+            if (isMounted) {
+              const errObj = posErr as { code?: string; message?: string } | null
+              const msg = `${errObj?.code || ''} ${errObj?.message || ''}`.toLowerCase()
+              if (msg.includes('permission-denied') || msg.includes('permission_denied') || msg.includes('missing or insufficient permissions')) {
+                setPositionsError('permission_denied')
+              } else {
+                setPositionsError('network_error')
+              }
             }
-          })
+            positions = []
+          }
           setProfessor({
             ...profData,
             uid: profUid,
@@ -119,6 +130,7 @@ export default function ProfessorProfilePage() {
             currentProjects: Array.isArray(profData.currentProjects) ? profData.currentProjects : [],
             publications: Array.isArray(profData.publications) ? profData.publications : [],
             labMembers: Array.isArray(profData.labMembers) ? profData.labMembers : [],
+            fundingInfo: normalizeProfessorFundingInfo(profData.fundingInfo),
             positions,
           })
         } else {
@@ -148,10 +160,10 @@ export default function ProfessorProfilePage() {
         return
       }
       try {
-        const snap = await getDoc(doc(db, 'students', user.uid))
+        const loaded = await loadSplitStudentProfile(user.uid)
         if (!isMounted) return
-        if (snap.exists()) {
-          const data = snap.data() as StudentProfile
+        if (loaded.exists) {
+          const data = loaded.data as StudentProfile
           setStudentProfile({
             ...data,
             uid: data.uid || user.uid,
@@ -285,14 +297,29 @@ export default function ProfessorProfilePage() {
                 </div>
 
                 <div className="flex flex-wrap gap-2">
-                  <VerificationBadge status={professor.verificationStatus} />
                   <RecruitingBadge status={professor.recruitingStatus} />
+                  {professor.fundingInfo?.fundingStatus && (
+                    <span
+                      className={cn(
+                        'inline-flex items-center gap-1 text-xs font-semibold px-2.5 py-1 rounded-full border',
+                        getFundingStatusBadgeStyle(professor.fundingInfo.fundingStatus)
+                      )}
+                      id="hero-funding-status-badge"
+                    >
+                      <DollarSign size={12} />
+                      <span>
+                        {PROFESSOR_FUNDING_STATUS_LABELS[professor.fundingInfo.fundingStatus]}
+                      </span>
+                    </span>
+                  )}
                 </div>
               </div>
 
-              {/* Research Areas */}
+              {/* Research Areas & Topics */}
               <div className="flex flex-wrap gap-1.5">
-                {professor.researchAreas.map((area) => (
+                {Array.from(
+                  new Set([...professor.researchAreas, ...professor.researchInterests].filter(Boolean))
+                ).map((area) => (
                   <span
                     key={area}
                     className="text-xs font-semibold px-2.5 py-1 rounded-lg bg-blue-50/80 border border-blue-200/70 text-blue-800"
@@ -315,28 +342,61 @@ export default function ProfessorProfilePage() {
                   </Button>
                 )}
 
-                <Button
-                  variant="outline"
-                  onClick={toggleSave}
-                  className={cn(
-                    'flex items-center gap-2 transition-colors',
-                    isSaved ? 'text-rose-600 border-rose-300 bg-rose-50/50' : 'text-slate-700'
-                  )}
-                  id="save-professor-btn"
-                >
-                  <Heart size={16} className={isSaved ? 'fill-rose-500 text-rose-500' : 'text-slate-400'} />
-                  <span>{isSaved ? 'Bookmarked' : 'Save Faculty'}</span>
-                </Button>
+                {user?.uid === professor.uid ? (
+                  <Button
+                    variant="outline"
+                    onClick={() => navigate('/profile/professor/edit?edit=true')}
+                    className="flex items-center gap-2"
+                    id="edit-own-professor-profile-btn"
+                  >
+                    <span>Edit Faculty Profile</span>
+                  </Button>
+                ) : (
+                  <>
+                    {role === 'student' && (
+                      <Button
+                        variant="outline"
+                        onClick={toggleSave}
+                        className={cn(
+                          'flex items-center gap-2 transition-colors',
+                          isSaved ? 'text-rose-600 border-rose-300 bg-rose-50/50' : 'text-slate-700'
+                        )}
+                        id="save-professor-btn"
+                      >
+                        <Heart size={16} className={isSaved ? 'fill-rose-500 text-rose-500' : 'text-slate-400'} />
+                        <span>{isSaved ? 'Bookmarked' : 'Save Faculty'}</span>
+                      </Button>
+                    )}
 
-                <Button
-                  variant="secondary"
-                  onClick={() => navigate('/messages')}
-                  className="flex items-center gap-2"
-                  id="message-professor-btn"
-                >
-                  <Mail size={16} />
-                  <span>Send Inquiry</span>
-                </Button>
+                    <Button
+                      variant="secondary"
+                      onClick={() => {
+                        if (!user) {
+                          navigate('/login')
+                          return
+                        }
+                        const ctxTitle =
+                          professor.positions[0]?.title || `${professor.fullName} Lab Inquiry`
+                        const params = new URLSearchParams({
+                          to: professor.uid,
+                          context: ctxTitle,
+                          name: professor.fullName || 'Faculty Member',
+                          username: professor.username || professor.uid,
+                          role: 'professor',
+                          university: professor.university || '',
+                          department: professor.department || '',
+                          headline: professor.academicTitle || 'Professor',
+                        })
+                        navigate(`/messages?${params.toString()}`)
+                      }}
+                      className="flex items-center gap-2"
+                      id="message-professor-btn"
+                    >
+                      <Mail size={16} />
+                      <span>Send Inquiry</span>
+                    </Button>
+                  </>
+                )}
               </div>
 
               {/* External Links */}
@@ -365,13 +425,17 @@ export default function ProfessorProfilePage() {
                 )}
                 {professor.orcid && (
                   <a
-                    href={`https://orcid.org/${professor.orcid}`}
+                    href={
+                      professor.orcid.startsWith('http')
+                        ? professor.orcid
+                        : `https://orcid.org/${professor.orcid.replace(/^orcid\.org\//i, '')}`
+                    }
                     target="_blank"
                     rel="noopener noreferrer"
                     className="hover:text-blue-600 flex items-center gap-1 transition-colors"
                   >
                     <ExternalLink size={13} className="text-slate-400" />
-                    <span>ORCID: {professor.orcid}</span>
+                    <span>ORCID: {professor.orcid.replace(/^https?:\/\/orcid\.org\//i, '')}</span>
                   </a>
                 )}
                 {professor.personalWebpageUrl && (
@@ -432,23 +496,183 @@ export default function ProfessorProfilePage() {
               <div className="space-y-6">
                 <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-2xs space-y-4">
                   <h3 className="font-display text-lg font-bold text-slate-900">Faculty Biography</h3>
-                  <div className="text-slate-600 text-sm leading-relaxed whitespace-pre-line">
-                    {professor.biography}
-                  </div>
+                  {professor.biography ? (
+                    <div className="text-slate-600 text-sm leading-relaxed whitespace-pre-line">
+                      {professor.biography}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-slate-400 italic">No faculty biography provided yet.</p>
+                  )}
                 </div>
 
                 <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-2xs space-y-4">
-                  <h3 className="font-display text-lg font-bold text-slate-900">Research Interests</h3>
-                  <div className="flex flex-wrap gap-2">
-                    {professor.researchInterests.map((interest) => (
+                  <h3 className="font-display text-lg font-bold text-slate-900">
+                    Research Areas & Specific Topics
+                  </h3>
+                  {professor.researchAreas.length === 0 && professor.researchInterests.length === 0 ? (
+                    <p className="text-xs text-slate-400 italic">No research topics listed yet.</p>
+                  ) : (
+                    <div className="space-y-3">
+                      {professor.researchAreas.length > 0 && (
+                        <div>
+                          <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5">
+                            Primary Research Areas
+                          </p>
+                          <div className="flex flex-wrap gap-2">
+                            {professor.researchAreas.map((area) => (
+                              <span
+                                key={area}
+                                className="px-3 py-1.5 rounded-xl bg-blue-50 border border-blue-200 text-blue-800 text-xs font-medium"
+                              >
+                                {area}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {professor.researchInterests.length > 0 && (
+                        <div>
+                          <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5">
+                            Specific Research Topics & Methodologies
+                          </p>
+                          <div className="flex flex-wrap gap-2">
+                            {professor.researchInterests.map((interest) => (
+                              <span
+                                key={interest}
+                                className="px-3 py-1.5 rounded-xl bg-slate-50 border border-slate-200 text-slate-800 text-xs font-medium"
+                              >
+                                {interest}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {/* Funding Information & Availability Card */}
+                <div
+                  className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-2xs space-y-4"
+                  id="public-prof-funding-card"
+                >
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-100">
+                    <div className="flex items-center gap-2.5">
+                      <div className="w-8 h-8 rounded-lg bg-emerald-50 text-emerald-600 flex items-center justify-center shrink-0">
+                        <DollarSign size={17} />
+                      </div>
+                      <div>
+                        <h3 className="font-display text-lg font-bold text-slate-900">
+                          Funding Information & Student Support
+                        </h3>
+                        <p className="text-xs text-slate-500">
+                          Faculty funding sources, student support availability, and eligibility criteria
+                        </p>
+                      </div>
+                    </div>
+
+                    {professor.fundingInfo?.fundingStatus && (
                       <span
-                        key={interest}
-                        className="px-3 py-1.5 rounded-xl bg-slate-50 border border-slate-200 text-slate-800 text-xs font-medium"
+                        className={cn(
+                          'inline-flex items-center gap-1.5 text-xs font-semibold px-3 py-1 rounded-full border self-start sm:self-center',
+                          getFundingStatusBadgeStyle(professor.fundingInfo.fundingStatus)
+                        )}
                       >
-                        {interest}
+                        <DollarSign size={13} />
+                        <span>
+                          {PROFESSOR_FUNDING_STATUS_LABELS[professor.fundingInfo.fundingStatus]}
+                        </span>
                       </span>
-                    ))}
+                    )}
                   </div>
+
+                  {!hasProfessorFundingInfo(professor.fundingInfo) ? (
+                    <p className="text-xs text-slate-400 italic" id="funding-not-provided-msg">
+                      Funding information not provided
+                    </p>
+                  ) : (
+                    <div className="space-y-4 text-xs">
+                      {professor.fundingInfo?.fundingStatus ===
+                        'funding_available_for_selected_positions' && (
+                        <div className="p-3 rounded-xl bg-indigo-50/80 border border-indigo-200 text-indigo-900 flex items-start gap-2">
+                          <AlertCircle size={15} className="text-indigo-600 shrink-0 mt-0.5" />
+                          <span>
+                            <strong>Position-Specific Funding:</strong> Funding is currently available for selected research positions only. Please review the Open Positions tab for position-specific funding packages.
+                          </span>
+                        </div>
+                      )}
+
+                      {typeof professor.fundingInfo?.supportedStudentsCount === 'number' && (
+                        <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl bg-emerald-50/80 border border-emerald-200 text-emerald-900 font-medium">
+                          <span>Students currently supportable:</span>
+                          <strong className="font-bold text-emerald-950">
+                            {professor.fundingInfo.supportedStudentsCount}
+                          </strong>
+                        </div>
+                      )}
+
+                      {professor.fundingInfo?.fundingTypes &&
+                        professor.fundingInfo.fundingTypes.length > 0 && (
+                          <div>
+                            <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5">
+                              Available Funding Types
+                            </p>
+                            <div className="flex flex-wrap gap-2">
+                              {professor.fundingInfo.fundingTypes.map((typeId) => {
+                                const baseLabel = PROFESSOR_FUNDING_TYPE_LABELS[typeId] || typeId
+                                const label =
+                                  typeId === 'other' &&
+                                  professor.fundingInfo?.otherFundingTypeExplanation
+                                    ? `Other: ${professor.fundingInfo.otherFundingTypeExplanation}`
+                                    : baseLabel
+                                return (
+                                  <span
+                                    key={typeId}
+                                    className="px-3 py-1.5 rounded-xl bg-emerald-50/70 border border-emerald-200 text-emerald-800 text-xs font-medium"
+                                  >
+                                    {label}
+                                  </span>
+                                )
+                              })}
+                            </div>
+                          </div>
+                        )}
+
+                      {professor.fundingInfo?.description && (
+                        <div>
+                          <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1">
+                            Funding Overview
+                          </p>
+                          <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-line">
+                            {professor.fundingInfo.description}
+                          </p>
+                        </div>
+                      )}
+
+                      {professor.fundingInfo?.eligibilityRequirements && (
+                        <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200/80">
+                          <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1">
+                            Eligibility & Support Requirements
+                          </p>
+                          <p className="text-xs text-slate-700 leading-relaxed whitespace-pre-line">
+                            {professor.fundingInfo.eligibilityRequirements}
+                          </p>
+                        </div>
+                      )}
+
+                      {professor.fundingInfo?.additionalNotes && (
+                        <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200/80">
+                          <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1">
+                            Additional Funding Notes
+                          </p>
+                          <p className="text-xs text-slate-700 leading-relaxed whitespace-pre-line">
+                            {professor.fundingInfo.additionalNotes}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 {professor.labDescription && (
@@ -465,112 +689,160 @@ export default function ProfessorProfilePage() {
             {/* TAB CONTENT: Research Projects */}
             {activeTab === 'research' && (
               <div className="space-y-4">
-                {professor.currentProjects.map((project) => (
-                  <div
-                    key={project.id}
-                    className="bg-white rounded-3xl p-6 sm:p-7 border border-slate-200/80 shadow-2xs space-y-3"
-                  >
-                    <div className="flex items-start justify-between gap-4">
-                      <h4 className="font-display text-base font-bold text-slate-900">{project.title}</h4>
-                      <span className="text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 shrink-0">
-                        Ongoing Project
-                      </span>
-                    </div>
-
-                    <p className="text-slate-600 text-sm leading-relaxed">
-                      {project.description}
-                    </p>
-
-                    {project.fundingSource && (
-                      <div className="pt-2 flex items-center gap-2 text-xs text-slate-500 font-medium">
-                        <DollarSign size={13} className="text-emerald-600 shrink-0" />
-                        <span>Funded by: <strong className="text-slate-700">{project.fundingSource}</strong></span>
-                      </div>
-                    )}
+                {professor.currentProjects.length === 0 ? (
+                  <div className="bg-white rounded-3xl p-10 text-center border border-slate-200/80 shadow-2xs">
+                    <p className="text-slate-500 font-medium text-sm">No funded research projects listed yet.</p>
                   </div>
-                ))}
+                ) : (
+                  professor.currentProjects.map((project) => (
+                    <div
+                      key={project.id}
+                      className="bg-white rounded-3xl p-6 sm:p-7 border border-slate-200/80 shadow-2xs space-y-3"
+                    >
+                      <div className="flex items-start justify-between gap-4">
+                        <h4 className="font-display text-base font-bold text-slate-900">{project.title}</h4>
+                        <span className="text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 shrink-0">
+                          Ongoing Project
+                        </span>
+                      </div>
+
+                      <p className="text-slate-600 text-sm leading-relaxed">
+                        {project.description}
+                      </p>
+
+                      {project.fundingSource && (
+                        <div className="pt-2 flex items-center gap-2 text-xs text-slate-500 font-medium">
+                          <DollarSign size={13} className="text-emerald-600 shrink-0" />
+                          <span>Funded by: <strong className="text-slate-700">{project.fundingSource}</strong></span>
+                        </div>
+                      )}
+                    </div>
+                  ))
+                )}
               </div>
             )}
 
             {/* TAB CONTENT: Open Positions */}
             {activeTab === 'positions' && (
               <div className="space-y-5">
-                {professor.positions.map((pos) => (
-                  <div
-                    key={pos.id}
-                    className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-2xs space-y-5 hover:border-blue-300 transition-all"
-                  >
-                    <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
-                      <div>
-                        <div className="flex flex-wrap items-center gap-2 mb-1.5">
-                          <span className="px-2.5 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200 text-xs font-bold">
-                            {pos.degreeType.replace('_', ' ')}
-                          </span>
-                          <span className="px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-bold">
-                            {FUNDING_LABELS[pos.fundingType] || pos.fundingType}
-                          </span>
-                        </div>
-                        <h4 className="text-lg font-bold text-slate-900 font-display">{pos.title}</h4>
-                        <p className="text-xs text-slate-500 mt-0.5">
-                          Department of {pos.department} • {pos.university}
-                        </p>
-                      </div>
-
-                      <Button
-                        onClick={() => navigate(`/apply/${pos.id}`)}
-                        className="flex items-center gap-1.5 shrink-0 shadow-xs"
-                      >
-                        <span>Apply Now</span>
-                        <ArrowUpRight size={15} />
-                      </Button>
+                {positionsError === 'permission_denied' ? (
+                  <div className="bg-amber-50 rounded-3xl p-6 sm:p-8 border border-amber-200 text-amber-900 space-y-2">
+                    <div className="flex items-center gap-2 font-bold text-base">
+                      <AlertCircle className="w-5 h-5 text-amber-600" />
+                      <span>Access Restricted</span>
                     </div>
-
-                    <p className="text-slate-600 text-sm leading-relaxed whitespace-pre-line">
-                      {pos.description}
+                    <p className="text-sm text-amber-800 leading-relaxed">
+                      You do not have permission to view positions for this professor, or Firestore security rules restricted this query.
                     </p>
-
-                    {/* Requirements Breakdown */}
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2 border-t border-slate-100 text-xs">
-                      <div>
-                        <span className="font-semibold text-slate-700 block mb-1">Required Skills:</span>
-                        <div className="flex flex-wrap gap-1">
-                          {pos.requiredSkills.map((s) => (
-                            <span key={s} className="px-2 py-0.5 rounded-md bg-slate-100 text-slate-700 font-medium">
-                              {s}
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-
-                      <div>
-                        <span className="font-semibold text-slate-700 block mb-1">Preferred Background:</span>
-                        <div className="flex flex-wrap gap-1">
-                          {pos.preferredSkills.map((s) => (
-                            <span key={s} className="px-2 py-0.5 rounded-md bg-slate-50 border border-slate-200 text-slate-600 font-medium">
-                              {s}
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Stipend & Deadline Meta */}
-                    <div className="flex flex-wrap items-center gap-4 pt-3 border-t border-slate-100 text-xs text-slate-500 font-medium">
-                      {pos.stipend && (
-                        <div className="flex items-center gap-1 text-slate-700">
-                          <DollarSign size={13} className="text-emerald-600" />
-                          <span>Stipend: <strong className="text-slate-900">{pos.stipend}</strong></span>
-                        </div>
-                      )}
-                      {pos.applicationDeadline && (
-                        <div className="flex items-center gap-1">
-                          <Calendar size={13} className="text-blue-600" />
-                          <span>Deadline: <strong className="text-slate-900">{formatDate(pos.applicationDeadline)}</strong></span>
-                        </div>
-                      )}
-                    </div>
                   </div>
-                ))}
+                ) : positionsError === 'network_error' ? (
+                  <div className="bg-red-50 rounded-3xl p-6 sm:p-8 border border-red-200 text-red-900 space-y-2">
+                    <div className="flex items-center gap-2 font-bold text-base">
+                      <AlertCircle className="w-5 h-5 text-red-600" />
+                      <span>Failed to Load Positions</span>
+                    </div>
+                    <p className="text-sm text-red-800 leading-relaxed">
+                      A network error or unexpected issue occurred while loading open positions. Please check your connection and try again.
+                    </p>
+                  </div>
+                ) : professor.positions.length === 0 ? (
+                  <div className="bg-white rounded-3xl p-10 text-center border border-slate-200/80 shadow-2xs space-y-3">
+                    <p className="text-slate-500 font-medium text-sm">No open positions currently available.</p>
+                  </div>
+                ) : (
+                  professor.positions.map((pos) => {
+                    const posMatch = studentProfile ? computeMatch(studentProfile, pos) : null
+                    return (
+                    <div
+                      key={pos.id}
+                      className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-2xs space-y-5 hover:border-blue-300 transition-all"
+                    >
+                      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
+                        <div>
+                          <div className="flex flex-wrap items-center gap-2 mb-1.5">
+                            <span className="px-2.5 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200 text-xs font-bold">
+                              {pos.degreeType.replace('_', ' ')}
+                            </span>
+                            <span className="px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-bold">
+                              {FUNDING_LABELS[pos.fundingType] || pos.fundingType}
+                            </span>
+                            {posMatch && <MatchChip score={posMatch.score} />}
+                          </div>
+                          <h4 className="text-lg font-bold text-slate-900 font-display">{pos.title}</h4>
+                          <p className="text-xs text-slate-500 mt-0.5">
+                            Department of {pos.department} • {pos.university}
+                          </p>
+                        </div>
+
+                        <Button
+                          onClick={() => navigate(`/apply/${pos.id}`)}
+                          className="flex items-center gap-1.5 shrink-0 shadow-xs"
+                        >
+                          <span>Apply Now</span>
+                          <ArrowUpRight size={15} />
+                        </Button>
+                      </div>
+
+                      <p className="text-slate-600 text-sm leading-relaxed whitespace-pre-line">
+                        {pos.description}
+                      </p>
+
+                      {posMatch?.explanation && (
+                        <div className="p-3 rounded-xl bg-blue-50/60 border border-blue-200/70 text-xs text-blue-900 flex items-start gap-2">
+                          <Sparkles size={14} className="text-blue-600 shrink-0 mt-0.5" />
+                          <span>{posMatch.explanation}</span>
+                        </div>
+                      )}
+
+                      {/* Requirements Breakdown */}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2 border-t border-slate-100 text-xs">
+                        <div>
+                          <span className="font-semibold text-slate-700 block mb-1">Required Skills:</span>
+                          <div className="flex flex-wrap gap-1">
+                            {pos.requiredSkills.map((s) => (
+                              <span key={s} className="px-2 py-0.5 rounded-md bg-slate-100 text-slate-700 font-medium">
+                                {s}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+
+                        <div>
+                          <span className="font-semibold text-slate-700 block mb-1">Preferred Background:</span>
+                          <div className="flex flex-wrap gap-1">
+                            {pos.preferredSkills.map((s) => (
+                              <span key={s} className="px-2 py-0.5 rounded-md bg-slate-50 border border-slate-200 text-slate-600 font-medium">
+                                {s}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Stipend, Minimum GPA & Deadline Meta */}
+                      <div className="flex flex-wrap items-center gap-4 pt-3 border-t border-slate-100 text-xs text-slate-500 font-medium">
+                        {pos.stipend && (
+                          <div className="flex items-center gap-1 text-slate-700">
+                            <DollarSign size={13} className="text-emerald-600" />
+                            <span>Stipend: <strong className="text-slate-900">{pos.stipend}</strong></span>
+                          </div>
+                        )}
+                        {pos.minimumGPA > 0 && (
+                          <div className="flex items-center gap-1">
+                            <GraduationCap size={13} className="text-blue-600" />
+                            <span>Min GPA: <strong className="text-slate-900">{pos.minimumGPA} / {pos.gpaScale || 4.0}</strong></span>
+                          </div>
+                        )}
+                        {pos.applicationDeadline && (
+                          <div className="flex items-center gap-1">
+                            <Calendar size={13} className="text-blue-600" />
+                            <span>Deadline: <strong className="text-slate-900">{formatDate(pos.applicationDeadline)}</strong></span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )})
+                )}
               </div>
             )}
 
@@ -578,20 +850,24 @@ export default function ProfessorProfilePage() {
             {activeTab === 'publications' && (
               <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-2xs space-y-4">
                 <h3 className="font-display text-lg font-bold text-slate-900 mb-2">Featured Publications</h3>
-                <div className="space-y-3.5">
-                  {professor.publications.map((pub) => (
-                    <div
-                      key={pub.id}
-                      className="p-4 rounded-2xl bg-slate-50/70 border border-slate-200/80 space-y-1.5"
-                    >
-                      <h5 className="font-bold text-slate-900 text-sm leading-snug">{pub.title}</h5>
-                      <p className="text-xs text-slate-500">
-                        {pub.journal || pub.conference} ({pub.year}) • Authors: {pub.authors.join(', ')}
-                      </p>
-                      {pub.doi && <p className="text-[11px] text-blue-600 font-mono">DOI: {pub.doi}</p>}
-                    </div>
-                  ))}
-                </div>
+                {professor.publications.length === 0 ? (
+                  <p className="text-xs text-slate-400 italic">No publications listed yet.</p>
+                ) : (
+                  <div className="space-y-3.5">
+                    {professor.publications.map((pub) => (
+                      <div
+                        key={pub.id}
+                        className="p-4 rounded-2xl bg-slate-50/70 border border-slate-200/80 space-y-1.5"
+                      >
+                        <h5 className="font-bold text-slate-900 text-sm leading-snug">{pub.title}</h5>
+                        <p className="text-xs text-slate-500">
+                          {pub.journal || pub.conference} ({pub.year}) • Authors: {pub.authors.join(', ')}
+                        </p>
+                        {pub.doi && <p className="text-[11px] text-blue-600 font-mono">DOI: {pub.doi}</p>}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
 
@@ -600,27 +876,33 @@ export default function ProfessorProfilePage() {
               <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-2xs space-y-6">
                 <div>
                   <h3 className="font-display text-lg font-bold text-slate-900">{professor.labName || 'Research Group'}</h3>
-                  <p className="text-sm text-slate-600 mt-1">{professor.labDescription}</p>
+                  <p className="text-sm text-slate-600 mt-1">
+                    {professor.labDescription || 'No laboratory description provided yet.'}
+                  </p>
                 </div>
 
                 <div>
                   <h4 className="text-xs font-semibold text-slate-700 uppercase tracking-wide mb-3">
                     Active Lab Members
                   </h4>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    {(professor.labMembers || []).map((member) => (
-                      <div
-                        key={member.id}
-                        className="p-3 rounded-2xl border border-slate-200/80 bg-slate-50/60 flex items-center gap-3"
-                      >
-                        <Avatar name={member.name} size="sm" />
-                        <div>
-                          <p className="text-xs font-bold text-slate-900">{member.name}</p>
-                          <p className="text-[11px] text-slate-500">{member.role}</p>
+                  {(professor.labMembers || []).length === 0 ? (
+                    <p className="text-xs text-slate-400 italic">No lab members listed yet.</p>
+                  ) : (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      {(professor.labMembers || []).map((member) => (
+                        <div
+                          key={member.id}
+                          className="p-3 rounded-2xl border border-slate-200/80 bg-slate-50/60 flex items-center gap-3"
+                        >
+                          <Avatar name={member.name} size="sm" />
+                          <div>
+                            <p className="text-xs font-bold text-slate-900">{member.name}</p>
+                            <p className="text-[11px] text-slate-500">{member.role}</p>
+                          </div>
                         </div>
-                      </div>
-                    ))}
-                  </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -680,12 +962,14 @@ export default function ProfessorProfilePage() {
                   <MapPin size={14} className="text-slate-400 shrink-0" />
                   <span>{professor.university}, {professor.country}</span>
                 </div>
-                <div className="flex items-center gap-2.5 text-slate-600">
-                  <Mail size={14} className="text-slate-400 shrink-0" />
-                  <a href={`mailto:${professor.email}`} className="text-blue-600 hover:underline">
-                    {professor.email}
-                  </a>
-                </div>
+                {professor.email && (
+                  <div className="flex items-center gap-2.5 text-slate-600">
+                    <Mail size={14} className="text-slate-400 shrink-0" />
+                    <a href={`mailto:${professor.email}`} className="text-blue-600 hover:underline">
+                      {professor.email}
+                    </a>
+                  </div>
+                )}
                 <div className="flex items-center gap-2.5 text-slate-600">
                   <Briefcase size={14} className="text-slate-400 shrink-0" />
                   <span>{professor.positions.length} Active Position{professor.positions.length !== 1 ? 's' : ''}</span>

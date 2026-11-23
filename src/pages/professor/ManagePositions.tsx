@@ -17,11 +17,54 @@ import {
 } from 'lucide-react'
 import { useAuth } from '@/context/AuthContext'
 import { db } from '@/lib/firebase'
+import { stripLegacyProfessorEmailIfPresent } from '@/lib/messaging'
 import type { Position, DegreeType, FundingType } from '@/types/position.types'
 import type { ProfessorProfile } from '@/types/user.types'
 import { Button } from '@/components/common/Button'
 import { TagInput } from '@/components/common/TagInput'
 import { RESEARCH_AREAS, FUNDING_LABELS, formatDate } from '@/utils/helpers'
+
+const ALLOWED_POSITION_KEYS = new Set([
+  'id',
+  'professorId',
+  'professorName',
+  'professorTitle',
+  'professorPhotoURL',
+  'university',
+  'department',
+  'country',
+  'title',
+  'degreeType',
+  'description',
+  'researchArea',
+  'researchTopics',
+  'requiredSkills',
+  'preferredSkills',
+  'minimumGPA',
+  'gpaScale',
+  'languageRequirements',
+  'otherRequirements',
+  'fundingType',
+  'fundingDetails',
+  'stipend',
+  'applicationDeadline',
+  'startDate',
+  'isOpen',
+  'createdAt',
+  'updatedAt',
+])
+
+function sanitizePositionPayload(pos: Position): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(pos).filter(([key, val]) => ALLOWED_POSITION_KEYS.has(key) && val !== undefined)
+  )
+}
+
+function getTodayIsoDate(): string {
+  const d = new Date()
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
 
 export default function ManagePositions() {
   const { user } = useAuth()
@@ -53,8 +96,6 @@ export default function ManagePositions() {
   const [applicationDeadline, setApplicationDeadline] = useState('')
   const [startDate, setStartDate] = useState('Spring 2027')
 
-  const [verificationStatus, setVerificationStatus] = useState<string>('pending')
-
   useEffect(() => {
     let isMounted = true
 
@@ -65,7 +106,7 @@ export default function ManagePositions() {
       }
 
       try {
-        const [profSnap, posSnap, appSnap] = await Promise.all([
+        const [profRes, posRes, appRes] = await Promise.allSettled([
           getDoc(doc(db, 'professors', user.uid)),
           getDocs(query(collection(db, 'positions'), where('professorId', '==', user.uid))),
           getDocs(query(collection(db, 'applications'), where('professorId', '==', user.uid))),
@@ -73,31 +114,37 @@ export default function ManagePositions() {
 
         if (!isMounted) return
 
-        if (profSnap.exists()) {
-          const profData = profSnap.data() as ProfessorProfile
+        if (profRes.status === 'fulfilled' && profRes.value.exists()) {
+          const rawProf = profRes.value.data() as Record<string, unknown>
+          stripLegacyProfessorEmailIfPresent(user.uid, rawProf)
+          const profData = rawProf as unknown as ProfessorProfile
           setProfessorProfile(profData)
-          setVerificationStatus(profData.verificationStatus || 'pending')
-        } else {
-          setVerificationStatus('pending')
         }
 
-        const loadedPositions: Position[] = posSnap.docs
-          .map((d) => ({
-            ...(d.data() as Position),
-            id: d.id,
-          }))
-          .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''))
-        setPositions(loadedPositions)
+        if (posRes.status === 'fulfilled') {
+          const loadedPositions: Position[] = posRes.value.docs
+            .map((d) => ({
+              ...(d.data() as Position),
+              id: d.id,
+            }))
+            .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''))
+          setPositions(loadedPositions)
+          setErrorMsg(null)
+        } else {
+          console.error('Failed to load professor positions from Firestore:', posRes.reason)
+          setErrorMsg('Failed to load your research opportunities from the server. Please refresh and try again.')
+        }
 
-        const counts: Record<string, number> = {}
-        appSnap.docs.forEach((d) => {
-          const posId = (d.data() as { positionId?: string }).positionId
-          if (posId) {
-            counts[posId] = (counts[posId] || 0) + 1
-          }
-        })
-        setApplicantCounts(counts)
-        setErrorMsg(null)
+        if (appRes.status === 'fulfilled') {
+          const counts: Record<string, number> = {}
+          appRes.value.docs.forEach((d) => {
+            const posId = (d.data() as { positionId?: string }).positionId
+            if (posId) {
+              counts[posId] = (counts[posId] || 0) + 1
+            }
+          })
+          setApplicantCounts(counts)
+        }
       } catch (err) {
         console.error('Failed to load professor positions from Firestore:', err)
         if (isMounted) {
@@ -136,12 +183,16 @@ export default function ManagePositions() {
     setEditingPositionId(pos.id)
     setTitle(pos.title)
     setDegreeType(pos.degreeType)
-    setResearchArea(pos.researchArea)
+    setResearchArea(pos.researchArea || 'Computer Vision')
     setDescription(pos.description)
     setResearchTopics(pos.researchTopics || [])
     setRequiredSkills(pos.requiredSkills || [])
     setPreferredSkills(pos.preferredSkills || [])
-    setMinimumGPA(String(pos.minimumGPA || 3.5))
+    setMinimumGPA(
+      typeof pos.minimumGPA === 'number' && !Number.isNaN(pos.minimumGPA)
+        ? String(pos.minimumGPA)
+        : '3.5'
+    )
     setFundingType(pos.fundingType)
     setStipend(pos.stipend || '')
     setApplicationDeadline(pos.applicationDeadline || '')
@@ -152,7 +203,48 @@ export default function ManagePositions() {
 
   const handleSavePosition = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!user || !title.trim() || !description.trim()) return
+    if (!user) return
+
+    const trimmedTitle = title.trim()
+    const trimmedDesc = description.trim()
+    if (!trimmedTitle) {
+      setErrorMsg('Please enter a position title.')
+      return
+    }
+    if (trimmedTitle.length > 200) {
+      setErrorMsg('Position title must be 200 characters or fewer.')
+      return
+    }
+    if (!trimmedDesc) {
+      setErrorMsg('Please enter a detailed opportunity description.')
+      return
+    }
+
+    let resolvedMinGpa = 0
+    if (minimumGPA.trim() !== '') {
+      const parsedGpa = Number(minimumGPA)
+      if (Number.isNaN(parsedGpa) || parsedGpa < 0 || parsedGpa > 4.0) {
+        setErrorMsg('Minimum GPA must be a number between 0.0 and 4.0.')
+        return
+      }
+      resolvedMinGpa = Math.round(parsedGpa * 100) / 100
+    }
+
+    const trimmedDeadline = applicationDeadline.trim()
+    if (trimmedDeadline) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmedDeadline) || Number.isNaN(Date.parse(trimmedDeadline))) {
+        setErrorMsg('Please enter a valid application deadline date.')
+        return
+      }
+      const existingPos = editingPositionId
+        ? positions.find((p) => p.id === editingPositionId)
+        : undefined
+      const deadlineChanged = !existingPos || existingPos.applicationDeadline !== trimmedDeadline
+      if (deadlineChanged && trimmedDeadline < getTodayIsoDate()) {
+        setErrorMsg('Application deadline cannot be set to a date in the past.')
+        return
+      }
+    }
 
     setSaving(true)
     setErrorMsg(null)
@@ -162,74 +254,93 @@ export default function ManagePositions() {
       if (editingPositionId) {
         const existingPos = positions.find((p) => p.id === editingPositionId)
         if (!existingPos || existingPos.professorId !== user.uid) {
+          setErrorMsg('You can only edit your own research opportunities.')
           setSaving(false)
           return
         }
+        const resolvedPhoto =
+          professorProfile?.photoURL || existingPos.professorPhotoURL || user.photoURL || undefined
         const updatedPos: Position = {
           ...existingPos,
-          title: title.trim(),
+          id: editingPositionId,
+          professorId: user.uid,
+          professorName:
+            professorProfile?.fullName || existingPos.professorName || user.displayName || 'Faculty Member',
+          professorTitle:
+            professorProfile?.academicTitle || existingPos.professorTitle || 'Faculty',
+          ...(resolvedPhoto ? { professorPhotoURL: resolvedPhoto } : {}),
+          university: professorProfile?.university || existingPos.university || '',
+          department: professorProfile?.department || existingPos.department || '',
+          country: professorProfile?.country || existingPos.country || '',
+          title: trimmedTitle,
           degreeType,
           researchArea,
-          description: description.trim(),
+          description: trimmedDesc,
           researchTopics: researchTopics.length ? researchTopics : [researchArea],
           requiredSkills,
           preferredSkills,
-          minimumGPA: parseFloat(minimumGPA) || 3.0,
+          minimumGPA: resolvedMinGpa,
+          gpaScale: existingPos.gpaScale || 4.0,
+          languageRequirements: Array.isArray(existingPos.languageRequirements)
+            ? existingPos.languageRequirements
+            : [],
+          otherRequirements: existingPos.otherRequirements || '',
           fundingType,
           stipend: stipend.trim(),
-          applicationDeadline,
+          applicationDeadline: trimmedDeadline,
           startDate: startDate.trim(),
           updatedAt: now,
         }
 
-        await setDoc(doc(db, 'positions', editingPositionId), updatedPos, { merge: true })
+        await setDoc(doc(db, 'positions', editingPositionId), sanitizePositionPayload(updatedPos))
         setPositions((prev) => prev.map((p) => (p.id === editingPositionId ? updatedPos : p)))
         setSuccessMsg('Research position updated successfully!')
       } else {
-        const isVerified = verificationStatus === 'verified'
         const newId = `pos-${Date.now()}`
+        const resolvedPhoto = professorProfile?.photoURL || user.photoURL || undefined
         const newPos: Position = {
           id: newId,
           professorId: user.uid,
           professorName: professorProfile?.fullName || user.displayName || 'Faculty Member',
           professorTitle: professorProfile?.academicTitle || 'Faculty',
+          ...(resolvedPhoto ? { professorPhotoURL: resolvedPhoto } : {}),
           university: professorProfile?.university || '',
           department: professorProfile?.department || '',
           country: professorProfile?.country || '',
-          title: title.trim(),
+          title: trimmedTitle,
           degreeType,
           researchArea,
-          description: description.trim(),
+          description: trimmedDesc,
           researchTopics: researchTopics.length ? researchTopics : [researchArea],
           requiredSkills,
           preferredSkills,
-          minimumGPA: parseFloat(minimumGPA) || 3.0,
+          minimumGPA: resolvedMinGpa,
           gpaScale: 4.0,
           languageRequirements: [],
           otherRequirements: '',
           fundingType,
           stipend: stipend.trim(),
-          applicationDeadline: applicationDeadline || '',
+          applicationDeadline: trimmedDeadline,
           startDate: startDate.trim() || 'Spring 2027',
-          isOpen: isVerified,
+          isOpen: true,
           createdAt: now,
           updatedAt: now,
         }
 
-        await setDoc(doc(db, 'positions', newId), newPos)
+        await setDoc(doc(db, 'positions', newId), sanitizePositionPayload(newPos))
         setPositions((prev) => [newPos, ...prev])
-        setSuccessMsg(
-          isVerified
-            ? 'New research position published!'
-            : 'Opportunity saved as draft (Unpublished). Faculty verification required to publish.'
-        )
+        setSuccessMsg('New research position published!')
       }
 
       setIsFormOpen(false)
+      setEditingPositionId(null)
       setTimeout(() => setSuccessMsg(''), 4000)
     } catch (err) {
       console.error('Failed to save position to Firestore:', err)
-      setErrorMsg('Failed to save research opportunity. Please check your connection and try again.')
+      const code = (err as { code?: string })?.code
+      setErrorMsg(
+        `Failed to save research opportunity${code ? ` (${code})` : ''}. Please check your connection and try again.`
+      )
     } finally {
       setSaving(false)
     }
@@ -241,12 +352,6 @@ export default function ManagePositions() {
     if (!target || target.professorId !== user.uid) return
 
     const nextOpen = !target.isOpen
-    if (nextOpen && verificationStatus !== 'verified') {
-      setSuccessMsg('Faculty verification required to open opportunities publicly.')
-      setTimeout(() => setSuccessMsg(''), 4000)
-      return
-    }
-
     const now = new Date().toISOString()
     try {
       await updateDoc(doc(db, 'positions', id), {
@@ -257,9 +362,12 @@ export default function ManagePositions() {
         prev.map((p) => (p.id === id ? { ...p, isOpen: nextOpen, updatedAt: now } : p))
       )
       setErrorMsg(null)
+      setSuccessMsg(nextOpen ? 'Research opportunity reopened!' : 'Research opportunity closed.')
+      setTimeout(() => setSuccessMsg(''), 4000)
     } catch (err) {
       console.error('Failed to toggle position status in Firestore:', err)
-      setErrorMsg('Failed to update position status. Please try again.')
+      const code = (err as { code?: string })?.code
+      setErrorMsg(`Failed to update position status${code ? ` (${code})` : ''}. Please try again.`)
     }
   }
 
@@ -267,14 +375,24 @@ export default function ManagePositions() {
     if (!user) return
     const target = positions.find((p) => p.id === id)
     if (!target || target.professorId !== user.uid) return
+    if (!window.confirm(`Are you sure you want to delete "${target.title}"? This action cannot be undone.`)) {
+      return
+    }
 
     try {
       await deleteDoc(doc(db, 'positions', id))
       setPositions((prev) => prev.filter((p) => p.id !== id))
+      if (editingPositionId === id) {
+        setIsFormOpen(false)
+        setEditingPositionId(null)
+      }
       setErrorMsg(null)
+      setSuccessMsg('Research opportunity deleted.')
+      setTimeout(() => setSuccessMsg(''), 4000)
     } catch (err) {
       console.error('Failed to delete position from Firestore:', err)
-      setErrorMsg('Failed to delete research opportunity. Please try again.')
+      const code = (err as { code?: string })?.code
+      setErrorMsg(`Failed to delete research opportunity${code ? ` (${code})` : ''}. Please try again.`)
     }
   }
 
@@ -340,22 +458,6 @@ export default function ManagePositions() {
           <div className="bg-rose-50 border border-rose-200 rounded-2xl p-4 text-xs font-medium text-rose-700 flex items-center gap-2.5">
             <AlertCircle size={16} className="text-rose-600 shrink-0" />
             <span>{errorMsg}</span>
-          </div>
-        )}
-
-        {/* Verification Alert Banner if not verified */}
-        {verificationStatus !== 'verified' && (
-          <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 shadow-xs flex items-start gap-3 animate-fade-in">
-            <AlertCircle size={20} className="text-amber-600 shrink-0 mt-0.5" />
-            <div className="space-y-0.5">
-              <h4 className="text-xs font-bold text-amber-900">
-                Institutional Affiliation Verification Required
-              </h4>
-              <p className="text-xs text-amber-800">
-                Your faculty affiliation status is currently <strong className="uppercase underline font-bold">{verificationStatus}</strong>.
-                You may draft research positions, but opportunities cannot be published publicly to accept student applications until an administrator confirms your credentials.
-              </p>
-            </div>
           </div>
         )}
 
@@ -428,6 +530,9 @@ export default function ManagePositions() {
                     className="w-full bg-white border border-slate-200 rounded-xl px-3.5 py-2.5 text-sm text-slate-900 focus:border-blue-600 focus:ring-2 focus:ring-blue-100 outline-none transition-all"
                     id="position-area"
                   >
+                    {researchArea && !RESEARCH_AREAS.includes(researchArea) && (
+                      <option value={researchArea}>{researchArea}</option>
+                    )}
                     {RESEARCH_AREAS.map((a) => (
                       <option key={a} value={a}>{a}</option>
                     ))}
@@ -504,6 +609,23 @@ export default function ManagePositions() {
                     tags={preferredSkills}
                     onChange={(tags) => setPreferredSkills(tags)}
                     placeholder="e.g. Medical Imaging, CVPR papers, C++"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1.5 uppercase tracking-wide">
+                    Minimum GPA (4.0 Scale)
+                  </label>
+                  <input
+                    type="number"
+                    step="0.1"
+                    min="0"
+                    max="4.0"
+                    value={minimumGPA}
+                    onChange={(e) => setMinimumGPA(e.target.value)}
+                    placeholder="e.g. 3.5 (or 0 for no minimum)"
+                    className="w-full bg-white border border-slate-200 rounded-xl px-3.5 py-2.5 text-sm text-slate-900 focus:border-blue-600 focus:ring-2 focus:ring-blue-100 outline-none transition-all"
+                    id="position-min-gpa"
                   />
                 </div>
 

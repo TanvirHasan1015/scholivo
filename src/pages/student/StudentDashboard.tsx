@@ -1,12 +1,23 @@
 import { useState, useEffect } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { collection, doc, getDoc, getDocs, query, where, limit } from 'firebase/firestore'
+import { collection, doc, getDoc, getDocs, query, where } from 'firebase/firestore'
 import { 
   User, BookOpen, Search, Heart, FileText, TrendingUp, 
   ChevronRight, Star, GraduationCap, CheckCircle2, ArrowUpRight,
-  Sparkles, ShieldCheck, MapPin
+  Sparkles, MapPin, AlertCircle, DollarSign
 } from 'lucide-react'
 import { db } from '@/lib/firebase'
+import {
+  buildDirectoryEntryFromStudent,
+  fetchPublicProfessorsSafely,
+  loadSplitStudentProfile,
+  syncUserDirectoryEntry,
+} from '@/lib/messaging'
+import {
+  PROFESSOR_FUNDING_STATUS_LABELS,
+  getFundingStatusBadgeStyle,
+  normalizeProfessorFundingInfo,
+} from '@/lib/professorFunding'
 import { useAuth } from '@/context/AuthContext'
 import type { StudentProfile, ProfessorProfile } from '@/types/user.types'
 import type { Position } from '@/types/position.types'
@@ -20,6 +31,8 @@ import { computeMatch } from '@/lib/matching'
 type ProfessorWithPositions = ProfessorProfile & {
   positions: Position[]
   matchScore?: number
+  matchExplanation?: string
+  positionsError?: 'permission_denied' | 'network_error' | null
 }
 
 interface SavedProfessorItem {
@@ -39,7 +52,6 @@ interface SavedProfessorItem {
 const STATUS_BADGE_STYLES: Record<string, string> = {
   submitted: 'bg-blue-50 text-blue-700 border-blue-200',
   under_review: 'bg-amber-50 text-amber-700 border-amber-200',
-  shortlisted: 'bg-emerald-50 text-emerald-700 border-emerald-200',
   interview: 'bg-purple-50 text-purple-700 border-purple-200',
   accepted: 'bg-teal-50 text-teal-700 border-teal-200',
   rejected: 'bg-rose-50 text-rose-700 border-rose-200',
@@ -72,8 +84,6 @@ function createInitialStudentProfile(uid = '', email = '', displayName = '', pho
     technicalSkills: [],
     researchTools: [],
     languageScores: [],
-    verificationStatus: 'pending',
-    accountStatus: 'active',
     profileCompleteness: 0,
     createdAt: now,
     updatedAt: now,
@@ -92,6 +102,7 @@ export default function StudentDashboard() {
   )
   const [applications, setApplications] = useState<Application[]>([])
   const [recommendedProfessors, setRecommendedProfessors] = useState<ProfessorWithPositions[]>([])
+  const [recommendationsError, setRecommendationsError] = useState<'permission_denied' | 'network_error' | null>(null)
   const [savedProfessors, setSavedProfessors] = useState<SavedProfessorItem[]>([])
   const [loading, setLoading] = useState(true)
 
@@ -105,10 +116,10 @@ export default function StudentDashboard() {
       }
 
       try {
-        const [studentSnap, appsSnap, profsSnap] = await Promise.all([
-          getDoc(doc(db, 'students', user.uid)),
+        const [studentRes, appsRes, profsRes] = await Promise.allSettled([
+          loadSplitStudentProfile(user.uid),
           getDocs(query(collection(db, 'applications'), where('studentId', '==', user.uid))),
-          getDocs(query(collection(db, 'professors'), where('verificationStatus', '==', 'verified'), limit(12))),
+          fetchPublicProfessorsSafely(12),
         ])
 
         if (!isMounted) return
@@ -119,8 +130,8 @@ export default function StudentDashboard() {
           user.displayName || '',
           user.photoURL || undefined
         )
-        if (studentSnap.exists()) {
-          const data = studentSnap.data() as Partial<StudentProfile>
+        if (studentRes.status === 'fulfilled' && studentRes.value.exists) {
+          const data = studentRes.value.data
           const merged: StudentProfile = {
             ...loadedProfile,
             ...data,
@@ -140,41 +151,90 @@ export default function StudentDashboard() {
             ...merged,
             profileCompleteness: calculateProfileCompleteness(merged),
           }
+          syncUserDirectoryEntry(buildDirectoryEntryFromStudent(loadedProfile)).catch(() => {
+            // Non-blocking directory backfill
+          })
         }
         setProfile(loadedProfile)
 
-        const loadedApps: Application[] = appsSnap.docs
-          .map((d) => ({
-            ...(d.data() as Application),
-            id: d.id,
-          }))
-          .sort((a, b) => (b.submittedAt || '').localeCompare(a.submittedAt || ''))
-        setApplications(loadedApps)
+        if (appsRes.status === 'fulfilled') {
+          const loadedApps: Application[] = appsRes.value.docs
+            .map((d) => ({
+              ...(d.data() as Application),
+              id: d.id,
+            }))
+            .sort((a, b) => (b.submittedAt || '').localeCompare(a.submittedAt || ''))
+          setApplications(loadedApps)
+        }
 
+        let hasPermissionDenied = false
+        let hasNetworkError = false
+
+        if (profsRes.status === 'rejected') {
+          const errObj = profsRes.reason as { code?: string; message?: string } | null
+          const msg = `${errObj?.code || ''} ${errObj?.message || ''}`.toLowerCase()
+          if (msg.includes('permission-denied') || msg.includes('permission_denied') || msg.includes('missing or insufficient permissions')) {
+            hasPermissionDenied = true
+          } else {
+            hasNetworkError = true
+          }
+        }
+
+        const profDocs = profsRes.status === 'fulfilled' ? profsRes.value : []
         const profResults: ProfessorWithPositions[] = []
-        for (const profDoc of profsSnap.docs) {
-          const profData = profDoc.data() as ProfessorProfile
-          const profUid = profData.uid || profDoc.id
-          const posSnap = await getDocs(
-            query(collection(db, 'positions'), where('professorId', '==', profUid), where('isOpen', '==', true))
-          )
-          const positions = posSnap.docs.map((d) => ({ ...(d.data() as Position), id: d.id }))
-          const bestScore = positions.length
-            ? Math.max(...positions.map((pos) => computeMatch(loadedProfile, pos).score))
-            : undefined
+        for (const profData of profDocs) {
+          const profUid = profData.uid
+          let positions: Position[] = []
+          let posErrType: 'permission_denied' | 'network_error' | null = null
+          try {
+            const posSnap = await getDocs(
+              query(collection(db, 'positions'), where('professorId', '==', profUid), where('isOpen', '==', true))
+            )
+            positions = posSnap.docs.map((d) => ({ ...(d.data() as Position), id: d.id }))
+          } catch (posErr: unknown) {
+            console.error('Failed to query positions for recommended professor:', profUid, posErr)
+            const errObj = posErr as { code?: string; message?: string } | null
+            const msg = `${errObj?.code || ''} ${errObj?.message || ''}`.toLowerCase()
+            if (msg.includes('permission-denied') || msg.includes('permission_denied') || msg.includes('missing or insufficient permissions')) {
+              posErrType = 'permission_denied'
+              hasPermissionDenied = true
+            } else {
+              posErrType = 'network_error'
+              hasNetworkError = true
+            }
+            positions = []
+          }
+          let bestScore: number | undefined
+          let bestExplanation: string | undefined
+          for (const pos of positions) {
+            const m = computeMatch(loadedProfile, pos)
+            if (bestScore === undefined || m.score > bestScore) {
+              bestScore = m.score
+              bestExplanation = m.explanation
+            }
+          }
           profResults.push({
             ...profData,
             uid: profUid,
             researchAreas: Array.isArray(profData.researchAreas) ? profData.researchAreas : [],
             researchInterests: Array.isArray(profData.researchInterests) ? profData.researchInterests : [],
+            fundingInfo: normalizeProfessorFundingInfo(profData.fundingInfo),
             positions,
             matchScore: bestScore,
+            matchExplanation: bestExplanation,
+            positionsError: posErrType,
           })
         }
 
-        profResults.sort((a, b) => (b.matchScore ?? 0) - (a.matchScore ?? 0))
+        profResults.sort((a, b) => {
+          const scoreA = a.matchScore ?? -1
+          const scoreB = b.matchScore ?? -1
+          if (scoreA !== scoreB) return scoreB - scoreA
+          return b.positions.length - a.positions.length
+        })
         if (isMounted) {
           setRecommendedProfessors(profResults.slice(0, 4))
+          setRecommendationsError(hasPermissionDenied ? 'permission_denied' : hasNetworkError ? 'network_error' : null)
         }
 
         const savedIds = loadedProfile.savedProfessorIds || []
@@ -197,30 +257,34 @@ export default function StudentDashboard() {
                 isRecruiting: Boolean(existing.isRecruiting),
               })
             } else {
-              const sSnap = await getDoc(doc(db, 'professors', savedId))
-              if (sSnap.exists()) {
-                const sData = sSnap.data() as ProfessorProfile
-                const sUid = sData.uid || sSnap.id
-                const sPosSnap = await getDocs(
-                  query(collection(db, 'positions'), where('professorId', '==', sUid), where('isOpen', '==', true))
-                )
-                const sPositions = sPosSnap.docs.map((d) => ({ ...(d.data() as Position), id: d.id }))
-                const sScore = sPositions.length
-                  ? Math.max(...sPositions.map((pos) => computeMatch(loadedProfile, pos).score))
-                  : 0
-                resolvedSaved.push({
-                  uid: sUid,
-                  username: sData.username || sUid,
-                  fullName: sData.fullName,
-                  academicTitle: sData.academicTitle,
-                  university: sData.university,
-                  country: sData.country,
-                  photoURL: sData.photoURL,
-                  researchAreas: Array.isArray(sData.researchAreas) ? sData.researchAreas : [],
-                  matchScore: sScore,
-                  openPositionsCount: sPositions.length,
-                  isRecruiting: Boolean(sData.isRecruiting),
-                })
+              try {
+                const sSnap = await getDoc(doc(db, 'professors', savedId))
+                if (sSnap.exists()) {
+                  const sData = sSnap.data() as ProfessorProfile
+                  const sUid = sData.uid || sSnap.id
+                  const sPosSnap = await getDocs(
+                    query(collection(db, 'positions'), where('professorId', '==', sUid), where('isOpen', '==', true))
+                  )
+                  const sPositions = sPosSnap.docs.map((d) => ({ ...(d.data() as Position), id: d.id }))
+                  const sScore = sPositions.length
+                    ? Math.max(...sPositions.map((pos) => computeMatch(loadedProfile, pos).score))
+                    : 0
+                  resolvedSaved.push({
+                    uid: sUid,
+                    username: sData.username || sUid,
+                    fullName: sData.fullName,
+                    academicTitle: sData.academicTitle,
+                    university: sData.university,
+                    country: sData.country,
+                    photoURL: sData.photoURL,
+                    researchAreas: Array.isArray(sData.researchAreas) ? sData.researchAreas : [],
+                    matchScore: sScore,
+                    openPositionsCount: sPositions.length,
+                    isRecruiting: Boolean(sData.isRecruiting),
+                  })
+                }
+              } catch {
+                // Skip if a saved legacy professor document is not yet migrated for public read
               }
             }
           }
@@ -245,15 +309,14 @@ export default function StudentDashboard() {
 
   const completenessItems = [
     { label: 'Basic & Contact Information', done: !!(profile?.fullName && profile?.email) },
-    { label: 'Academic Background & GPA', done: !!profile?.university },
+    { label: 'Academic Background & GPA', done: !!(profile?.university && profile?.gpa > 0) },
     { label: 'Research Interests & Topics', done: (profile?.researchInterests?.length ?? 0) > 0 },
     { label: 'Technical Skills & Frameworks', done: (profile?.programmingLanguages?.length ?? 0) > 0 },
     { label: 'Language / Exam Scores (IELTS/GRE)', done: (profile?.languageScores?.length ?? 0) > 0 },
-    { label: 'CV & Academic Transcript Uploaded', done: !!profile?.cvUrl },
+    { label: 'Curriculum Vitae (CV) Attached', done: !!profile?.cvUrl },
   ]
 
-  const shortlistedCount = applications.filter((a) => a.status === 'shortlisted').length
-  const verificationStatus = profile?.verificationStatus || 'pending'
+  const interviewCount = applications.filter((a) => a.status === 'interview').length
   const firstName = profile?.fullName
     ? profile.fullName.split(' ')[0]
     : user?.displayName
@@ -283,18 +346,6 @@ export default function StudentDashboard() {
                 <Sparkles size={13} className="text-blue-600" />
                 <span>Student Research Portal</span>
               </div>
-              <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold border ${
-                verificationStatus === 'verified'
-                  ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                  : verificationStatus === 'more_info_required'
-                  ? 'bg-purple-50 text-purple-700 border-purple-200'
-                  : verificationStatus === 'rejected'
-                  ? 'bg-rose-50 text-rose-700 border-rose-200'
-                  : 'bg-amber-50 text-amber-700 border-amber-200'
-              }`}>
-                <ShieldCheck size={13} className={verificationStatus === 'verified' ? 'text-emerald-600' : 'text-amber-600'} />
-                <span>Affiliation: {verificationStatus === 'verified' ? 'Verified Student' : verificationStatus.replace('_', ' ')}</span>
-              </span>
             </div>
             <h1 className="font-display text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight">
               Welcome back, {firstName} 👋
@@ -338,12 +389,12 @@ export default function StudentDashboard() {
           </div>
 
           <div className="bg-white rounded-2xl p-5 border border-slate-200/80 shadow-2xs flex items-center gap-4">
-            <div className="w-12 h-12 rounded-xl bg-emerald-50 border border-emerald-100 flex items-center justify-center text-emerald-600 shrink-0">
+            <div className="w-12 h-12 rounded-xl bg-purple-50 border border-purple-100 flex items-center justify-center text-purple-600 shrink-0">
               <TrendingUp size={22} />
             </div>
             <div>
-              <p className="text-2xl font-bold text-slate-900 font-display">{shortlistedCount}</p>
-              <p className="text-xs font-medium text-slate-500">Shortlisted Interviews</p>
+              <p className="text-2xl font-bold text-slate-900 font-display">{interviewCount}</p>
+              <p className="text-xs font-medium text-slate-500">Scheduled Interviews</p>
             </div>
           </div>
 
@@ -426,7 +477,7 @@ export default function StudentDashboard() {
                   <div className="text-center py-10 px-4 bg-slate-50 rounded-2xl border border-dashed border-slate-200">
                     <FileText size={36} className="mx-auto text-slate-400 mb-2 opacity-60" />
                     <p className="text-sm font-semibold text-slate-800">No applications submitted yet</p>
-                    <p className="text-xs text-slate-500 mt-1">Explore verified positions matching your research background</p>
+                    <p className="text-xs text-slate-500 mt-1">Explore open positions matching your research background</p>
                     <Button variant="secondary" size="sm" className="mt-4" onClick={() => navigate('/search')}>
                       Browse Faculty Openings
                     </Button>
@@ -459,12 +510,32 @@ export default function StudentDashboard() {
                 </Button>
               </div>
 
-              {recommendedProfessors.length === 0 ? (
+              {recommendationsError === 'permission_denied' ? (
+                <div className="text-center py-6 px-4 bg-amber-50 rounded-2xl border border-amber-200 text-amber-900 space-y-1">
+                  <div className="flex items-center justify-center gap-2 font-bold text-sm text-amber-800">
+                    <AlertCircle size={18} className="text-amber-600" />
+                    <span>Access Restricted</span>
+                  </div>
+                  <p className="text-xs text-amber-700">
+                    Faculty recommendation queries or position listings were restricted by Firestore permissions.
+                  </p>
+                </div>
+              ) : recommendationsError === 'network_error' ? (
+                <div className="text-center py-6 px-4 bg-red-50 rounded-2xl border border-red-200 text-red-900 space-y-1">
+                  <div className="flex items-center justify-center gap-2 font-bold text-sm text-red-800">
+                    <AlertCircle size={18} className="text-red-600" />
+                    <span>Network Error</span>
+                  </div>
+                  <p className="text-xs text-red-700">
+                    Unable to load recommendations due to a network connection issue.
+                  </p>
+                </div>
+              ) : recommendedProfessors.length === 0 ? (
                 <div className="text-center py-8 px-4 bg-slate-50 rounded-2xl border border-dashed border-slate-200">
                   <Star size={32} className="mx-auto text-slate-400 mb-2 opacity-60" />
                   <p className="text-sm font-semibold text-slate-800">No recommended professors available yet</p>
                   <p className="text-xs text-slate-500 mt-1">
-                    Verified faculty opportunities will appear here as professors publish openings.
+                    Faculty opportunities will appear here as professors publish openings.
                   </p>
                 </div>
               ) : (
@@ -496,6 +567,18 @@ export default function StudentDashboard() {
                           </div>
 
                           <div className="flex flex-wrap gap-1.5 my-3">
+                            {prof.fundingInfo?.fundingStatus && (
+                              <span
+                                className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full border ${getFundingStatusBadgeStyle(
+                                  prof.fundingInfo.fundingStatus
+                                )}`}
+                              >
+                                <DollarSign size={10} />
+                                <span>
+                                  {PROFESSOR_FUNDING_STATUS_LABELS[prof.fundingInfo.fundingStatus]}
+                                </span>
+                              </span>
+                            )}
                             {prof.researchAreas.slice(0, 2).map((area) => (
                               <span
                                 key={area}
@@ -505,10 +588,19 @@ export default function StudentDashboard() {
                               </span>
                             ))}
                           </div>
+                          {prof.matchExplanation && (
+                            <p className="text-[11px] text-slate-500 line-clamp-2 italic mb-2">
+                              "{prof.matchExplanation}"
+                            </p>
+                          )}
                         </div>
 
                         <div className="pt-3 border-t border-slate-200/60 flex items-center justify-between text-xs text-blue-600 font-semibold group-hover:text-blue-700">
-                          <span>View Lab & Openings</span>
+                          <span>
+                            {prof.positions.length > 0
+                              ? `${prof.positions.length} open position${prof.positions.length !== 1 ? 's' : ''}`
+                              : 'View Lab & Openings'}
+                          </span>
                           <ArrowUpRight size={14} className="group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
                         </div>
                       </div>
@@ -531,6 +623,9 @@ export default function StudentDashboard() {
                   <h3 className="font-bold text-slate-900 text-base truncate">{profile.fullName}</h3>
                   <p className="text-xs text-slate-500 truncate">{profile.degree} in {profile.major}</p>
                   <p className="text-xs font-semibold text-blue-600 mt-0.5">{profile.university}</p>
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    GPA: <strong className="text-slate-800">{profile.gpa > 0 ? `${profile.gpa} / ${profile.gpaScale || 4.0}` : 'Not set'}</strong>
+                  </p>
                 </div>
               </div>
 

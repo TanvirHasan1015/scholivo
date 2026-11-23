@@ -3,9 +3,10 @@ import { useNavigate } from 'react-router-dom'
 import { collection, getDocs, query, where } from 'firebase/firestore'
 import {
   ArrowLeft, FileText, GraduationCap, Calendar, Search,
-  ArrowUpRight, Clock, AlertCircle
+  ArrowUpRight, Clock, AlertCircle, Video
 } from 'lucide-react'
 import { db } from '@/lib/firebase'
+import { formatInterviewDateTime } from '@/lib/notifications'
 import { useAuth } from '@/context/AuthContext'
 import type { Application, ApplicationStatus } from '@/types/application.types'
 import { Button } from '@/components/common/Button'
@@ -15,7 +16,6 @@ import { STATUS_LABELS, formatDate } from '@/utils/helpers'
 const STATUS_BADGE_STYLES: Record<string, string> = {
   submitted: 'bg-blue-50 text-blue-700 border-blue-200',
   under_review: 'bg-amber-50 text-amber-700 border-amber-200',
-  shortlisted: 'bg-emerald-50 text-emerald-700 border-emerald-200',
   interview: 'bg-purple-50 text-purple-700 border-purple-200',
   accepted: 'bg-teal-50 text-teal-700 border-teal-200',
   rejected: 'bg-rose-50 text-rose-700 border-rose-200',
@@ -84,7 +84,6 @@ export default function StudentApplications() {
     { id: 'all', label: 'All Applications', count: applications.length },
     { id: 'submitted', label: 'Submitted', count: applications.filter((a) => a.status === 'submitted').length },
     { id: 'under_review', label: 'Under Review', count: applications.filter((a) => a.status === 'under_review').length },
-    { id: 'shortlisted', label: 'Shortlisted', count: applications.filter((a) => a.status === 'shortlisted').length },
     { id: 'interview', label: 'Interview', count: applications.filter((a) => a.status === 'interview').length },
     { id: 'accepted', label: 'Accepted', count: applications.filter((a) => a.status === 'accepted').length },
     { id: 'rejected', label: 'Rejected', count: applications.filter((a) => a.status === 'rejected').length },
@@ -183,7 +182,7 @@ export default function StudentApplications() {
             </div>
             <h2 className="text-lg font-bold text-slate-900 font-display">No applications submitted yet</h2>
             <p className="text-sm text-slate-500">
-              Explore verified faculty research opportunities and submit an application to track your admissions progress here.
+              Explore faculty research opportunities and submit an application to track your admissions progress here.
             </p>
             <Button onClick={() => navigate('/search')} className="mt-2">
               Browse Faculty Directory
@@ -250,6 +249,21 @@ export default function StudentApplications() {
                       </span>
                     </div>
                   </div>
+
+                  {app.interviewAt && (
+                    <div className="px-3.5 py-2.5 rounded-xl bg-purple-50/90 border border-purple-200 text-xs text-purple-900 flex flex-wrap items-center justify-between gap-2">
+                      <span className="inline-flex items-center gap-1.5 font-semibold">
+                        <Calendar size={13} className="text-purple-600 shrink-0" />
+                        <span>Interview Scheduled: {formatInterviewDateTime(app.interviewAt)}</span>
+                      </span>
+                      {app.interviewMeetingUrl && (
+                        <span className="inline-flex items-center gap-1 text-[11px] font-bold text-purple-700 bg-white px-2.5 py-0.5 rounded-full border border-purple-200">
+                          <Video size={11} />
+                          <span>Zoom Meeting Ready</span>
+                        </span>
+                      )}
+                    </div>
+                  )}
 
                   {latestEvent?.note && (
                     <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/70 text-xs text-slate-600 flex items-center justify-between gap-2">

@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { collection, doc, getDoc, getDocs, setDoc, query, where } from 'firebase/firestore'
-import { Heart, MapPin, Building, ArrowLeft, BookmarkCheck, Search, ArrowUpRight } from 'lucide-react'
+import { collection, doc, getDoc, getDocs, query, where } from 'firebase/firestore'
+import { Heart, MapPin, Building, ArrowLeft, BookmarkCheck, Search, ArrowUpRight, AlertCircle } from 'lucide-react'
 import { db } from '@/lib/firebase'
+import { loadSplitStudentProfile, saveStudentSavedProfessors } from '@/lib/messaging'
 import { useAuth } from '@/context/AuthContext'
 import type { StudentProfile, ProfessorProfile } from '@/types/user.types'
 import type { Position } from '@/types/position.types'
@@ -23,6 +24,7 @@ interface SavedProfessorItem {
   matchScore: number
   openPositionsCount: number
   isRecruiting: boolean
+  positionsError?: 'permission_denied' | 'network_error' | null
 }
 
 export default function SavedProfessors() {
@@ -30,6 +32,7 @@ export default function SavedProfessors() {
   const navigate = useNavigate()
   const [saved, setSaved] = useState<SavedProfessorItem[]>([])
   const [loading, setLoading] = useState(true)
+  const [savedError, setSavedError] = useState<'permission_denied' | 'network_error' | null>(null)
 
   useEffect(() => {
     let isMounted = true
@@ -44,14 +47,14 @@ export default function SavedProfessors() {
       }
 
       try {
-        const snap = await getDoc(doc(db, 'students', user.uid))
+        const loaded = await loadSplitStudentProfile(user.uid)
         if (!isMounted) return
-        if (!snap.exists()) {
+        if (!loaded.exists) {
           setSaved([])
           return
         }
 
-        const studentData = snap.data() as StudentProfile
+        const studentData = loaded.data as StudentProfile
         const savedIds = Array.isArray(studentData.savedProfessorIds)
           ? studentData.savedProfessorIds
           : []
@@ -76,6 +79,9 @@ export default function SavedProfessors() {
           languageScores: Array.isArray(studentData.languageScores) ? studentData.languageScores : [],
         }
 
+        let hasPermissionDenied = false
+        let hasNetworkError = false
+
         const resolved: SavedProfessorItem[] = []
         for (const profId of savedIds) {
           const profSnap = await getDoc(doc(db, 'professors', profId))
@@ -83,10 +89,27 @@ export default function SavedProfessors() {
           const prof = profSnap.data() as ProfessorProfile
           const profUid = prof.uid || profSnap.id
 
-          const posSnap = await getDocs(
-            query(collection(db, 'positions'), where('professorId', '==', profUid), where('isOpen', '==', true))
-          )
-          const positions = posSnap.docs.map((d) => ({ ...(d.data() as Position), id: d.id }))
+          let positions: Position[] = []
+          let posError: 'permission_denied' | 'network_error' | null = null
+
+          try {
+            const posSnap = await getDocs(
+              query(collection(db, 'positions'), where('professorId', '==', profUid), where('isOpen', '==', true))
+            )
+            positions = posSnap.docs.map((d) => ({ ...(d.data() as Position), id: d.id }))
+          } catch (posErr: unknown) {
+            console.error('Failed to query positions for saved professor:', profUid, posErr)
+            const errObj = posErr as { code?: string; message?: string } | null
+            const msg = `${errObj?.code || ''} ${errObj?.message || ''}`.toLowerCase()
+            if (msg.includes('permission-denied') || msg.includes('permission_denied') || msg.includes('missing or insufficient permissions')) {
+              posError = 'permission_denied'
+              hasPermissionDenied = true
+            } else {
+              posError = 'network_error'
+              hasNetworkError = true
+            }
+            positions = []
+          }
           const bestScore = positions.length
             ? Math.max(...positions.map((pos) => computeMatch(normalizedStudent, pos).score))
             : 0
@@ -103,15 +126,26 @@ export default function SavedProfessors() {
             matchScore: bestScore,
             openPositionsCount: positions.length,
             isRecruiting: Boolean(prof.isRecruiting),
+            positionsError: posError,
           })
         }
 
         if (isMounted) {
           setSaved(resolved)
+          setSavedError(hasPermissionDenied ? 'permission_denied' : hasNetworkError ? 'network_error' : null)
         }
-      } catch (err) {
+      } catch (err: unknown) {
         console.error('Failed to load saved professors from Firestore:', err)
-        if (isMounted) setSaved([])
+        const errObj = err as { code?: string; message?: string } | null
+        const msg = `${errObj?.code || ''} ${errObj?.message || ''}`.toLowerCase()
+        if (isMounted) {
+          setSaved([])
+          setSavedError(
+            msg.includes('permission-denied') || msg.includes('permission_denied') || msg.includes('missing or insufficient permissions')
+              ? 'permission_denied'
+              : 'network_error'
+          )
+        }
       } finally {
         if (isMounted) setLoading(false)
       }
@@ -128,13 +162,9 @@ export default function SavedProfessors() {
     setSaved(nextList)
     if (!user) return
     try {
-      await setDoc(
-        doc(db, 'students', user.uid),
-        {
-          savedProfessorIds: nextList.map((p) => p.uid),
-          updatedAt: new Date().toISOString(),
-        },
-        { merge: true }
+      await saveStudentSavedProfessors(
+        user.uid,
+        nextList.map((p) => p.uid)
       )
     } catch (err) {
       console.error('Failed to remove saved professor in Firestore:', err)
@@ -191,6 +221,30 @@ export default function SavedProfessors() {
             </Button>
           </div>
         </div>
+
+        {/* Informational Alerts for Permission or Network Issues */}
+        {!loading && savedError === 'permission_denied' && (
+          <div className="p-4 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+            <div>
+              <h4 className="text-sm font-bold">Access Restricted</h4>
+              <p className="text-xs text-amber-800 mt-0.5">
+                Some saved faculty records or positions could not be loaded due to Firestore security permissions.
+              </p>
+            </div>
+          </div>
+        )}
+        {!loading && savedError === 'network_error' && (
+          <div className="p-4 rounded-2xl bg-red-50 border border-red-200 text-red-900 flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
+            <div>
+              <h4 className="text-sm font-bold">Network Error</h4>
+              <p className="text-xs text-red-800 mt-0.5">
+                A network issue occurred while loading saved faculty.
+              </p>
+            </div>
+          </div>
+        )}
 
         {/* Empty State */}
         {saved.length === 0 ? (
@@ -249,6 +303,15 @@ export default function SavedProfessors() {
                       <MapPin size={13} className="text-slate-400 shrink-0" />
                       <span>{prof.country}</span>
                     </div>
+                    {prof.positionsError === 'permission_denied' ? (
+                      <div className="text-[11px] text-amber-600 font-medium">Positions restricted (permission denied)</div>
+                    ) : prof.positionsError === 'network_error' ? (
+                      <div className="text-[11px] text-rose-500 font-medium">Positions unavailable</div>
+                    ) : prof.openPositionsCount === 0 ? (
+                      <div className="text-[11px] text-slate-400 italic">No open positions</div>
+                    ) : (
+                      <div className="text-[11px] text-blue-600 font-medium">{prof.openPositionsCount} Open Position{prof.openPositionsCount !== 1 ? 's' : ''}</div>
+                    )}
                   </div>
 
                   <div className="flex flex-wrap gap-1.5 mb-5">

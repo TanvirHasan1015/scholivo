@@ -1,14 +1,25 @@
 import { useState, useEffect, useMemo } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { collection, doc, getDoc, getDocs, updateDoc, query, where } from 'firebase/firestore'
+import { collection, deleteField, doc, getDoc, getDocs, updateDoc, writeBatch, query, where } from 'firebase/firestore'
 import {
   Users, Briefcase, Plus, CheckCircle2, Clock,
-  Sparkles, Building,
+  Sparkles, Building, Calendar,
   GraduationCap, ArrowUpRight, ChevronRight, Filter,
-  Settings, Award, ShieldCheck, AlertCircle, FileText,
-  X, ExternalLink, BookOpen, Code
+  Settings, Award, FileText,
+  X, ExternalLink, BookOpen, Code, MessageSquare, Video
 } from 'lucide-react'
 import { db } from '@/lib/firebase'
+import {
+  formatInterviewDateTime,
+  toDateTimeLocalInputValue,
+  validateMeetingUrl,
+} from '@/lib/notifications'
+import {
+  buildDirectoryEntryFromProfessor,
+  fetchPublicStudentsForProfessorSafely,
+  stripLegacyProfessorEmailIfPresent,
+  syncUserDirectoryEntry,
+} from '@/lib/messaging'
 import { useAuth } from '@/context/AuthContext'
 import type { Position } from '@/types/position.types'
 import type { Application, ApplicationStatus } from '@/types/application.types'
@@ -25,7 +36,6 @@ type ProfessorWithPositions = ProfessorProfile & { positions: Position[] }
 const STATUS_PILL_STYLES: Record<string, string> = {
   submitted: 'bg-blue-50 text-blue-700 border-blue-200',
   under_review: 'bg-amber-50 text-amber-700 border-amber-200',
-  shortlisted: 'bg-emerald-50 text-emerald-700 border-emerald-200',
   interview: 'bg-purple-50 text-purple-700 border-purple-200',
   accepted: 'bg-teal-50 text-teal-700 border-teal-200',
   rejected: 'bg-rose-700/10 text-rose-700 border-rose-200',
@@ -54,9 +64,6 @@ function createInitialProfessorProfile(uid = '', email = '', displayName = '', p
     researchInterests: [],
     currentProjects: [],
     publications: [],
-    verificationStatus: 'pending',
-    verificationDocuments: [],
-    accountStatus: 'active',
     isRecruiting: true,
     recruitingStatus: 'actively_recruiting',
     createdAt: now,
@@ -78,7 +85,24 @@ export default function ProfessorDashboard() {
   const [loading, setLoading] = useState(true)
 
   const [selectedStatusFilter, setSelectedStatusFilter] = useState<string>('all')
+  const [showApplicantFilters, setShowApplicantFilters] = useState(false)
+  const [applicantFilters, setApplicantFilters] = useState({
+    major: '',
+    minGpa: '',
+    researchInterest: '',
+    technicalSkill: '',
+    languageExam: '',
+    hasResearchExperience: false,
+    hasPublications: false,
+  })
   const [isRecruiting, setIsRecruiting] = useState<boolean>(true)
+  const [interviewModalApp, setInterviewModalApp] = useState<Application | null>(null)
+  const [interviewDateTimeInput, setInterviewDateTimeInput] = useState('')
+  const [interviewMeetingUrlInput, setInterviewMeetingUrlInput] = useState('')
+  const [interviewInstructionsInput, setInterviewInstructionsInput] = useState('')
+  const [interviewModalError, setInterviewModalError] = useState<string | null>(null)
+  const [savingInterview, setSavingInterview] = useState(false)
+  const [statusUpdateError, setStatusUpdateError] = useState<string | null>(null)
 
   // Ensure only positions owned by the logged-in professor are selectable
   const currentProfessorId = user?.uid || profile?.uid || ''
@@ -102,16 +126,143 @@ export default function ProfessorDashboard() {
     return active[0] || ownedPositions[0] || null
   }, [ownedPositions, selectedPositionId])
 
+  // Lookup map of studentId -> public StudentProfile for qualification filtering & badges
+  const studentByUid = useMemo(() => {
+    const map = new Map<string, StudentProfile>()
+    for (const s of verifiedStudents) {
+      if (s && s.uid) {
+        map.set(s.uid, s)
+      }
+    }
+    return map
+  }, [verifiedStudents])
+
   // Opportunity-specific applicants (strictly isolated to selected position)
   const positionApplications = useMemo(() => {
     if (!selectedPosition) return []
     return applications.filter((a) => a.positionId === selectedPosition.id)
   }, [selectedPosition, applications])
 
+  const activeQualificationFilterCount = useMemo(() => {
+    let count = 0
+    if (applicantFilters.major.trim()) count++
+    if (applicantFilters.minGpa.trim()) count++
+    if (applicantFilters.researchInterest.trim()) count++
+    if (applicantFilters.technicalSkill.trim()) count++
+    if (applicantFilters.languageExam.trim()) count++
+    if (applicantFilters.hasResearchExperience) count++
+    if (applicantFilters.hasPublications) count++
+    return count
+  }, [applicantFilters])
+
+  const resetApplicantQualificationFilters = () => {
+    setApplicantFilters({
+      major: '',
+      minGpa: '',
+      researchInterest: '',
+      technicalSkill: '',
+      languageExam: '',
+      hasResearchExperience: false,
+      hasPublications: false,
+    })
+  }
+
   const filteredApplications = useMemo(() => {
-    if (selectedStatusFilter === 'all') return positionApplications
-    return positionApplications.filter((a) => a.status === selectedStatusFilter)
-  }, [selectedStatusFilter, positionApplications])
+    const norm = (v?: string) => (v || '').toLowerCase().trim()
+    const majorQ = norm(applicantFilters.major)
+    const interestQ = norm(applicantFilters.researchInterest)
+    const skillQ = norm(applicantFilters.technicalSkill)
+    const langQ = norm(applicantFilters.languageExam)
+    const parsedMinGpa =
+      applicantFilters.minGpa.trim() !== '' ? Number(applicantFilters.minGpa) : null
+    const minGpaThreshold =
+      parsedMinGpa !== null && !Number.isNaN(parsedMinGpa) && parsedMinGpa > 0
+        ? parsedMinGpa
+        : null
+
+    return positionApplications.filter((app) => {
+      if (selectedStatusFilter !== 'all' && app.status !== selectedStatusFilter) {
+        return false
+      }
+      const student = studentByUid.get(app.studentId)
+
+      // 1. Academic major / department / degree filter
+      if (majorQ) {
+        const majorFields = [
+          student?.major,
+          student?.department,
+          student?.degree,
+          student?.university,
+          app.university,
+        ]
+        const matchesMajor = majorFields.some((f) => norm(f).includes(majorQ))
+        if (!matchesMajor) return false
+      }
+
+      // 2. Minimum GPA filter (normalized to 4.0 scale using app.studentGpa)
+      if (minGpaThreshold !== null) {
+        const rawGpa = typeof app.studentGpa === 'number' ? app.studentGpa : 0
+        const rawScale =
+          typeof app.studentGpaScale === 'number' && app.studentGpaScale > 0
+            ? app.studentGpaScale
+            : 4.0
+        const normalizedGpa = rawGpa > 0 ? (rawGpa / rawScale) * 4.0 : 0
+        if (normalizedGpa < minGpaThreshold) return false
+      }
+
+      // 3. Research interests & areas filter
+      if (interestQ) {
+        const interests = [
+          ...(student?.researchInterests || []),
+          ...(student?.researchAreas || []),
+        ]
+        const matchesInterest = interests.some((item) => norm(item).includes(interestQ))
+        if (!matchesInterest) return false
+      }
+
+      // 4. Technical skills, programming languages, frameworks & tools filter
+      if (skillQ) {
+        const allSkills = [
+          ...(student?.programmingLanguages || []),
+          ...(student?.frameworks || []),
+          ...(student?.technicalSkills || []),
+          ...(student?.researchTools || []),
+        ]
+        const matchesSkill = allSkills.some((item) => norm(item).includes(skillQ))
+        if (!matchesSkill) return false
+      }
+
+      // 5. Language proficiency / standardized exam filter
+      if (langQ) {
+        const scores = student?.languageScores || []
+        if (langQ === 'any_score') {
+          if (scores.length === 0) return false
+        } else {
+          const matchesLang = scores.some(
+            (ls) =>
+              norm(ls.type).includes(langQ) ||
+              norm(ls.label).includes(langQ) ||
+              norm(ls.score).includes(langQ)
+          )
+          if (!matchesLang) return false
+        }
+      }
+
+      // 6. Research experience & publications checkboxes
+      if (applicantFilters.hasResearchExperience) {
+        if (!student?.researchExperience || student.researchExperience.length === 0) {
+          return false
+        }
+      }
+      if (applicantFilters.hasPublications) {
+        if (!student?.publications || student.publications.length === 0) {
+          return false
+        }
+      }
+
+      return true
+    })
+  }, [selectedStatusFilter, positionApplications, applicantFilters, studentByUid])
 
   // Opportunity-specific recommended non-applicants (recalculated whenever selectedPosition, applications, or verifiedStudents change)
   const recommendedCandidates: CandidateMatch[] = useMemo(() => {
@@ -126,10 +277,7 @@ export default function ProfessorDashboard() {
     const eligible = verifiedStudents.filter((student) => {
       if (!student || !student.uid) return false
       if (appliedStudentIds.has(student.uid)) return false
-      return (
-        student.verificationStatus === 'verified' &&
-        (student.accountStatus || 'active') === 'active'
-      )
+      return true
     })
 
     const scored: CandidateMatch[] = eligible.map((student) => ({
@@ -191,22 +339,24 @@ export default function ProfessorDashboard() {
       }
 
       try {
-        const [profSnap, posSnap, appSnap, studentsSnap] = await Promise.all([
+        const [profRes, posRes, appRes] = await Promise.allSettled([
           getDoc(doc(db, 'professors', user.uid)),
           getDocs(query(collection(db, 'positions'), where('professorId', '==', user.uid))),
           getDocs(query(collection(db, 'applications'), where('professorId', '==', user.uid))),
-          getDocs(query(collection(db, 'students'), where('verificationStatus', '==', 'verified'))),
         ])
 
         if (!isMounted) return
 
-        const posList: Position[] = posSnap.docs.map(
-          (d) => ({ ...(d.data() as Position), id: d.id })
-        )
+        const posList: Position[] =
+          posRes.status === 'fulfilled'
+            ? posRes.value.docs.map((d) => ({ ...(d.data() as Position), id: d.id }))
+            : []
         setPositions(posList)
 
-        if (profSnap.exists()) {
-          const profData = profSnap.data() as ProfessorProfile
+        if (profRes.status === 'fulfilled' && profRes.value.exists()) {
+          const rawProf = profRes.value.data() as Record<string, unknown>
+          stripLegacyProfessorEmailIfPresent(user.uid, rawProf)
+          const profData = rawProf as unknown as ProfessorProfile
           const mergedProf: ProfessorWithPositions = {
             ...createInitialProfessorProfile(
               user.uid,
@@ -220,7 +370,6 @@ export default function ProfessorDashboard() {
             researchInterests: Array.isArray(profData.researchInterests) ? profData.researchInterests : [],
             currentProjects: Array.isArray(profData.currentProjects) ? profData.currentProjects : [],
             publications: Array.isArray(profData.publications) ? profData.publications : [],
-            verificationStatus: profData.verificationStatus || 'pending',
             positions: posList,
           }
           setProfile(mergedProf)
@@ -229,32 +378,38 @@ export default function ProfessorDashboard() {
               ? profData.isRecruiting
               : (profData.recruitingStatus || 'actively_recruiting') === 'actively_recruiting'
           )
+          syncUserDirectoryEntry(buildDirectoryEntryFromProfessor(mergedProf)).catch(() => {
+            // Non-blocking directory backfill
+          })
         } else {
           setProfile((prev) => ({ ...prev, positions: posList }))
         }
 
-        const appList: Application[] = appSnap.docs.map(
-          (d) => ({ ...(d.data() as Application), id: d.id })
-        )
-        setApplications(appList)
+        let appStudentIds: string[] = []
+        if (appRes.status === 'fulfilled') {
+          const appList: Application[] = appRes.value.docs.map(
+            (d) => ({ ...(d.data() as Application), id: d.id })
+          )
+          setApplications(appList)
+          appStudentIds = appList.map((a) => a.studentId).filter(Boolean)
+        }
 
-        const studentList: StudentProfile[] = studentsSnap.docs.map((d) => {
-          const data = d.data() as StudentProfile
-          return {
-            ...data,
-            uid: data.uid || d.id,
-            researchInterests: Array.isArray(data.researchInterests) ? data.researchInterests : [],
-            researchAreas: Array.isArray(data.researchAreas) ? data.researchAreas : [],
-            researchExperience: Array.isArray(data.researchExperience) ? data.researchExperience : [],
-            projects: Array.isArray(data.projects) ? data.projects : [],
-            publications: Array.isArray(data.publications) ? data.publications : [],
-            programmingLanguages: Array.isArray(data.programmingLanguages) ? data.programmingLanguages : [],
-            frameworks: Array.isArray(data.frameworks) ? data.frameworks : [],
-            technicalSkills: Array.isArray(data.technicalSkills) ? data.technicalSkills : [],
-            researchTools: Array.isArray(data.researchTools) ? data.researchTools : [],
-            languageScores: Array.isArray(data.languageScores) ? data.languageScores : [],
-          }
-        })
+        const rawStudentList = await fetchPublicStudentsForProfessorSafely(appStudentIds, 100)
+        if (!isMounted) return
+        const studentList: StudentProfile[] = rawStudentList.map((data) => ({
+          ...data,
+          uid: data.uid,
+          researchInterests: Array.isArray(data.researchInterests) ? data.researchInterests : [],
+          researchAreas: Array.isArray(data.researchAreas) ? data.researchAreas : [],
+          researchExperience: Array.isArray(data.researchExperience) ? data.researchExperience : [],
+          projects: Array.isArray(data.projects) ? data.projects : [],
+          publications: Array.isArray(data.publications) ? data.publications : [],
+          programmingLanguages: Array.isArray(data.programmingLanguages) ? data.programmingLanguages : [],
+          frameworks: Array.isArray(data.frameworks) ? data.frameworks : [],
+          technicalSkills: Array.isArray(data.technicalSkills) ? data.technicalSkills : [],
+          researchTools: Array.isArray(data.researchTools) ? data.researchTools : [],
+          languageScores: Array.isArray(data.languageScores) ? data.languageScores : [],
+        }))
         setVerifiedStudents(studentList)
       } catch (err) {
         console.error('Error fetching professor dashboard data from Firestore:', err)
@@ -285,6 +440,8 @@ export default function ProfessorDashboard() {
 
     try {
       await updateDoc(doc(db, 'professors', user.uid), {
+        email: deleteField(),
+        isPublicProfile: true,
         isRecruiting: next,
         recruitingStatus: nextRecruitingStatus,
         updatedAt: now,
@@ -294,22 +451,144 @@ export default function ProfessorDashboard() {
     }
   }
 
-  const handleStatusChange = async (appId: string, newStatus: ApplicationStatus) => {
-    if (!user) return
-    if ((profile.verificationStatus || 'pending') !== 'verified') {
-      alert('Faculty verification required to change candidate application stages.')
+  const openInterviewModal = (targetApp: Application) => {
+    setInterviewModalApp(targetApp)
+    setInterviewDateTimeInput(toDateTimeLocalInputValue(targetApp.interviewAt))
+    setInterviewMeetingUrlInput(targetApp.interviewMeetingUrl || '')
+    setInterviewInstructionsInput(targetApp.interviewInstructions || '')
+    setInterviewModalError(null)
+  }
+
+  const handleConfirmInterviewSchedule = async () => {
+    if (!user || !interviewModalApp || savingInterview) return
+    if (interviewModalApp.status === 'accepted' || interviewModalApp.status === 'rejected') {
+      setInterviewModalApp(null)
+      return
+    }
+    const parsed = Date.parse(interviewDateTimeInput)
+    if (!interviewDateTimeInput.trim() || Number.isNaN(parsed)) {
+      setInterviewModalError('Please select a valid interview date and time.')
+      return
+    }
+    const urlCheck = validateMeetingUrl(interviewMeetingUrlInput)
+    if (!urlCheck.valid) {
+      setInterviewModalError(urlCheck.error || 'Please enter a valid Zoom or meeting URL.')
+      return
+    }
+    const normalizedMeetingUrl = urlCheck.normalized
+    const trimmedInstructions = interviewInstructionsInput.trim()
+    if (trimmedInstructions.length > 2000) {
+      setInterviewModalError('Interview instructions must be 2,000 characters or fewer.')
       return
     }
 
+    const nextInterviewIso = new Date(parsed).toISOString()
+    const isReschedule = interviewModalApp.status === 'interview'
+    const dateChanged = nextInterviewIso !== interviewModalApp.interviewAt
+    const urlChanged = normalizedMeetingUrl !== (interviewModalApp.interviewMeetingUrl || '')
+    const instructionsChanged = trimmedInstructions !== (interviewModalApp.interviewInstructions || '')
+    if (isReschedule && !dateChanged && !urlChanged && !instructionsChanged) {
+      setInterviewModalError('Please update the interview date/time, meeting link, or instructions.')
+      return
+    }
+
+    setSavingInterview(true)
+    setInterviewModalError(null)
+    const now = new Date().toISOString()
+    const formatted = formatInterviewDateTime(nextInterviewIso)
+    const nextHistory = [
+      ...(interviewModalApp.statusHistory || []),
+      {
+        status: 'interview' as ApplicationStatus,
+        changedAt: now,
+        note: isReschedule
+          ? `Interview updated for ${formatted}`
+          : `Interview scheduled for ${formatted}`,
+      },
+    ]
+    const notifType = isReschedule ? 'interview_rescheduled' : 'interview_scheduled'
+    const notifId = `notif_app_${interviewModalApp.id}_h_${nextHistory.length}`
+
+    try {
+      const batch = writeBatch(db)
+      batch.update(doc(db, 'applications', interviewModalApp.id), {
+        status: 'interview',
+        interviewAt: nextInterviewIso,
+        interviewMeetingUrl: normalizedMeetingUrl,
+        interviewInstructions: trimmedInstructions,
+        statusHistory: nextHistory,
+        updatedAt: now,
+      })
+      batch.set(doc(db, 'users', interviewModalApp.studentId, 'notifications', notifId), {
+        id: notifId,
+        recipientId: interviewModalApp.studentId,
+        actorId: user.uid,
+        type: notifType,
+        title: isReschedule ? 'Interview Rescheduled' : 'Interview Scheduled',
+        description: isReschedule
+          ? `${interviewModalApp.professorName} updated the interview details for ${interviewModalApp.positionTitle} (${formatted}${normalizedMeetingUrl ? ', meeting link included' : ''}).`
+          : `${interviewModalApp.professorName} scheduled an interview for ${interviewModalApp.positionTitle} on ${formatted}${normalizedMeetingUrl ? ' (meeting link included)' : ''}.`,
+        applicationId: interviewModalApp.id,
+        positionId: interviewModalApp.positionId,
+        isRead: false,
+        createdAt: now,
+      })
+      await batch.commit()
+
+      setApplications((prev) =>
+        prev.map((app) =>
+          app.id === interviewModalApp.id
+            ? {
+                ...app,
+                status: 'interview',
+                interviewAt: nextInterviewIso,
+                interviewMeetingUrl: normalizedMeetingUrl,
+                interviewInstructions: trimmedInstructions,
+                statusHistory: nextHistory,
+                updatedAt: now,
+              }
+            : app
+        )
+      )
+      setInterviewModalApp(null)
+    } catch (err) {
+      console.error('Failed to schedule interview:', err)
+      const firebaseCode = (err as { code?: string })?.code
+      if (firebaseCode === 'permission-denied') {
+        setInterviewModalError(
+          'Failed to save interview schedule (permission-denied). Ensure the latest firestore.rules are published to Firebase.'
+        )
+      } else {
+        setInterviewModalError(
+          `Failed to save interview schedule${firebaseCode ? ` (${firebaseCode})` : ''}. Please try again.`
+        )
+      }
+    } finally {
+      setSavingInterview(false)
+    }
+  }
+
+  const handleStatusChange = async (appId: string, newStatus: ApplicationStatus) => {
+    if (!user) return
+
     const targetApp = applications.find((a) => a.id === appId)
-    if (!targetApp || targetApp.professorId !== user.uid || targetApp.status === newStatus) return
+    if (!targetApp || targetApp.professorId !== user.uid) return
+    if (targetApp.status === 'accepted' || targetApp.status === 'rejected') return
+
+    if (newStatus === 'interview') {
+      openInterviewModal(targetApp)
+      return
+    }
+    if (targetApp.status === newStatus) return
 
     const previousApp = targetApp
+    setStatusUpdateError(null)
     const now = new Date().toISOString()
     const nextHistory = [
       ...(targetApp.statusHistory || []),
       { status: newStatus, changedAt: now, note: `Updated to ${STATUS_LABELS[newStatus]}` },
     ]
+    const notifId = `notif_app_${targetApp.id}_h_${nextHistory.length}`
 
     setApplications((prev) =>
       prev.map((app) =>
@@ -325,16 +604,40 @@ export default function ProfessorDashboard() {
     )
 
     try {
-      await updateDoc(doc(db, 'applications', appId), {
+      const batch = writeBatch(db)
+      batch.update(doc(db, 'applications', appId), {
         status: newStatus,
         statusHistory: nextHistory,
         updatedAt: now,
       })
+      batch.set(doc(db, 'users', targetApp.studentId, 'notifications', notifId), {
+        id: notifId,
+        recipientId: targetApp.studentId,
+        actorId: user.uid,
+        type: 'application_status_changed',
+        title: 'Application Status Updated',
+        description: `Your application for ${targetApp.positionTitle} is now ${STATUS_LABELS[newStatus]}.`,
+        applicationId: targetApp.id,
+        positionId: targetApp.positionId,
+        isRead: false,
+        createdAt: now,
+      })
+      await batch.commit()
     } catch (err) {
       console.error('Failed to update application status in Firestore:', err)
       setApplications((prev) =>
         prev.map((app) => (app.id === appId ? previousApp : app))
       )
+      const firebaseCode = (err as { code?: string })?.code
+      if (firebaseCode === 'permission-denied') {
+        setStatusUpdateError(
+          'Failed to save application status update (permission-denied). Ensure the latest firestore.rules are published to Firebase.'
+        )
+      } else {
+        setStatusUpdateError(
+          `Failed to save application status update${firebaseCode ? ` (${firebaseCode})` : ''}. Please try again.`
+        )
+      }
     }
   }
 
@@ -342,7 +645,6 @@ export default function ProfessorDashboard() {
     totalPositions: ownedPositions.filter((p) => p.isOpen).length,
     totalApplications: applications.length,
     underReview: applications.filter((a) => a.status === 'under_review').length,
-    shortlisted: applications.filter((a) => a.status === 'shortlisted').length,
     interview: applications.filter((a) => a.status === 'interview').length,
     accepted: applications.filter((a) => a.status === 'accepted').length,
   }
@@ -351,12 +653,9 @@ export default function ProfessorDashboard() {
     { id: 'all', label: 'All Applicants', count: positionApplications.length },
     { id: 'submitted', label: 'New Submissions', count: positionApplications.filter((a) => a.status === 'submitted').length },
     { id: 'under_review', label: 'Under Review', count: positionApplications.filter((a) => a.status === 'under_review').length },
-    { id: 'shortlisted', label: 'Shortlisted', count: positionApplications.filter((a) => a.status === 'shortlisted').length },
     { id: 'interview', label: 'Interviews', count: positionApplications.filter((a) => a.status === 'interview').length },
     { id: 'accepted', label: 'Offered / Accepted', count: positionApplications.filter((a) => a.status === 'accepted').length },
   ]
-
-  const isVerifiedProfessor = (profile.verificationStatus || 'pending') === 'verified'
 
   if (loading) {
     return (
@@ -381,13 +680,6 @@ export default function ProfessorDashboard() {
                 <Sparkles size={13} className="text-blue-600" />
                 <span>Faculty Research Portal</span>
               </div>
-              <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold border ${isVerifiedProfessor
-                  ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                  : 'bg-amber-50 text-amber-700 border-amber-200'
-                }`}>
-                <ShieldCheck size={13} className={isVerifiedProfessor ? 'text-emerald-600' : 'text-amber-600'} />
-                <span>{isVerifiedProfessor ? 'Verified Lab' : `Affiliation: ${profile.verificationStatus || 'pending'}`}</span>
-              </span>
             </div>
 
             <h1 className="font-display text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight">
@@ -469,8 +761,8 @@ export default function ProfessorDashboard() {
               <CheckCircle2 size={22} />
             </div>
             <div>
-              <p className="text-2xl font-bold text-slate-900 font-display">{stats.shortlisted + stats.interview}</p>
-              <p className="text-xs font-medium text-slate-500">Shortlisted / Interviews</p>
+              <p className="text-2xl font-bold text-slate-900 font-display">{stats.interview}</p>
+              <p className="text-xs font-medium text-slate-500">Interviews Scheduled</p>
             </div>
           </div>
         </div>
@@ -586,14 +878,222 @@ export default function ProfessorDashboard() {
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setShowApplicantFilters((prev) => !prev)}
+                        className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-xs font-semibold transition-all cursor-pointer ${
+                          showApplicantFilters || activeQualificationFilterCount > 0
+                            ? 'bg-blue-50 border-blue-300 text-blue-700'
+                            : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                        }`}
+                        id="toggle-applicant-qual-filters-btn"
+                      >
+                        <Filter size={13} />
+                        <span>Filter by Qualifications</span>
+                        {activeQualificationFilterCount > 0 && (
+                          <span className="px-1.5 py-0.2 rounded-full bg-blue-600 text-white text-[10px] font-bold">
+                            {activeQualificationFilterCount}
+                          </span>
+                        )}
+                      </button>
+
                       <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
-                        {positionApplications.length} {positionApplications.length === 1 ? 'Applicant' : 'Applicants'}
+                        {filteredApplications.length} of {positionApplications.length}{' '}
+                        {positionApplications.length === 1 ? 'Applicant' : 'Applicants'}
                       </span>
                     </div>
                   </div>
 
+                  {/* Collapsible Applicant Qualification Filter Panel */}
+                  {showApplicantFilters && (
+                    <div
+                      id="applicant-qualification-filters"
+                      className="mb-5 p-4 sm:p-5 rounded-2xl bg-slate-50/90 border border-slate-200/80 space-y-4"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                          Filter Applicants by Academic & Research Qualifications
+                        </p>
+                        {activeQualificationFilterCount > 0 && (
+                          <button
+                            type="button"
+                            onClick={resetApplicantQualificationFilters}
+                            className="text-xs font-semibold text-rose-600 hover:text-rose-700 cursor-pointer"
+                            id="reset-applicant-qual-filters-btn"
+                          >
+                            Reset qualification filters
+                          </button>
+                        )}
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5">
+                        <div>
+                          <label
+                            htmlFor="applicant-filter-major"
+                            className="block text-[11px] font-semibold text-slate-600 uppercase tracking-wide mb-1"
+                          >
+                            Academic Major / Degree
+                          </label>
+                          <input
+                            id="applicant-filter-major"
+                            type="text"
+                            value={applicantFilters.major}
+                            onChange={(e) =>
+                              setApplicantFilters((prev) => ({ ...prev, major: e.target.value }))
+                            }
+                            placeholder="e.g. Computer Science, AI, Master"
+                            className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs text-slate-800 focus:border-blue-600 outline-none"
+                          />
+                        </div>
+
+                        <div>
+                          <label
+                            htmlFor="applicant-filter-min-gpa"
+                            className="block text-[11px] font-semibold text-slate-600 uppercase tracking-wide mb-1"
+                          >
+                            Minimum GPA (4.0 Scale)
+                          </label>
+                          <input
+                            id="applicant-filter-min-gpa"
+                            type="number"
+                            min="0"
+                            max="4.0"
+                            step="0.1"
+                            value={applicantFilters.minGpa}
+                            onChange={(e) =>
+                              setApplicantFilters((prev) => ({ ...prev, minGpa: e.target.value }))
+                            }
+                            placeholder="e.g. 3.5"
+                            className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs text-slate-800 focus:border-blue-600 outline-none"
+                          />
+                        </div>
+
+                        <div>
+                          <label
+                            htmlFor="applicant-filter-interest"
+                            className="block text-[11px] font-semibold text-slate-600 uppercase tracking-wide mb-1"
+                          >
+                            Research Interest / Topic
+                          </label>
+                          <input
+                            id="applicant-filter-interest"
+                            type="text"
+                            value={applicantFilters.researchInterest}
+                            onChange={(e) =>
+                              setApplicantFilters((prev) => ({
+                                ...prev,
+                                researchInterest: e.target.value,
+                              }))
+                            }
+                            placeholder="e.g. Computer Vision, NLP, Robotics"
+                            className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs text-slate-800 focus:border-blue-600 outline-none"
+                          />
+                        </div>
+
+                        <div>
+                          <label
+                            htmlFor="applicant-filter-skill"
+                            className="block text-[11px] font-semibold text-slate-600 uppercase tracking-wide mb-1"
+                          >
+                            Technical Skill / Language
+                          </label>
+                          <input
+                            id="applicant-filter-skill"
+                            type="text"
+                            value={applicantFilters.technicalSkill}
+                            onChange={(e) =>
+                              setApplicantFilters((prev) => ({
+                                ...prev,
+                                technicalSkill: e.target.value,
+                              }))
+                            }
+                            placeholder="e.g. Python, PyTorch, C++, ROS"
+                            className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs text-slate-800 focus:border-blue-600 outline-none"
+                          />
+                        </div>
+
+                        <div>
+                          <label
+                            htmlFor="applicant-filter-language"
+                            className="block text-[11px] font-semibold text-slate-600 uppercase tracking-wide mb-1"
+                          >
+                            Language Proficiency / Exam
+                          </label>
+                          <select
+                            id="applicant-filter-language"
+                            value={applicantFilters.languageExam}
+                            onChange={(e) =>
+                              setApplicantFilters((prev) => ({
+                                ...prev,
+                                languageExam: e.target.value,
+                              }))
+                            }
+                            className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs font-medium text-slate-800 focus:border-blue-600 outline-none"
+                          >
+                            <option value="">Any Language / Exam</option>
+                            <option value="any_score">Has Any Standardized Exam Score</option>
+                            <option value="toefl">TOEFL</option>
+                            <option value="ielts">IELTS</option>
+                            <option value="gre">GRE</option>
+                            <option value="topik">TOPIK</option>
+                            <option value="gmat">GMAT</option>
+                          </select>
+                        </div>
+
+                        <div className="flex flex-col justify-center gap-2 pt-1">
+                          <label className="flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer">
+                            <input
+                              id="applicant-filter-has-experience"
+                              type="checkbox"
+                              checked={applicantFilters.hasResearchExperience}
+                              onChange={(e) =>
+                                setApplicantFilters((prev) => ({
+                                  ...prev,
+                                  hasResearchExperience: e.target.checked,
+                                }))
+                              }
+                              className="w-4 h-4 rounded text-blue-600 focus:ring-blue-500 border-slate-300"
+                            />
+                            <span>Has Prior Research Experience</span>
+                          </label>
+
+                          <label className="flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer">
+                            <input
+                              id="applicant-filter-has-publications"
+                              type="checkbox"
+                              checked={applicantFilters.hasPublications}
+                              onChange={(e) =>
+                                setApplicantFilters((prev) => ({
+                                  ...prev,
+                                  hasPublications: e.target.checked,
+                                }))
+                              }
+                              className="w-4 h-4 rounded text-blue-600 focus:ring-blue-500 border-slate-300"
+                            />
+                            <span>Has Published Papers</span>
+                          </label>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
                   {/* Status Filter Tab Pills */}
+                  {statusUpdateError && (
+                    <div
+                      id="professor-status-update-error"
+                      className="mb-4 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs font-medium text-rose-700 flex items-center justify-between gap-3"
+                    >
+                      <span>{statusUpdateError}</span>
+                      <button
+                        type="button"
+                        onClick={() => setStatusUpdateError(null)}
+                        className="text-rose-600 hover:text-rose-800 font-semibold shrink-0 cursor-pointer"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  )}
                   <div className="flex flex-wrap gap-1.5 p-1 bg-slate-100 rounded-2xl mb-6">
                     {statusFilterTabs.map((tab) => (
                       <button
@@ -614,19 +1114,6 @@ export default function ProfessorDashboard() {
                     ))}
                   </div>
 
-                  {/* Pending Faculty Verification Alert */}
-                  {!isVerifiedProfessor && (
-                    <div className="p-4 rounded-2xl bg-amber-50/90 border border-amber-200 text-amber-900 text-xs flex items-start gap-3 mb-6">
-                      <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                      <div>
-                        <p className="font-semibold text-amber-950">Faculty Verification Pending</p>
-                        <p className="mt-0.5 text-amber-800 leading-relaxed">
-                          Candidate dossier evaluation and application stage transitions are locked until institutional affiliation is approved by an administrator. You may still update your research profile and prepare draft opportunities.
-                        </p>
-                      </div>
-                    </div>
-                  )}
-
                   {/* Applications List & Empty States */}
                   <div className="space-y-4">
                     {positionApplications.length === 0 ? (
@@ -635,26 +1122,44 @@ export default function ProfessorDashboard() {
                         <Users size={36} className="mx-auto text-slate-400 mb-2 opacity-60" />
                         <p className="text-sm font-semibold text-slate-800">No applicants for this opportunity yet</p>
                         <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
-                          No students have submitted applications for "{selectedPosition.title}" yet. You can discover top matching verified researchers in the Recommended Students section below.
+                          No students have submitted applications for "{selectedPosition.title}" yet. You can discover top matching researchers in the Recommended Students section below.
                         </p>
                       </div>
                     ) : filteredApplications.length === 0 ? (
-                      /* Empty state: No applicants in selected status filter */
+                      /* Empty state: No applicants in selected status or qualification filter */
                       <div className="text-center py-12 px-4 bg-slate-50 rounded-2xl border border-dashed border-slate-200" id="empty-status-filter-applicants">
                         <FileText size={36} className="mx-auto text-slate-400 mb-2 opacity-60" />
                         <p className="text-sm font-semibold text-slate-800">
-                          No applicants in "{STATUS_LABELS[selectedStatusFilter as ApplicationStatus] || selectedStatusFilter}"
+                          {activeQualificationFilterCount > 0
+                            ? 'No applicants match your active qualification filters'
+                            : `No applicants in "${STATUS_LABELS[selectedStatusFilter as ApplicationStatus] || selectedStatusFilter}"`}
                         </p>
-                        <p className="text-xs text-slate-500 mt-1">Select "All Applicants" to inspect all candidate submissions for this position.</p>
+                        <p className="text-xs text-slate-500 mt-1">
+                          {activeQualificationFilterCount > 0
+                            ? 'Try broadening or resetting your qualification criteria to inspect all applicants.'
+                            : 'Select "All Applicants" to inspect all candidate submissions for this position.'}
+                        </p>
                         <button
-                          onClick={() => setSelectedStatusFilter('all')}
+                          onClick={() => {
+                            setSelectedStatusFilter('all')
+                            resetApplicantQualificationFilters()
+                          }}
                           className="mt-3 text-xs font-semibold text-blue-600 hover:text-blue-700 underline cursor-pointer"
                         >
-                          View all {positionApplications.length} applicants
+                          Reset filters & view all {positionApplications.length} applicants
                         </button>
                       </div>
                     ) : (
-                      filteredApplications.map((app) => (
+                      filteredApplications.map((app) => {
+                        const applicantProfile = studentByUid.get(app.studentId)
+                        const applicantSkills = Array.from(
+                          new Set([
+                            ...(applicantProfile?.programmingLanguages || []),
+                            ...(applicantProfile?.frameworks || []),
+                            ...(applicantProfile?.technicalSkills || []),
+                          ])
+                        )
+                        return (
                         <div
                           key={app.id}
                           className="p-5 rounded-2xl border border-slate-200/80 hover:border-blue-300 hover:shadow-xs transition-all bg-slate-50/40 hover:bg-white flex flex-col justify-between gap-4 group"
@@ -662,7 +1167,11 @@ export default function ProfessorDashboard() {
                         >
                           <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
                             <div className="flex items-start gap-3.5 min-w-0">
-                              <Avatar src={app.studentPhotoURL} name={app.studentName} size="md" />
+                              <Avatar
+                                src={applicantProfile?.photoURL ?? app.studentPhotoURL}
+                                name={app.studentName}
+                                size="md"
+                              />
                               <div className="min-w-0">
                                 <div className="flex items-center gap-2">
                                   <h3 className="text-base font-bold text-slate-900 group-hover:text-blue-600 transition-colors truncate">
@@ -674,7 +1183,10 @@ export default function ProfessorDashboard() {
                                   {app.positionTitle}
                                 </p>
                                 <p className="text-xs text-slate-500 mt-0.5">
-                                  Applied {formatRelativeDate(app.submittedAt)}
+                                  {applicantProfile?.degree && applicantProfile?.major
+                                    ? `${applicantProfile.degree} in ${applicantProfile.major} • `
+                                    : ''}
+                                  {app.university} • Applied {formatRelativeDate(app.submittedAt)}
                                 </p>
                               </div>
                             </div>
@@ -686,11 +1198,86 @@ export default function ProfessorDashboard() {
                             </div>
                           </div>
 
+                          {/* Applicant Qualification Summary Badges */}
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            {typeof app.studentGpa === 'number' && app.studentGpa > 0 && (
+                              <span className="text-[11px] font-semibold px-2.5 py-0.5 rounded-lg bg-blue-50 text-blue-800 border border-blue-200/80">
+                                GPA: {app.studentGpa} / {app.studentGpaScale || 4.0}
+                              </span>
+                            )}
+                            {applicantProfile?.languageScores?.slice(0, 2).map((ls, idx) => (
+                              <span
+                                key={`${ls.type}-${idx}`}
+                                className="text-[11px] font-semibold px-2.5 py-0.5 rounded-lg bg-amber-50 text-amber-800 border border-amber-200/80"
+                              >
+                                {ls.type}: {ls.score}
+                              </span>
+                            ))}
+                            {(applicantProfile?.researchExperience?.length || 0) > 0 && (
+                              <span className="text-[11px] font-medium px-2.5 py-0.5 rounded-lg bg-emerald-50 text-emerald-800 border border-emerald-200/80">
+                                {applicantProfile!.researchExperience.length} Research Exp.
+                              </span>
+                            )}
+                            {(applicantProfile?.publications?.length || 0) > 0 && (
+                              <span className="text-[11px] font-medium px-2.5 py-0.5 rounded-lg bg-purple-50 text-purple-800 border border-purple-200/80">
+                                {applicantProfile!.publications.length}{' '}
+                                {applicantProfile!.publications.length === 1 ? 'Publication' : 'Publications'}
+                              </span>
+                            )}
+                            {applicantSkills.slice(0, 3).map((skill) => (
+                              <span
+                                key={skill}
+                                className="text-[11px] font-medium px-2 py-0.5 rounded-lg bg-white text-slate-700 border border-slate-200"
+                              >
+                                {skill}
+                              </span>
+                            ))}
+                          </div>
+
                           {/* Statement Preview */}
                           {app.applicationStatement && (
                             <p className="text-xs text-slate-600 line-clamp-2 bg-white/80 p-3 rounded-xl border border-slate-200/60 italic">
                               "{app.applicationStatement}"
                             </p>
+                          )}
+
+                          {/* Scheduled Interview Pill */}
+                          {app.interviewAt && (
+                            <div className="px-3 py-2 rounded-xl bg-purple-50 border border-purple-200 text-xs text-purple-900 space-y-1">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <span className="inline-flex items-center gap-1.5 font-semibold">
+                                  <Calendar size={13} className="text-purple-600" />
+                                  Interview: {formatInterviewDateTime(app.interviewAt)}
+                                </span>
+                                <div className="flex items-center gap-3">
+                                  {app.interviewMeetingUrl && (
+                                    <a
+                                      href={app.interviewMeetingUrl}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="inline-flex items-center gap-1 text-[11px] font-bold text-purple-700 hover:text-purple-900 underline"
+                                    >
+                                      <Video size={12} />
+                                      <span>Zoom Link</span>
+                                    </a>
+                                  )}
+                                  {app.status === 'interview' && (
+                                    <button
+                                      type="button"
+                                      onClick={() => openInterviewModal(app)}
+                                      className="text-[11px] font-bold text-purple-700 hover:text-purple-900 underline cursor-pointer"
+                                    >
+                                      Edit / Reschedule
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                              {app.interviewInstructions && (
+                                <p className="text-[11px] text-purple-800 line-clamp-2">
+                                  Instructions: {app.interviewInstructions}
+                                </p>
+                              )}
+                            </div>
                           )}
 
                           {/* Action Bar */}
@@ -699,15 +1286,13 @@ export default function ProfessorDashboard() {
                               <span className="text-[11px] font-semibold text-slate-500 mr-1">Move Stage:</span>
                               <select
                                 value={app.status}
+                                disabled={app.status === 'accepted' || app.status === 'rejected'}
                                 onChange={(e) => handleStatusChange(app.id, e.target.value as ApplicationStatus)}
-                                disabled={!isVerifiedProfessor}
-                                title={!isVerifiedProfessor ? 'Faculty verification required to change stage' : undefined}
-                                className="bg-white border border-slate-200 rounded-lg px-2.5 py-1 text-xs font-semibold text-slate-800 focus:border-blue-600 outline-none cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-slate-100"
+                                className="bg-white border border-slate-200 rounded-lg px-2.5 py-1 text-xs font-semibold text-slate-800 focus:border-blue-600 outline-none cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
                                 id={`change-status-${app.id}`}
                               >
                                 <option value="submitted">Submitted</option>
                                 <option value="under_review">Under Review</option>
-                                <option value="shortlisted">Shortlisted</option>
                                 <option value="interview">Interview</option>
                                 <option value="accepted">Accepted</option>
                                 <option value="rejected">Rejected</option>
@@ -726,7 +1311,8 @@ export default function ProfessorDashboard() {
                             </Button>
                           </div>
                         </div>
-                      ))
+                        )
+                      })
                     )}
                   </div>
                 </div>
@@ -741,12 +1327,9 @@ export default function ProfessorDashboard() {
                       <div>
                         <div className="flex items-center gap-2">
                           <h2 className="font-display text-lg font-bold text-slate-900">Recommended Students</h2>
-                          <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
-                            Verified
-                          </span>
                         </div>
                         <p className="text-xs text-slate-500">
-                          Verified researchers matching {selectedPosition.title} who have not applied
+                          Researchers matching {selectedPosition.title} who have not applied
                         </p>
                       </div>
                     </div>
@@ -766,7 +1349,7 @@ export default function ProfessorDashboard() {
                         <Users size={32} className="mx-auto text-slate-400 mb-2 opacity-60" />
                         <p className="text-sm font-semibold text-slate-800">No eligible recommended students</p>
                         <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
-                          All verified students in the network have either already submitted an application for "{selectedPosition.title}" or do not meet active verification eligibility criteria.
+                          All students in the network have already submitted an application for "{selectedPosition.title}".
                         </p>
                       </div>
                     ) : (
@@ -797,16 +1380,15 @@ export default function ProfessorDashboard() {
                                       {student.fullName}
                                     </h3>
                                     <MatchChip score={matchResult.score} />
-                                    <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
-                                      <ShieldCheck size={11} className="text-emerald-600" />
-                                      <span>Verified Student</span>
-                                    </span>
                                   </div>
                                   <p className="text-xs font-semibold text-slate-700 mt-0.5">
                                     {student.university} • {student.major} ({student.degree})
                                   </p>
                                   <p className="text-xs text-slate-500 mt-0.5">
-                                    GPA: {student.gpa} / {student.gpaScale} • Expected {student.expectedGraduation}
+                                    {student.gpa > 0
+                                      ? `GPA: ${student.gpa} / ${student.gpaScale || 4.0} • `
+                                      : ''}
+                                    Expected Graduation: {student.expectedGraduation || 'Not specified'}
                                   </p>
                                 </div>
                               </div>
@@ -1041,10 +1623,6 @@ export default function ProfessorDashboard() {
                         {activeCandidateMatch.student.fullName}
                       </h2>
                       <MatchChip score={activeCandidateMatch.matchResult.score} />
-                      <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 bg-emerald-50 px-2.5 py-0.5 rounded-full border border-emerald-200">
-                        <ShieldCheck size={12} className="text-emerald-600" />
-                        <span>Verified Student</span>
-                      </span>
                     </div>
 
                     <p className="text-xs sm:text-sm font-semibold text-slate-700 mt-1">
@@ -1087,7 +1665,7 @@ export default function ProfessorDashboard() {
                     </span>
                   </div>
                   <p className="text-xs text-slate-500">
-                    Compatibility computed against <strong>{selectedPosition.title}</strong> ({selectedPosition.degreeType.replace('_', ' ')} • {selectedPosition.researchArea}) based on verified profile attributes.
+                    Compatibility computed against <strong>{selectedPosition.title}</strong> ({selectedPosition.degreeType.replace('_', ' ')} • {selectedPosition.researchArea}) based on profile attributes.
                   </p>
                   {/* Reused MatchBreakdownPanel */}
                   <MatchBreakdownPanel result={activeCandidateMatch.matchResult} />
@@ -1114,8 +1692,12 @@ export default function ProfessorDashboard() {
                     </div>
 
                     <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200/80">
-                      <span className="text-slate-400 block font-medium mb-0.5">Academic Performance</span>
-                      <span className="font-bold text-slate-900">GPA: {activeCandidateMatch.student.gpa} / {activeCandidateMatch.student.gpaScale}</span>
+                      <span className="text-slate-400 block font-medium mb-0.5">Academic Standing</span>
+                      <span className="font-bold text-slate-900">
+                        {activeCandidateMatch.student.gpa
+                          ? `GPA: ${activeCandidateMatch.student.gpa} / ${activeCandidateMatch.student.gpaScale || 4.0}`
+                          : 'Shared upon application'}
+                      </span>
                       {activeCandidateMatch.student.currentSemester && (
                         <p className="text-slate-600 mt-0.5">Semester: {activeCandidateMatch.student.currentSemester}</p>
                       )}
@@ -1396,21 +1978,136 @@ export default function ProfessorDashboard() {
                 <div className="flex items-center gap-2 text-xs text-slate-500">
                   <span className="w-2 h-2 rounded-full bg-emerald-500 shrink-0" />
                   <span>
-                    Verified student in the Scholivo talent network. Non-applicant preview.
+                    Student in the Scholivo talent network. Non-applicant preview.
                   </span>
                 </div>
 
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  onClick={() => setSelectedCandidateId(null)}
-                  className="text-xs font-semibold shrink-0"
-                  id="close-candidate-modal-footer-btn"
-                >
-                  Close Profile
-                </Button>
+                <div className="flex items-center gap-2 shrink-0">
+                  <Button
+                    size="sm"
+                    onClick={() => {
+                      const s = activeCandidateMatch.student
+                      const targetUid = s.uid
+                      const ctxTitle = selectedPosition?.title || 'Research Inquiry'
+                      setSelectedCandidateId(null)
+                      const params = new URLSearchParams({
+                        to: targetUid,
+                        context: ctxTitle,
+                        name: s.fullName || 'Student Researcher',
+                        username: s.username || targetUid,
+                        role: 'student',
+                        university: s.university || '',
+                        department: s.department || '',
+                        headline: s.degree ? `${s.degree} Candidate` : 'Student Researcher',
+                      })
+                      navigate(`/messages?${params.toString()}`)
+                    }}
+                    className="text-xs font-semibold flex items-center gap-1.5"
+                    id="message-candidate-modal-btn"
+                  >
+                    <MessageSquare size={14} />
+                    <span>Message Candidate</span>
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => setSelectedCandidateId(null)}
+                    className="text-xs font-semibold"
+                    id="close-candidate-modal-footer-btn"
+                  >
+                    Close Profile
+                  </Button>
+                </div>
               </div>
 
+            </div>
+          </div>
+        )}
+
+        {/* Interview Scheduling / Rescheduling Modal */}
+        {interviewModalApp && (
+          <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
+            <div className="bg-white rounded-3xl border border-slate-200 max-w-md w-full p-6 shadow-xl space-y-4">
+              <div className="flex items-center justify-between">
+                <h3 className="text-base font-bold text-slate-900 font-display">
+                  {interviewModalApp.status === 'interview' ? 'Reschedule Interview' : 'Schedule Interview'}
+                </h3>
+                <button
+                  type="button"
+                  onClick={() => setInterviewModalApp(null)}
+                  className="text-slate-400 hover:text-slate-600 p-1 rounded-lg cursor-pointer"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+              <p className="text-xs text-slate-600">
+                Select an interview date and time for <strong>{interviewModalApp.studentName}</strong> ({interviewModalApp.positionTitle}).
+              </p>
+              {interviewModalError && (
+                <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-medium">
+                  {interviewModalError}
+                </div>
+              )}
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-slate-700" htmlFor="dashboard-interview-datetime">
+                  Interview Date & Time (Required)
+                </label>
+                <input
+                  id="dashboard-interview-datetime"
+                  type="datetime-local"
+                  value={interviewDateTimeInput}
+                  onChange={(e) => setInterviewDateTimeInput(e.target.value)}
+                  className="w-full text-xs rounded-xl border border-slate-200 px-3 py-2.5 focus:outline-none focus:ring-2 focus:ring-purple-600/30 focus:border-purple-600"
+                  required
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-slate-700" htmlFor="dashboard-interview-meeting-url">
+                  Zoom / Meeting Link (Optional)
+                </label>
+                <input
+                  id="dashboard-interview-meeting-url"
+                  type="url"
+                  value={interviewMeetingUrlInput}
+                  onChange={(e) => setInterviewMeetingUrlInput(e.target.value)}
+                  placeholder="https://zoom.us/j/123456789"
+                  className="w-full text-xs rounded-xl border border-slate-200 px-3 py-2.5 focus:outline-none focus:ring-2 focus:ring-purple-600/30 focus:border-purple-600"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-slate-700" htmlFor="dashboard-interview-instructions">
+                  Interview Instructions for Student (Optional)
+                </label>
+                <textarea
+                  id="dashboard-interview-instructions"
+                  value={interviewInstructionsInput}
+                  onChange={(e) => setInterviewInstructionsInput(e.target.value)}
+                  placeholder="e.g., Please join 5 minutes early and prepare a brief overview of your research."
+                  rows={3}
+                  className="w-full text-xs rounded-xl border border-slate-200 p-3 focus:outline-none focus:ring-2 focus:ring-purple-600/30 focus:border-purple-600"
+                />
+              </div>
+              <div className="flex items-center justify-end gap-2 pt-2">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setInterviewModalApp(null)}
+                  className="text-xs text-slate-600"
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={handleConfirmInterviewSchedule}
+                  disabled={savingInterview}
+                  className="text-xs bg-purple-600 hover:bg-purple-700 text-white"
+                  id="confirm-dashboard-interview-btn"
+                >
+                  {savingInterview ? 'Saving…' : 'Confirm Schedule'}
+                </Button>
+              </div>
             </div>
           </div>
         )}
